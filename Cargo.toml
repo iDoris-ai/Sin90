@@ -1,0 +1,12 @@
+[package]
+name = "sin90"
+version = "0.3.0-dev"
+edition = "2021"
+license = "Apache-2.0"
+description = "Sin90 — 个人助理领域 OS，Agent24 的参考实现之一"
+repository = "https://github.com/iDoris-ai/Sin90"
+
+[dependencies]
+
+[lints.rust]
+missing_docs = "warn"
