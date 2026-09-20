@@ -1,0 +1,579 @@
+//! Sin90's business routes — the "http" layer of design §5.2.
+//!
+//! Depends on `core` + `store`. Does NOT know Agent24 exists: it only knows
+//! "someone will send requests in" and "someone MAY collect emitted events"
+//! (the [`EventSink`] trait below) — `adapter_agent24` is the someone, in the
+//! shipped form; a `standalone` test harness is the other.
+//!
+//! Ported route-for-route from Agent24's `agent24-sin90-os` (design §1.4) —
+//! the seven existing routes' handler bodies are unchanged; six are new (M0
+//! §6): `/areas`, `/areas/{id}`, `/tasks`, `/tasks/{id}`, `/events`, plus
+//! `/packs/install` (design §7.4, brought forward from M6 because the seed
+//! data itself was trivial to wire once Area existed).
+//!
+//! New in this port: [`ActorKey`]-gated direct writes (design §7.1) — every
+//! direct-write route requires the human actor key; only the Proposal routes
+//! accept the automation key. This is enforced HERE, in Sin90's own code, not
+//! delegated to Agent24 (design §7.1's evaluation: the kernel has no
+//! AI-vs-human caller concept and should not grow one for this).
+
+pub mod actor;
+pub mod state;
+
+use axum::body::Bytes;
+use axum::extract::{Path as AxPath, Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, patch, post};
+use axum::Json;
+use serde::Deserialize;
+
+use crate::core::{AreaStatus, Energy, ScheduleBlockStatus, Sin90Proposal, TaskKind, TaskStatus};
+use crate::store::StoreError;
+
+pub use actor::{Actor, ActorKeys};
+pub use state::{EventSink, NullEventSink, Sin90State};
+
+/// The v1 error envelope every handler below returns on failure — same shape
+/// regardless of which layer produced the error, so a client cannot tell
+/// "Sin90's own code" from "the transport wrapping it" apart.
+#[derive(serde::Serialize)]
+struct ErrorBody<'a> {
+    error: ErrorDetail<'a>,
+}
+#[derive(serde::Serialize)]
+struct ErrorDetail<'a> {
+    code: &'a str,
+    message: &'a str,
+}
+
+fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
+    (
+        status,
+        Json(ErrorBody {
+            error: ErrorDetail { code, message },
+        }),
+    )
+        .into_response()
+}
+
+/// Map a store error to an HTTP response. A FOREIGN KEY violation is a client
+/// mistake (referenced a nonexistent entity) → 404, not the 500 a raw sqlx
+/// error would otherwise become.
+fn map_err(err: StoreError) -> Response {
+    if err.is_fk_violation() {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "a referenced entity does not exist",
+        );
+    }
+    match err {
+        StoreError::NotFound(m) => error_response(StatusCode::NOT_FOUND, "not_found", &m),
+        StoreError::Transition(e) => {
+            error_response(StatusCode::CONFLICT, "conflict", &e.to_string())
+        }
+        StoreError::Proposal(e) => error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unprocessable",
+            &e.to_string(),
+        ),
+        StoreError::Conflict(m) => error_response(StatusCode::CONFLICT, "conflict", &m),
+        StoreError::WeekNotOpen(m) => error_response(
+            StatusCode::CONFLICT,
+            "conflict",
+            &format!("task {m}'s week is not open"),
+        ),
+        StoreError::SameWeekCarry(m) => error_response(
+            StatusCode::CONFLICT,
+            "conflict",
+            &format!("cannot carry task {m} into its own week"),
+        ),
+        StoreError::Internal(_)
+        | StoreError::Sqlx(_)
+        | StoreError::Migrate(_)
+        | StoreError::Serde(_) => {
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", "store error")
+        }
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn parse<T: for<'de> Deserialize<'de>>(
+    bytes: &Bytes,
+    what: &str,
+) -> std::result::Result<T, Response> {
+    serde_json::from_slice(bytes).map_err(|e| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            &format!("invalid {what}: {e}"),
+        )
+    })
+}
+
+/// Build the router. `state.actor_keys` gates direct writes (design §7.1);
+/// `state.sink` is where emitted events go (design §5.2 — Sin90 does not know
+/// who is on the other end of it).
+pub fn router(state: Sin90State) -> axum::Router {
+    axum::Router::new()
+        .route("/areas", post(create_area).get(list_areas))
+        .route("/areas/{id}", patch(transition_area))
+        .route("/directions", post(create_direction).get(list_directions))
+        .route("/tasks", post(create_task).get(list_tasks))
+        .route("/tasks/{id}", patch(transition_task))
+        .route("/schedule-blocks", post(create_block).get(list_blocks))
+        .route("/schedule-blocks/{id}", patch(transition_block))
+        .route("/proposals", post(submit_proposal).get(list_proposals))
+        .route("/proposals/{id}", get(get_proposal))
+        .route("/proposals/{id}/accept", post(accept_proposal))
+        .route("/attention", get(attention))
+        .route("/events", get(list_events))
+        .route("/packs/install", post(install_pack))
+        .with_state(state)
+}
+
+// ---- request/query bodies (deny_unknown_fields: reject model typos loudly) --
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewAreaReq {
+    title: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AreaTransitionReq {
+    to: AreaStatus,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewDirectionReq {
+    title: String,
+    target_window: String,
+    #[serde(default)]
+    area_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewTaskReq {
+    title: String,
+    #[serde(default)]
+    direction_id: Option<String>,
+    #[serde(default)]
+    parent_task_id: Option<String>,
+    #[serde(default)]
+    kind: Option<TaskKind>,
+    #[serde(default)]
+    energy: Option<Energy>,
+    #[serde(default)]
+    est_minutes: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct TaskListQuery {
+    direction_id: Option<String>,
+    area_id: Option<String>,
+    status: Option<TaskStatus>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskTransitionReq {
+    to: TaskStatus,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewBlockReq {
+    #[serde(default)]
+    direction_id: Option<String>,
+    #[serde(default)]
+    task_id: Option<String>,
+    planned_minutes: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BlockTransitionReq {
+    to: ScheduleBlockStatus,
+}
+
+#[derive(Deserialize)]
+struct AttentionQuery {
+    start: String,
+    end: String,
+}
+
+#[derive(Deserialize)]
+struct EventsQuery {
+    entity: Option<String>,
+    entity_id: Option<String>,
+    since_seq: Option<i64>,
+    limit: Option<i64>,
+}
+
+// ---- Area handlers (new) ----------------------------------------------------
+
+async fn create_area(State(state): State<Sin90State>, headers: HeaderMap, body: Bytes) -> Response {
+    if let Err(r) = state.require_human(&headers) {
+        return r;
+    }
+    let req: NewAreaReq = match parse(&body, "area") {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    match state.store.create_area(&req.title).await {
+        Ok(a) => {
+            state.emit(
+                "area.created",
+                serde_json::json!({ "id": a.id, "title": a.title }),
+            );
+            (StatusCode::CREATED, Json(a)).into_response()
+        }
+        Err(e) => map_err(e),
+    }
+}
+
+async fn list_areas(State(state): State<Sin90State>) -> Response {
+    match state.store.list_areas().await {
+        Ok(v) => Json(serde_json::json!({ "areas": v })).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
+async fn transition_area(
+    State(state): State<Sin90State>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    body: Bytes,
+) -> Response {
+    if let Err(r) = state.require_human(&headers) {
+        return r;
+    }
+    let req: AreaTransitionReq = match parse(&body, "area transition") {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    match state.store.transition_area(&id, req.to).await {
+        Ok(a) => {
+            state.emit(
+                "area.transitioned",
+                serde_json::json!({ "area_id": a.id, "to": a.status }),
+            );
+            Json(a).into_response()
+        }
+        Err(e) => map_err(e),
+    }
+}
+
+// ---- Direction handlers (ported, area_id added) -----------------------------
+
+async fn create_direction(
+    State(state): State<Sin90State>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(r) = state.require_human(&headers) {
+        return r;
+    }
+    let req: NewDirectionReq = match parse(&body, "direction") {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    match state
+        .store
+        .create_direction(&req.title, &req.target_window, req.area_id.as_deref())
+        .await
+    {
+        Ok(d) => {
+            state.emit(
+                "direction.created",
+                serde_json::json!({ "id": d.id, "title": d.title, "area_id": d.area_id }),
+            );
+            (StatusCode::CREATED, Json(d)).into_response()
+        }
+        Err(e) => map_err(e),
+    }
+}
+
+async fn list_directions(State(state): State<Sin90State>) -> Response {
+    match state.store.list_directions().await {
+        Ok(v) => Json(serde_json::json!({ "directions": v })).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
+// ---- Task handlers (new) -----------------------------------------------------
+
+async fn create_task(State(state): State<Sin90State>, headers: HeaderMap, body: Bytes) -> Response {
+    if let Err(r) = state.require_human(&headers) {
+        return r;
+    }
+    let req: NewTaskReq = match parse(&body, "task") {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    match state
+        .store
+        .create_task(
+            &req.title,
+            req.direction_id.as_deref(),
+            req.parent_task_id.as_deref(),
+            req.kind.unwrap_or(TaskKind::Other),
+            req.energy.unwrap_or(Energy::Mid),
+            req.est_minutes,
+        )
+        .await
+    {
+        Ok(t) => {
+            state.emit(
+                "task.created",
+                serde_json::json!({ "id": t.id, "direction_id": t.direction_id, "parent_task_id": t.parent_task_id }),
+            );
+            (StatusCode::CREATED, Json(t)).into_response()
+        }
+        Err(e) => map_err(e),
+    }
+}
+
+async fn list_tasks(State(state): State<Sin90State>, Query(q): Query<TaskListQuery>) -> Response {
+    match state
+        .store
+        .list_tasks(q.direction_id.as_deref(), q.area_id.as_deref(), q.status)
+        .await
+    {
+        Ok(v) => Json(serde_json::json!({ "tasks": v })).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
+async fn transition_task(
+    State(state): State<Sin90State>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    body: Bytes,
+) -> Response {
+    if let Err(r) = state.require_human(&headers) {
+        return r;
+    }
+    let req: TaskTransitionReq = match parse(&body, "task transition") {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    match state.store.transition_task(&id, req.to).await {
+        Ok(t) => {
+            state.emit(
+                "task.transitioned",
+                serde_json::json!({ "task_id": t.id, "to": t.status }),
+            );
+            Json(t).into_response()
+        }
+        Err(e) => map_err(e),
+    }
+}
+
+// ---- ScheduleBlock handlers (ported, unchanged) -----------------------------
+
+async fn create_block(
+    State(state): State<Sin90State>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(r) = state.require_human(&headers) {
+        return r;
+    }
+    let req: NewBlockReq = match parse(&body, "block") {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    match state
+        .store
+        .create_block(
+            req.direction_id.as_deref(),
+            req.task_id.as_deref(),
+            req.planned_minutes,
+        )
+        .await
+    {
+        Ok(b) => {
+            state.emit(
+                "block.created",
+                serde_json::json!({ "block_id": b.id, "direction_id": b.direction_id }),
+            );
+            (StatusCode::CREATED, Json(b)).into_response()
+        }
+        Err(e) => map_err(e),
+    }
+}
+
+async fn transition_block(
+    State(state): State<Sin90State>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    body: Bytes,
+) -> Response {
+    if let Err(r) = state.require_human(&headers) {
+        return r;
+    }
+    let req: BlockTransitionReq = match parse(&body, "transition") {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    match state.store.transition_block(&id, req.to).await {
+        Ok(b) => {
+            state.emit(
+                "block.transitioned",
+                serde_json::json!({ "block_id": b.id, "to": b.status }),
+            );
+            Json(b).into_response()
+        }
+        Err(e) => map_err(e),
+    }
+}
+
+async fn list_blocks(State(state): State<Sin90State>) -> Response {
+    match state.store.list_blocks().await {
+        Ok(v) => Json(serde_json::json!({ "blocks": v })).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
+// ---- Proposal handlers (ported, unchanged; automation key accepted here) ---
+
+async fn submit_proposal(
+    State(state): State<Sin90State>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    // Design §7.1: the Proposal gate is where the AUTOMATION key is accepted —
+    // this is the one family of routes that key is good for.
+    if let Err(r) = state.require_any_actor(&headers) {
+        return r;
+    }
+    let proposal: Sin90Proposal = match parse(&body, "proposal") {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    match state.store.submit_proposal(&proposal).await {
+        Ok(()) => {
+            state.emit(
+                "proposal.submitted",
+                serde_json::json!({ "id": proposal.id }),
+            );
+            (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({ "id": proposal.id, "status": "pending" })),
+            )
+                .into_response()
+        }
+        Err(e) => map_err(e),
+    }
+}
+
+async fn accept_proposal(
+    State(state): State<Sin90State>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+) -> Response {
+    if let Err(r) = state.require_any_actor(&headers) {
+        return r;
+    }
+    match state.store.apply_proposal(&id).await {
+        Ok(outcome) => {
+            if outcome.applied_now {
+                state.emit(
+                    "proposal.applied",
+                    serde_json::json!({ "proposal_id": outcome.receipt.proposal_id }),
+                );
+            }
+            Json(outcome.receipt).into_response()
+        }
+        Err(e) => map_err(e),
+    }
+}
+
+async fn list_proposals(State(state): State<Sin90State>) -> Response {
+    match state.store.list_proposals().await {
+        Ok(v) => Json(serde_json::json!({ "proposals": v })).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
+async fn get_proposal(State(state): State<Sin90State>, AxPath(id): AxPath<String>) -> Response {
+    match state.store.get_proposal(&id).await {
+        Ok(p) => Json(p).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
+// ---- attention / events (ported / new) --------------------------------------
+
+async fn attention(State(state): State<Sin90State>, q: Query<AttentionQuery>) -> Response {
+    let Query(q) = q;
+    if !crate::core::is_fixed_iso8601(&q.start) || !crate::core::is_fixed_iso8601(&q.end) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "start and end must be fixed-width ISO-8601 (YYYY-MM-DDThh:mm:ssZ)",
+        );
+    }
+    if q.start >= q.end {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "start must be strictly before end",
+        );
+    }
+    match state.store.attention(&q.start, &q.end).await {
+        Ok(rows) => Json(serde_json::json!({ "attention": rows })).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
+async fn list_events(State(state): State<Sin90State>, Query(q): Query<EventsQuery>) -> Response {
+    match state
+        .store
+        .list_events(
+            q.entity.as_deref(),
+            q.entity_id.as_deref(),
+            q.since_seq,
+            q.limit,
+        )
+        .await
+    {
+        Ok(rows) => Json(serde_json::json!({ "events": rows })).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
+async fn install_pack(State(state): State<Sin90State>, headers: HeaderMap) -> Response {
+    if let Err(r) = state.require_human(&headers) {
+        return r;
+    }
+    match state
+        .store
+        .install_seed_pack(&crate::store::five_life_systems())
+        .await
+    {
+        Ok(areas) => {
+            for a in &areas {
+                state.emit(
+                    "area.created",
+                    serde_json::json!({ "id": a.id, "title": a.title }),
+                );
+            }
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({ "areas": areas })),
+            )
+                .into_response()
+        }
+        Err(e) => map_err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests;

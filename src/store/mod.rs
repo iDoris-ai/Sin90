@@ -1,0 +1,181 @@
+//! Sin90 persistence — sqlx over its OWN `sin90.db` (never a kernel database).
+//!
+//! Mirrors the ported discipline: every status change runs inside a
+//! `BEGIN IMMEDIATE` transaction — current state is read under the write lock,
+//! checked against `core::transitions`'s matrix, then updated, and an event is
+//! appended in the SAME transaction. Proposal apply is CAS-idempotent
+//! (pending → applying → applied) so a re-tried accept never applies twice.
+//!
+//! Ported from Agent24's `agent24-sin90-store` crate (design §1.2/§4.1). This
+//! port DROPS `open_migrating_from` and its legacy-path probing: that method
+//! existed to migrate a pre-ME-1b-b `~/.agent24/sin90.db` — a fact about
+//! Agent24's own history, not something a fresh standalone package has. `open`
+//! and `open_memory` are unchanged.
+
+pub mod attention;
+pub mod packs;
+pub mod repo;
+
+pub use attention::AttentionRow;
+pub use packs::{five_life_systems, SeedArea};
+pub use repo::{AppliedProposal, ApplyOutcome, EventRow, StoredProposal};
+
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::SqlitePool;
+use std::path::Path;
+use std::str::FromStr;
+
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error(transparent)]
+    Sqlx(#[from] sqlx::Error),
+    #[error(transparent)]
+    Migrate(#[from] sqlx::migrate::MigrateError),
+    #[error("serialization: {0}")]
+    Serde(#[from] serde_json::Error),
+    #[error(transparent)]
+    Transition(#[from] crate::core::TransitionError),
+    #[error(transparent)]
+    Proposal(#[from] crate::core::ProposalError),
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("conflict: {0}")]
+    Conflict(String),
+    /// Relational invariants the pure validator cannot see (ValidationCtx is
+    /// per-entity), enforced here under the write lock: mutating a task whose
+    /// week is not open (planning|active) ...
+    #[error("task {0}'s week is not open; cannot mutate")]
+    WeekNotOpen(String),
+    /// ... or carrying a task over into the very week it already lives in
+    /// (which would strand the closed task and spawn an endlessly re-carryable
+    /// duplicate in the same week).
+    #[error("cannot carry task {0} into its own week")]
+    SameWeekCarry(String),
+    /// A broken internal invariant (not the client's fault) — maps to 500.
+    #[error("internal: {0}")]
+    Internal(String),
+}
+
+impl StoreError {
+    /// True if this is a FOREIGN KEY violation (SQLite extended code 787) —
+    /// i.e. the client referenced an entity that doesn't exist, a 4xx not a 5xx.
+    pub fn is_fk_violation(&self) -> bool {
+        matches!(
+            self,
+            StoreError::Sqlx(sqlx::Error::Database(db)) if db.code().as_deref() == Some("787")
+        )
+    }
+}
+
+pub type Result<T> = std::result::Result<T, StoreError>;
+
+/// Opaque wire status returned to callers is defined in `core`; this struct
+/// only owns the connection pool.
+#[derive(Clone)]
+pub struct Sin90Store {
+    pool: SqlitePool,
+}
+
+impl Sin90Store {
+    /// Open (creating if needed) `sin90.db` and run migrations.
+    pub async fn open(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| StoreError::Conflict(e.to_string()))?;
+        }
+        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))?
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(options)
+            .await?;
+        sqlx::migrate!("./src/store/migrations").run(&pool).await?;
+        Ok(Self { pool })
+    }
+
+    /// In-memory database for tests (single connection — each `:memory:` handle
+    /// is its own database).
+    pub async fn open_memory() -> Result<Self> {
+        let options = SqliteConnectOptions::from_str("sqlite::memory:")?
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await?;
+        sqlx::migrate!("./src/store/migrations").run(&pool).await?;
+        Ok(Self { pool })
+    }
+
+    pub(crate) fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+}
+
+/// Test-only escape hatches (raw SQL peeks + a mutation to prove event replay
+/// is unaffected). Feature-gated so they are NOT part of the released API.
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub mod test_hooks {
+    use crate::store::{Result, Sin90Store};
+    use sqlx::Row;
+
+    /// Rename a direction via raw SQL — historical event payloads must NOT change.
+    pub async fn rename_direction(store: &Sin90Store, id: &str, new_title: &str) -> Result<()> {
+        sqlx::query("UPDATE sin90_directions SET title = ? WHERE id = ?")
+            .bind(new_title)
+            .bind(id)
+            .execute(store.pool())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn direction_count(store: &Sin90Store) -> Result<i64> {
+        Ok(sqlx::query("SELECT COUNT(*) AS n FROM sin90_directions")
+            .fetch_one(store.pool())
+            .await?
+            .get::<i64, _>("n"))
+    }
+
+    pub async fn first_task_id(store: &Sin90Store) -> Result<String> {
+        Ok(
+            sqlx::query("SELECT id FROM sin90_tasks ORDER BY id LIMIT 1")
+                .fetch_one(store.pool())
+                .await?
+                .get::<String, _>("id"),
+        )
+    }
+
+    pub async fn close_week(store: &Sin90Store, id: &str) -> Result<()> {
+        sqlx::query("UPDATE sin90_weeks SET status = 'closed' WHERE id = ?")
+            .bind(id)
+            .execute(store.pool())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn event_count(store: &Sin90Store, entity: &str, entity_id: &str) -> Result<i64> {
+        Ok(
+            sqlx::query(
+                "SELECT COUNT(*) AS n FROM sin90_events WHERE entity = ? AND entity_id = ?",
+            )
+            .bind(entity)
+            .bind(entity_id)
+            .fetch_one(store.pool())
+            .await?
+            .get::<i64, _>("n"),
+        )
+    }
+
+    pub async fn proposal_status(store: &Sin90Store, id: &str) -> Result<Option<String>> {
+        Ok(
+            sqlx::query("SELECT status FROM sin90_proposals WHERE id = ?")
+                .bind(id)
+                .fetch_optional(store.pool())
+                .await?
+                .map(|r| r.get::<String, _>("status")),
+        )
+    }
+}

@@ -1,14 +1,12 @@
-# Sin90 的领域 OS 清单（Agent24 ADR-029 / SPEC-MD-ME §2）
+# Sin90 的领域 OS 清单（design §5.4）。
 #
-# 内核读这个文件来认识模块。`name` 是身份的唯一来源 —— 命名空间、事件模块名、
-# 数据目录都由它派生，声明成别的会是校验错误。所以这个文件不可能悄悄把 Sin90
-# 指向另一个 OS 的路由或数据。
+# `name` 是身份的唯一来源 —— 命名空间、事件模块名、数据目录都由它派生。
 #
-# ⚠️ impl_kind 今天必须是 in_process_crate。写 out_of_process 的包会在挂载时
-#    被内核硬拒（agent24d/src/domain.rs 的 is_mountable_in_process），因为
-#    ME-3 的传输层还没落地。到 Agent24 v0.5.0 才能改。见 docs/STATUS.md。
+# impl_kind 从 in_process_crate 改成了 out_of_process_provider（2026-09-20）：
+# Agent24 的 ME-3 专项已于 2026-09-20 整体收口（T9/ME-3f 黑盒验收合入 main），
+# 进程外挂载的阻塞条件已经解除，见 docs/STATUS.md。
 name: sin90
-version: "0.3.0-dev"
+version: "0.5.0"
 route_namespace: /api/v1/sin90
 event_module: sin90
 data_dir: ~/.agent24/os/sin90/
@@ -17,11 +15,11 @@ requires_models: []
 requires_apis: []
 requires_deps: []
 
-# 只写真正用到的。多要没有好处 —— 内核取交集 —— 而且会在 `agent24 os` 里
-# 把模块描述错。
-#
-# Sin90 只要 events：它自己管数据目录，不用内核记忆。这一条直接决定了
-# Sin90 不需要 ME-3d（记忆回调），是全 ME-3 里最难的一刀。
+# 只写真正用到的。Sin90 只要 events：它自己管数据目录，不用内核记忆
+# （design §5.3；这条决策继承自内核实现时代，未改变）。
 kernel_capabilities: [events]
 
-impl_kind: in_process_crate
+impl_kind: out_of_process_provider
+spawn:
+  command: bin/sin90
+  args: ["module"]
