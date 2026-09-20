@@ -1,10 +1,21 @@
-//! Sin90 —— 个人助理的领域 OS，同时是「怎么写一个 Agent24 领域 OS」的参考实现。
+//! Sin90 — 个人助理的领域 OS，同时是「怎么写一个 Agent24 领域 OS」的参考实现。
 //!
-//! 两个半边，状态不同，所以分成两个模块：
+//! Four layers, dependency arrow pointing one way (design §5.2):
 //!
-//! - [`routes`]：业务半边。**现在就能写**，形状不会因 ME-3 怎么定而改变。
-//! - [`handshake`]：握手半边。**桩** —— 协议未定稿，见 `docs/STATUS.md`。
+//! ```text
+//! core  <-  store  <-  http  <-  adapter_agent24
+//! ```
+//!
+//! - [`core`]: pure domain — entities, state machines, Proposal validation.
+//!   Zero Agent24 dependency, zero I/O.
+//! - [`store`]: SQLite persistence over `core`.
+//! - [`http`]: business routes over `store`. Knows nothing about Agent24 —
+//!   only an [`http::EventSink`] trait for "someone may collect what I emit".
+//! - [`adapter_agent24`]: the ONLY module that knows Agent24 exists — the
+//!   `initialize` handshake, `A24_*` env vars, and the `EventSink` that
+//!   forwards to `_a24/events/emit`.
 
-pub mod handshake;
-pub mod routes;
+pub mod adapter_agent24;
+pub mod core;
+pub mod http;
 pub mod store;
