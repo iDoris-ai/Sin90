@@ -56,14 +56,30 @@ impl ActorKeys {
     /// matches neither).
     pub fn identify(&self, headers: &HeaderMap) -> Option<Actor> {
         let key = bearer_token(headers)?;
-        if key == self.human {
+        if constant_time_eq(key.as_bytes(), self.human.as_bytes()) {
             Some(Actor::Human)
-        } else if key == self.automation {
+        } else if constant_time_eq(key.as_bytes(), self.automation.as_bytes()) {
             Some(Actor::Automation)
         } else {
             None
         }
     }
+}
+
+/// Bearer-token comparison that takes the same time regardless of where the
+/// first mismatching byte falls, so a timing side channel can't be used to
+/// recover `human`/`automation` one byte at a time. A length mismatch is not
+/// itself timed — comparing against a fixed-length local secret leaks
+/// nothing an attacker doesn't already get from trying keys of every length.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {

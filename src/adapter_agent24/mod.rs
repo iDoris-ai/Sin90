@@ -89,9 +89,22 @@ pub fn manifest_digest(manifest_bytes: &[u8]) -> String {
 /// call volume than a background reader + per-request channel; if
 /// `agent24-os-sdk` supersedes this file (design §7.2), that concurrency
 /// design is its call to make, not this one's to anticipate.
+///
+/// `conn` is `None` exactly when the last known state of the socket is
+/// "desynced or closed" — a read/write error, a frame that failed to parse,
+/// or one that arrived with a `FrameTooLong`/id-mismatch shape we don't know
+/// how to keep reading past. Leaving a `BufReader` in place after any of
+/// those would mean every later `emit()` keeps reading from the wrong offset
+/// in the stream forever, silently warning on each call until the process is
+/// restarted — `emit()` reconnects (one fresh `initialize`) instead of
+/// reusing a connection it can no longer trust the framing of.
 pub struct CallbackChannel {
-    conn: Mutex<BufReader<UnixStream>>,
+    conn: Mutex<Option<BufReader<UnixStream>>>,
     next_id: std::sync::atomic::AtomicU64,
+    sock_path: std::path::PathBuf,
+    module: String,
+    manifest_bytes: Vec<u8>,
+    auth_token: String,
 }
 
 impl CallbackChannel {
@@ -103,49 +116,16 @@ impl CallbackChannel {
         manifest_bytes: &[u8],
         auth_token: &str,
     ) -> Result<(Self, Vec<String>), AdapterError> {
-        let stream = UnixStream::connect(sock_path).await?;
-        let mut reader = BufReader::new(stream);
-
-        let id = "1".to_string();
-        let req = json!({
-            "jsonrpc": "2.0",
-            "method": "initialize",
-            "id": id,
-            "params": {
-                "protocol_versions": { "min": PROTOCOL_MIN, "max": PROTOCOL_MAX },
-                "module": module,
-                "manifest_digest": manifest_digest(manifest_bytes),
-                "auth_token": auth_token,
-                "capabilities": ["events"],
-            }
-        });
-        write_frame(reader.get_mut(), &req).await?;
-
-        let line = read_frame(&mut reader).await?;
-        let resp: Value = serde_json::from_slice(&line)?;
-        let got_id = resp["id"].as_str().unwrap_or_default().to_string();
-        if got_id != id {
-            return Err(AdapterError::IdMismatch {
-                sent: id,
-                got: got_id,
-            });
-        }
-        if let Some(err) = resp.get("error") {
-            return Err(AdapterError::HandshakeRefused(err.to_string()));
-        }
-        let provides: Vec<String> = resp["result"]["offer"]["provides"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-
+        let (reader, provides) =
+            connect_and_initialize(sock_path, module, manifest_bytes, auth_token).await?;
         Ok((
             Self {
-                conn: Mutex::new(reader),
+                conn: Mutex::new(Some(reader)),
                 next_id: std::sync::atomic::AtomicU64::new(2), // id "1" was the handshake
+                sock_path: sock_path.to_path_buf(),
+                module: module.to_string(),
+                manifest_bytes: manifest_bytes.to_vec(),
+                auth_token: auth_token.to_string(),
             },
             provides,
         ))
@@ -154,8 +134,27 @@ impl CallbackChannel {
     /// Call `_a24/events/emit`. Best-effort: a callback failure is logged and
     /// swallowed, same posture as the ported kernel handlers' "no sink granted
     /// -> degrade, don't fail the mutation" (design §5.3) — a Sin90 write must
-    /// not fail because the event side-channel hiccuped.
+    /// not fail because the event side-channel hiccuped. On a desynced or
+    /// closed connection, reconnects once before giving up on this call —
+    /// see the struct doc for why reusing a broken `conn` isn't an option.
     pub async fn emit(&self, kind: &str, payload: Map<String, Value>) {
+        let mut conn = self.conn.lock().await;
+        if conn.is_none() {
+            match connect_and_initialize(
+                &self.sock_path,
+                &self.module,
+                &self.manifest_bytes,
+                &self.auth_token,
+            )
+            .await
+            {
+                Ok((reader, _provides)) => *conn = Some(reader),
+                Err(e) => {
+                    tracing::warn!(error = %e, kind, "sin90: could not reconnect to emit events/emit");
+                    return;
+                }
+            }
+        }
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -166,22 +165,86 @@ impl CallbackChannel {
             "id": id,
             "params": { "kind": kind, "payload": payload },
         });
-        let mut conn = self.conn.lock().await;
-        if let Err(e) = write_frame(conn.get_mut(), &req).await {
+        // From here on, any error means the stream's framing can no longer be
+        // trusted (we don't know how much of a frame the kernel received, or
+        // whether the reader's position matches a frame boundary) — drop the
+        // connection so the NEXT `emit()` reconnects rather than continuing
+        // to read a desynced stream.
+        let reader = conn.as_mut().expect("just ensured Some above");
+        if let Err(e) = write_frame(reader.get_mut(), &req).await {
             tracing::warn!(error = %e, kind, "sin90: failed to write events/emit frame");
+            *conn = None;
             return;
         }
-        match read_frame(&mut conn).await {
-            Ok(line) => {
-                if let Ok(resp) = serde_json::from_slice::<Value>(&line) {
+        match read_frame(reader).await {
+            Ok(line) => match serde_json::from_slice::<Value>(&line) {
+                Ok(resp) => {
                     if let Some(err) = resp.get("error") {
                         tracing::warn!(kind, ?err, "sin90: events/emit rejected by kernel");
                     }
                 }
+                Err(e) => {
+                    tracing::warn!(error = %e, kind, "sin90: events/emit response was not valid JSON");
+                    *conn = None;
+                }
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, kind, "sin90: no response to events/emit");
+                *conn = None;
             }
-            Err(e) => tracing::warn!(error = %e, kind, "sin90: no response to events/emit"),
         }
     }
+}
+
+/// Connect to `sock_path` and run the `initialize` exchange, shared by the
+/// initial [`CallbackChannel::handshake`] and every later reconnect inside
+/// [`CallbackChannel::emit`] — one place that speaks the wire format.
+async fn connect_and_initialize(
+    sock_path: &std::path::Path,
+    module: &str,
+    manifest_bytes: &[u8],
+    auth_token: &str,
+) -> Result<(BufReader<UnixStream>, Vec<String>), AdapterError> {
+    let stream = UnixStream::connect(sock_path).await?;
+    let mut reader = BufReader::new(stream);
+
+    let id = "1".to_string();
+    let req = json!({
+        "jsonrpc": "2.0",
+        "method": "initialize",
+        "id": id,
+        "params": {
+            "protocol_versions": { "min": PROTOCOL_MIN, "max": PROTOCOL_MAX },
+            "module": module,
+            "manifest_digest": manifest_digest(manifest_bytes),
+            "auth_token": auth_token,
+            "capabilities": ["events"],
+        }
+    });
+    write_frame(reader.get_mut(), &req).await?;
+
+    let line = read_frame(&mut reader).await?;
+    let resp: Value = serde_json::from_slice(&line)?;
+    let got_id = resp["id"].as_str().unwrap_or_default().to_string();
+    if got_id != id {
+        return Err(AdapterError::IdMismatch {
+            sent: id,
+            got: got_id,
+        });
+    }
+    if let Some(err) = resp.get("error") {
+        return Err(AdapterError::HandshakeRefused(err.to_string()));
+    }
+    let provides: Vec<String> = resp["result"]["offer"]["provides"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok((reader, provides))
 }
 
 /// Adapts [`CallbackChannel`] to [`crate::http::EventSink`]. `http` never
@@ -321,6 +384,49 @@ mod tests {
         };
         assert!(matches!(err, AdapterError::HandshakeRefused(_)));
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn emit_clears_the_connection_when_the_server_hangs_up() {
+        // Regression: before this fix, a read/write failure inside `emit()`
+        // left the old `BufReader` in place — every later `emit()` kept
+        // reading the same dead stream and silently warned forever, with no
+        // way back short of restarting the process. After this fix, any
+        // failure clears `conn`, so the NEXT `emit()` reconnects instead.
+        let dir = tempdir();
+        let sock_path = dir.join("cb.sock");
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+
+        let manifest = b"name: sin90\n";
+        let token = "test-token";
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut buf = Vec::new();
+            reader.read_until(b'\n', &mut buf).await.unwrap();
+            let req: Value = serde_json::from_slice(&buf).unwrap();
+            assert_eq!(req["method"], "initialize");
+            let resp = json!({
+                "jsonrpc": "2.0", "id": req["id"],
+                "result": { "protocol_version": 1, "offer": { "provides": ["_a24/events/"] } }
+            });
+            let mut bytes = serde_json::to_vec(&resp).unwrap();
+            bytes.push(b'\n');
+            reader.get_mut().write_all(&bytes).await.unwrap();
+            // Hang up immediately after the handshake, before any emit
+            // request can arrive — the dropped `reader` closes the socket.
+        });
+
+        let (chan, _provides) = CallbackChannel::handshake(&sock_path, "sin90", manifest, token)
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        chan.emit("test.orphaned", Map::new()).await;
+        assert!(
+            chan.conn.lock().await.is_none(),
+            "emit() against a hung-up connection must clear `conn`, not leave a desynced reader in place for the next call to reuse"
+        );
     }
 
     fn tempdir() -> std::path::PathBuf {
