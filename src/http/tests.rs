@@ -33,17 +33,36 @@ const HUMAN: &str = "test-human-key";
 const AUTOMATION: &str = "test-automation-key";
 
 async fn test_app() -> (axum::Router, RecordingSink) {
+    let (app, sink, _store) = test_app_with_store().await;
+    (app, sink)
+}
+
+/// Same as [`test_app`], plus the `Sin90Store` handle itself — for the one
+/// test (`today_view`'s carry-over rule) that needs to reach past the HTTP
+/// surface via `store::test_hooks` to backdate a row's `created_at`, which no
+/// route exposes (nor should one: `created_at` is server-assigned, always).
+async fn test_app_with_store() -> (axum::Router, RecordingSink, Sin90Store) {
     let store = Sin90Store::open_memory().await.unwrap();
     let sink = RecordingSink::default();
     let state = Sin90State::new(
-        store,
+        store.clone(),
         Arc::new(sink.clone()),
         ActorKeys {
             human: HUMAN.into(),
             automation: AUTOMATION.into(),
         },
     );
-    (router(state), sink)
+    (router(state), sink, store)
+}
+
+fn automation_req(method: &str, uri: &str, body: Value) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {AUTOMATION}"))
+        .body(Body::from(body.to_string()))
+        .unwrap()
 }
 
 fn human_req(method: &str, uri: &str, body: Value) -> Request<Body> {
@@ -487,4 +506,238 @@ async fn installing_the_seed_pack_creates_five_areas_via_the_http_route() {
     assert_eq!(resp.status(), StatusCode::CREATED);
     let areas = body_json(app.oneshot(get_req("/areas")).await.unwrap()).await;
     assert_eq!(areas["areas"].as_array().unwrap().len(), 5);
+}
+
+// ---- M1: /capture + /today ---------------------------------------------------
+
+#[tokio::test]
+async fn capture_lands_as_an_uncategorized_backlog_task_and_shows_up_in_today() {
+    let (app, sink) = test_app().await;
+    let resp = app
+        .clone()
+        .oneshot(human_req(
+            "POST",
+            "/capture",
+            json!({"text": "水电费还没交"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let task = body_json(resp).await;
+    assert_eq!(task["title"], "水电费还没交");
+    assert!(
+        task["direction_id"].is_null(),
+        "a capture must not be pre-classified into a Direction"
+    );
+    assert_eq!(task["status"], "backlog");
+
+    // M1's acceptance line: it shows up in /today's un-classified section.
+    let today = body_json(app.oneshot(get_req("/today")).await.unwrap()).await;
+    let inbox = today["inbox"].as_array().unwrap();
+    assert!(
+        inbox.iter().any(|t| t["id"] == task["id"]),
+        "captured task must appear in /today's inbox: {inbox:?}"
+    );
+
+    // It also emitted the ordinary task.created event — capture is not a
+    // separate event kind, it's a Task creation like any other (design M1:
+    // "does not introduce a new entity").
+    let events = sink.0.lock().unwrap();
+    assert!(events.iter().any(|(kind, _)| kind == "task.created"));
+}
+
+#[tokio::test]
+async fn capture_accepts_the_automation_key_unlike_every_other_direct_write_route() {
+    let (app, _sink) = test_app().await;
+    let resp = app
+        .oneshot(automation_req(
+            "POST",
+            "/capture",
+            json!({"text": "自动采集的一条笔记"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "capture is the one direct write this design opens to the automation \
+         key too — see the handler doc comment for why"
+    );
+}
+
+#[tokio::test]
+async fn today_must_do_orders_in_progress_before_planned_before_backlog_oldest_first() {
+    let (app, _sink) = test_app().await;
+    let area = body_json(
+        app.clone()
+            .oneshot(human_req("POST", "/areas", json!({"title": "工作"})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let direction = body_json(
+        app.clone()
+            .oneshot(human_req(
+                "POST",
+                "/directions",
+                json!({"title": "Q4", "target_window": "2026-Q4", "area_id": area["id"]}),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let direction_id = direction["id"].clone();
+
+    let mk_task = |app: axum::Router, title: &str| {
+        let direction_id = direction_id.clone();
+        let title = title.to_string();
+        async move {
+            body_json(
+                app.oneshot(human_req(
+                    "POST",
+                    "/tasks",
+                    json!({"title": title, "direction_id": direction_id}),
+                ))
+                .await
+                .unwrap(),
+            )
+            .await
+        }
+    };
+
+    // Created in this order: backlog task, then a task promoted to
+    // in_progress, then a task moved to planned then in_progress isn't
+    // needed — a second in_progress task proves the tie-break (oldest of the
+    // in_progress tier first), and the backlog task proves the tier itself
+    // (it must rank behind BOTH in_progress tasks regardless of creation
+    // order — it's created FIRST but must still sort LAST).
+    let backlog_task = mk_task(app.clone(), "backlog item").await;
+    let first_in_progress = mk_task(app.clone(), "started first").await;
+    let second_in_progress = mk_task(app.clone(), "started second").await;
+
+    // backlog -> planned -> in_progress: the matrix has no direct
+    // backlog -> in_progress edge.
+    for t in [&first_in_progress, &second_in_progress] {
+        let id = t["id"].as_str().unwrap();
+        for to in ["planned", "in_progress"] {
+            let resp = app
+                .clone()
+                .oneshot(human_req(
+                    "PATCH",
+                    &format!("/tasks/{id}"),
+                    json!({"to": to}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+    }
+
+    let today = body_json(app.oneshot(get_req("/today")).await.unwrap()).await;
+    let must_do: Vec<&str> = today["must_do"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        must_do,
+        vec![
+            first_in_progress["id"].as_str().unwrap(),
+            second_in_progress["id"].as_str().unwrap(),
+            backlog_task["id"].as_str().unwrap(),
+        ],
+        "in_progress tasks (oldest first) must outrank backlog regardless of creation order"
+    );
+}
+
+#[tokio::test]
+async fn today_carry_over_candidates_are_in_progress_tasks_started_before_today() {
+    let (app, _sink, store) = test_app_with_store().await;
+    let area = body_json(
+        app.clone()
+            .oneshot(human_req("POST", "/areas", json!({"title": "工作"})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let direction = body_json(
+        app.clone()
+            .oneshot(human_req(
+                "POST",
+                "/directions",
+                json!({"title": "Q4", "target_window": "2026-Q4", "area_id": area["id"]}),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    let old_task = body_json(
+        app.clone()
+            .oneshot(human_req(
+                "POST",
+                "/tasks",
+                json!({"title": "stale in-progress work", "direction_id": direction["id"]}),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let old_id = old_task["id"].as_str().unwrap();
+    for to in ["planned", "in_progress"] {
+        let resp = app
+            .clone()
+            .oneshot(human_req(
+                "PATCH",
+                &format!("/tasks/{old_id}"),
+                json!({"to": to}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    // Backdate it to yesterday (UTC) — a real day boundary, not a sleep.
+    crate::store::test_hooks::set_task_created_at(&store, old_id, "2020-01-01T00:00:00Z")
+        .await
+        .unwrap();
+
+    let today_task = body_json(
+        app.clone()
+            .oneshot(human_req(
+                "POST",
+                "/tasks",
+                json!({"title": "started today", "direction_id": direction["id"]}),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let today_id = today_task["id"].as_str().unwrap();
+    for to in ["planned", "in_progress"] {
+        let resp = app
+            .clone()
+            .oneshot(human_req(
+                "PATCH",
+                &format!("/tasks/{today_id}"),
+                json!({"to": to}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    let today = body_json(app.oneshot(get_req("/today")).await.unwrap()).await;
+    let candidates: Vec<&str> = today["carry_over_candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        candidates,
+        vec![old_id],
+        "only the task started on an earlier UTC day is a carry-over candidate; \
+         one started today (however in-progress) is not yet stale"
+    );
 }

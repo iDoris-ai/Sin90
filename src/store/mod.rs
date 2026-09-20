@@ -18,7 +18,7 @@ pub mod repo;
 
 pub use attention::AttentionRow;
 pub use packs::{five_life_systems, SeedArea};
-pub use repo::{AppliedProposal, ApplyOutcome, EventRow, StoredProposal};
+pub use repo::{AppliedProposal, ApplyOutcome, EventRow, StoredProposal, TodayView};
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
@@ -167,6 +167,18 @@ pub mod test_hooks {
             .await?
             .get::<i64, _>("n"),
         )
+    }
+
+    /// Backdate a task's `created_at` via raw SQL — the only way a test can
+    /// put a task on "an earlier day" for `today_view`'s carry-over-candidate
+    /// rule without sleeping past a UTC day boundary.
+    pub async fn set_task_created_at(store: &Sin90Store, id: &str, created_at: &str) -> Result<()> {
+        sqlx::query("UPDATE sin90_tasks SET created_at = ? WHERE id = ?")
+            .bind(created_at)
+            .bind(id)
+            .execute(store.pool())
+            .await?;
+        Ok(())
     }
 
     pub async fn proposal_status(store: &Sin90Store, id: &str) -> Result<Option<String>> {

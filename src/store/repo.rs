@@ -103,6 +103,37 @@ fn from_wire<T: DeserializeOwned>(s: &str) -> Result<T> {
     ))?)
 }
 
+/// Shared row→`Task` mapping for the read paths that select the full column
+/// list (`list_tasks`, `today_view`'s three task queries) — introduced with
+/// `today_view` so a fourth near-identical `SELECT ... FROM sin90_tasks`
+/// projection didn't mean a fourth copy of this mapping.
+fn row_to_task(r: sqlx::sqlite::SqliteRow) -> Result<Task> {
+    Ok(Task {
+        id: r.get("id"),
+        direction_id: r.get("direction_id"),
+        week_id: r.get("week_id"),
+        parent_task_id: r.get("parent_task_id"),
+        title: r.get("title"),
+        status: from_wire(&r.get::<String, _>("status"))?,
+        kind: from_wire(&r.get::<String, _>("kind"))?,
+        energy: from_wire(&r.get::<String, _>("energy"))?,
+        est_minutes: r.get::<Option<i64>, _>("est_minutes").map(|m| m as u32),
+        carried_from: r.get("carried_from"),
+        created_at: r.get("created_at"),
+        updated_at: r.get("updated_at"),
+    })
+}
+
+/// `GET /today`'s response shape (design M1). Every field is a plain read —
+/// see [`Sin90Store::today_view`] for the selection rules behind each one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct TodayView {
+    pub must_do: Vec<Task>,
+    pub deep_block: Option<ScheduleBlock>,
+    pub inbox: Vec<Task>,
+    pub carry_over_candidates: Vec<Task>,
+}
+
 type Tx<'a> = Transaction<'a, Sqlite>;
 
 // One low-level append; the fixed event-row shape is clearer as positional args
@@ -670,24 +701,120 @@ impl Sin90Store {
             q = q.bind(to_wire(&s)?);
         }
         let rows = q.fetch_all(self.pool()).await?;
-        rows.into_iter()
-            .map(|r| {
-                Ok(Task {
-                    id: r.get("id"),
-                    direction_id: r.get("direction_id"),
-                    week_id: r.get("week_id"),
-                    parent_task_id: r.get("parent_task_id"),
-                    title: r.get("title"),
-                    status: from_wire(&r.get::<String, _>("status"))?,
-                    kind: from_wire(&r.get::<String, _>("kind"))?,
-                    energy: from_wire(&r.get::<String, _>("energy"))?,
-                    est_minutes: r.get::<Option<i64>, _>("est_minutes").map(|m| m as u32),
-                    carried_from: r.get("carried_from"),
-                    created_at: r.get("created_at"),
-                    updated_at: r.get("updated_at"),
-                })
+        rows.into_iter().map(row_to_task).collect()
+    }
+
+    /// `GET /today` (design M1). Four sections, every one a plain read — this
+    /// method itself never writes, so `/today` "does not land a third table"
+    /// (M1's acceptance line) is true of the whole call, not just the response
+    /// shape: no row, temp table, or cache is created to answer it.
+    ///
+    /// The selection rules below are M1's own judgment calls, not anything the
+    /// design doc pins down further than "3 things" / "90-minute block" /
+    /// "carry-over candidates" — Task has no priority or due-date column yet
+    /// (that's out of M1's scope: adding one would be a data-model change, and
+    /// M1 is a read-only view over what M0 already stores), so every rule here
+    /// is built only from `status` and `created_at`:
+    ///
+    /// - **must-do (≤3)**: tasks that already have a `direction_id` (an inbox
+    ///   item isn't "must-do" until a human puts it under a Direction),
+    ///   ordered `in_progress` first (finish what's started before starting
+    ///   more), then `planned`, then `backlog`; oldest-first within each tier
+    ///   so a task doesn't rot at the bottom of an ever-growing backlog.
+    /// - **deep block**: the single oldest still-`planned` `ScheduleBlock`
+    ///   (FIFO). `ScheduleBlock` has no "which day" column in M0's schema, so
+    ///   this is deliberately NOT "today's block" in the calendar sense — it's
+    ///   "the next one queued" — until M3's `Routine`/scheduling work gives
+    ///   blocks a day to belong to.
+    /// - **inbox**: `direction_id IS NULL` tasks not yet `done`/`dropped`
+    ///   (M1's "not-yet-classified" bucket, oldest first).
+    /// - **carry-over candidates**: `in_progress` tasks (WITH a direction —
+    ///   distinct from inbox) whose `created_at` falls before today's UTC date
+    ///   boundary — started on an earlier day and still open, so a human
+    ///   should decide whether to keep pushing, drop, or (M2) actually
+    ///   `CarryOverTask` it into next week.
+    pub async fn today_view(&self) -> Result<TodayView> {
+        let today_start = format!("{}T00:00:00Z", &now_iso8601()[..10]);
+
+        let must_do = sqlx::query(
+            "SELECT id, direction_id, week_id, parent_task_id, title, status, kind, energy,
+                    est_minutes, carried_from, created_at, updated_at
+             FROM sin90_tasks
+             WHERE direction_id IS NOT NULL
+               AND status IN ('in_progress', 'planned', 'backlog')
+             ORDER BY
+               CASE status
+                 WHEN 'in_progress' THEN 0
+                 WHEN 'planned' THEN 1
+                 ELSE 2
+               END,
+               created_at ASC
+             LIMIT 3",
+        )
+        .fetch_all(self.pool())
+        .await?
+        .into_iter()
+        .map(row_to_task)
+        .collect::<Result<Vec<_>>>()?;
+
+        let deep_block = sqlx::query(
+            "SELECT id, direction_id, task_id, status, planned_minutes, created_at, updated_at
+             FROM sin90_schedule_blocks
+             WHERE status = 'planned'
+             ORDER BY created_at ASC
+             LIMIT 1",
+        )
+        .fetch_optional(self.pool())
+        .await?
+        .map(|r| {
+            Ok::<_, StoreError>(ScheduleBlock {
+                id: r.get("id"),
+                direction_id: r.get("direction_id"),
+                task_id: r.get("task_id"),
+                status: from_wire(&r.get::<String, _>("status"))?,
+                planned_minutes: r.get::<i64, _>("planned_minutes") as u32,
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
             })
-            .collect()
+        })
+        .transpose()?;
+
+        let inbox = sqlx::query(
+            "SELECT id, direction_id, week_id, parent_task_id, title, status, kind, energy,
+                    est_minutes, carried_from, created_at, updated_at
+             FROM sin90_tasks
+             WHERE direction_id IS NULL
+               AND status NOT IN ('done', 'dropped')
+             ORDER BY created_at ASC",
+        )
+        .fetch_all(self.pool())
+        .await?
+        .into_iter()
+        .map(row_to_task)
+        .collect::<Result<Vec<_>>>()?;
+
+        let carry_over_candidates = sqlx::query(
+            "SELECT id, direction_id, week_id, parent_task_id, title, status, kind, energy,
+                    est_minutes, carried_from, created_at, updated_at
+             FROM sin90_tasks
+             WHERE direction_id IS NOT NULL
+               AND status = 'in_progress'
+               AND created_at < ?
+             ORDER BY created_at ASC",
+        )
+        .bind(&today_start)
+        .fetch_all(self.pool())
+        .await?
+        .into_iter()
+        .map(row_to_task)
+        .collect::<Result<Vec<_>>>()?;
+
+        Ok(TodayView {
+            must_do,
+            deep_block,
+            inbox,
+            carry_over_candidates,
+        })
     }
 
     // ----- reads (list + detail) ---------------------------------------------
