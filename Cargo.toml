@@ -36,4 +36,7 @@ test-hooks = []
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
+futures = { version = "0.3", default-features = false, features = ["std"] }
+rustix = { version = "0.38", features = ["process"] }
 

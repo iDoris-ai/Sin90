@@ -89,7 +89,7 @@ async fn a_real_process_serves_http_and_a_second_process_sees_what_the_first_wro
 
         let resp = client
             .post(format!("{}/areas", server.base()))
-            .bearer_auth("blackbox-human-key")
+            .header("x-sin90-actor-key", "blackbox-human-key")
             .json(&serde_json::json!({"title": "Work"}))
             .send()
             .await
