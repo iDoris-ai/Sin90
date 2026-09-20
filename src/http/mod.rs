@@ -130,6 +130,8 @@ pub fn router(state: Sin90State) -> axum::Router {
         .route("/attention", get(attention))
         .route("/events", get(list_events))
         .route("/packs/install", post(install_pack))
+        .route("/capture", post(capture))
+        .route("/today", get(today))
         .with_state(state)
 }
 
@@ -205,6 +207,12 @@ struct BlockTransitionReq {
 struct AttentionQuery {
     start: String,
     end: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaptureReq {
+    text: String,
 }
 
 #[derive(Deserialize)]
@@ -571,6 +579,60 @@ async fn install_pack(State(state): State<Sin90State>, headers: HeaderMap) -> Re
             )
                 .into_response()
         }
+        Err(e) => map_err(e),
+    }
+}
+
+// ---- Capture / Today (design M1) --------------------------------------------
+
+/// `POST /capture` — a raw, unclassified note (design M1). Lands as an
+/// ordinary `direction_id = NULL` `Task` (no new entity, per M1's own
+/// acceptance line) via the same `create_task` path `POST /tasks` uses, just
+/// with every optional field left at its default.
+///
+/// Gate: `require_any_actor`, not `require_human`. This is a deliberate
+/// departure from every other direct-write route above. Capture is the one
+/// direct write this design treats as low-stakes enough for either actor:
+/// it commits nothing (no `direction_id`, no plan, no state machine edge —
+/// it can only ever be sitting in `backlog`), and a future automated
+/// intake (a script watching some inbox) capturing a raw note is exactly
+/// the kind of provisional, needs-a-human-later action `Sin90Proposal`
+/// exists for in spirit, if not literally through that table. The line
+/// design §7.1 actually draws is "AI must not commit state a human hasn't
+/// reviewed" — an inbox item a human still has to triage, categorize, and
+/// promote out of `backlog` before it does anything, has not had state
+/// committed to it in that sense.
+async fn capture(State(state): State<Sin90State>, headers: HeaderMap, body: Bytes) -> Response {
+    if let Err(r) = state.require_any_actor(&headers) {
+        return r;
+    }
+    let req: CaptureReq = match parse(&body, "capture") {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    match state
+        .store
+        .create_task(&req.text, None, None, TaskKind::Other, Energy::Mid, None)
+        .await
+    {
+        Ok(t) => {
+            state.emit(
+                "task.created",
+                serde_json::json!({ "id": t.id, "direction_id": t.direction_id, "parent_task_id": t.parent_task_id }),
+            );
+            (StatusCode::CREATED, Json(t)).into_response()
+        }
+        Err(e) => map_err(e),
+    }
+}
+
+/// `GET /today` (design M1) — a pure read composed of four independent
+/// queries; see [`crate::store::Sin90Store::today_view`] for the selection
+/// rule behind each section. No auth gate: reading the view commits nothing,
+/// same posture as `GET /tasks` / `GET /areas` above.
+async fn today(State(state): State<Sin90State>) -> Response {
+    match state.store.today_view().await {
+        Ok(view) => Json(view).into_response(),
         Err(e) => map_err(e),
     }
 }
