@@ -61,8 +61,17 @@ fn build_agent24d(checkout: &Path) -> PathBuf {
     bin
 }
 
+/// `/tmp` directly, NOT `std::env::temp_dir()` — on macOS the latter resolves
+/// through `/var/folders/<hash>/<hash>/T`, and the daemon's out-of-process
+/// callback socket lives at `<home>/.agent24/run/<pid>/callback.sock`. `sockaddr_un`
+/// caps the whole path at ~103 usable bytes; the `/var/folders` prefix alone is
+/// long enough to blow that budget before this function adds anything, and the
+/// daemon then degrades every out-of-process module with `"callback sockets ...
+/// would be longer than 103 bytes"` — not a Sin90 bug, a test fixture picking too
+/// long a home directory (mirrors `agent24d/tests/me3f_blackbox.rs`'s own
+/// `tempdir_in("/tmp")`, which exists for the identical reason).
 fn tmp_home(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("sin90-a24mount-{tag}-{}", std::process::id()));
+    let dir = Path::new("/tmp").join(format!("sin90-a24mount-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -96,26 +105,39 @@ fn install_sin90(packages_root: &Path, sin90_bin: &Path) {
     }
 }
 
-fn http_get(port: u16, token: Option<&str>, path: &str) -> Option<(u16, String)> {
-    http_call(port, "GET", path, token, None)
+/// `daemon_token` is Agent24's OWN kernel bearer token (`server.rs::auth` —
+/// every `/api/v1/*` route except `GET /api/v1/health` requires it, domain-OS
+/// routes included: `mount_all`'s routes fold in BEFORE `.layer(auth)`, so the
+/// layer covers them too). It is unrelated to, and does not substitute for,
+/// Sin90's OWN `x-sin90-actor-key` gate (`actor_key`) — the kernel's proxy
+/// (`agent24-os-proto::proxy::forward`) strips `Authorization` before handing
+/// the request to Sin90, so a caller through the real proxy needs BOTH: the
+/// daemon token to get past the kernel, and (for a gated Sin90 route) the
+/// actor key to get past Sin90 itself.
+fn http_get(port: u16, daemon_token: Option<&str>, path: &str) -> Option<(u16, String)> {
+    http_call(port, "GET", path, daemon_token, None, None)
 }
 
 fn http_call(
     port: u16,
     method: &str,
     path: &str,
-    token: Option<&str>,
+    daemon_token: Option<&str>,
+    actor_key: Option<&str>,
     body: Option<&str>,
 ) -> Option<(u16, String)> {
     let mut s = TcpStream::connect(("127.0.0.1", port)).ok()?;
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let auth = token
+    let auth = daemon_token
         .map(|t| format!("authorization: Bearer {t}\r\n"))
+        .unwrap_or_default();
+    let actor = actor_key
+        .map(|k| format!("x-sin90-actor-key: {k}\r\n"))
         .unwrap_or_default();
     let body = body.unwrap_or("");
     write!(
         s,
-        "{method} {path} HTTP/1.1\r\nhost: x\r\n{auth}content-type: application/json\r\n\
+        "{method} {path} HTTP/1.1\r\nhost: x\r\n{auth}{actor}content-type: application/json\r\n\
          content-length: {}\r\nconnection: close\r\n\r\n{body}",
         body.len()
     )
@@ -189,7 +211,20 @@ impl Daemon {
                 .chain(self.stderr.lock().unwrap().iter())
             {
                 if let Some(pos) = line.find(&marker) {
-                    return line[pos + marker.len()..].trim().to_owned();
+                    // The key itself has no internal whitespace, but the REST of
+                    // this log line does not end there: Agent24's daemon
+                    // re-logs each captured stdout/stderr line with its own
+                    // trailing `module="sin90" stream="stderr" cut=false`
+                    // tracing fields appended on the SAME line — `.trim()`
+                    // alone slurped those in as part of the "key", which then
+                    // failed every actor-key check downstream with no error
+                    // clearer than a generic 401/400. Take only the first
+                    // whitespace-delimited token after the marker.
+                    return line[pos + marker.len()..]
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned();
                 }
             }
             assert!(
@@ -386,7 +421,7 @@ fn sin90_mounts_under_a_real_agent24_daemon() {
     // call rather than gating on the list; this does the same.
     let deadline = Instant::now() + Duration::from_secs(30);
     let today = loop {
-        if let Some((status, body)) = http_get(d2.port, None, "/api/v1/sin90/today") {
+        if let Some((status, body)) = http_get(d2.port, Some(&d2.token), "/api/v1/sin90/today") {
             if status == 200 || Instant::now() >= deadline {
                 assert_eq!(status, 200, "daemon log:\n{}", d2.combined_log());
                 break body;
@@ -417,7 +452,15 @@ fn sin90_mounts_under_a_real_agent24_daemon() {
     //    (`/capture`), and `require_human` (`/areas`, `/tasks`).
     let human_key = d2.wait_for_generated_key("HUMAN", Duration::from_secs(10));
 
-    let (status, body) = http_call(d2.port, "GET", "/api/v1/sin90/areas", None, None).unwrap();
+    let (status, body) = http_call(
+        d2.port,
+        "GET",
+        "/api/v1/sin90/areas",
+        Some(&d2.token),
+        None,
+        None,
+    )
+    .unwrap();
     assert_eq!(status, 200, "{body}");
     assert!(
         serde_json::from_str::<serde_json::Value>(&body).unwrap()["areas"]
@@ -431,6 +474,7 @@ fn sin90_mounts_under_a_real_agent24_daemon() {
         d2.port,
         "POST",
         "/api/v1/sin90/areas",
+        Some(&d2.token),
         Some(&human_key),
         Some(r#"{"title":"Work"}"#),
     )
@@ -443,6 +487,7 @@ fn sin90_mounts_under_a_real_agent24_daemon() {
         d2.port,
         "POST",
         "/api/v1/sin90/tasks",
+        Some(&d2.token),
         Some(&human_key),
         Some(r#"{"title":"ship it","direction_id":null,"parent_task_id":null}"#),
     )
@@ -455,6 +500,7 @@ fn sin90_mounts_under_a_real_agent24_daemon() {
         d2.port,
         "PATCH",
         &format!("/api/v1/sin90/tasks/{task_id}"),
+        Some(&d2.token),
         Some(&human_key),
         Some(r#"{"to":"planned"}"#),
     )
@@ -465,20 +511,27 @@ fn sin90_mounts_under_a_real_agent24_daemon() {
     );
 
     // `POST /capture` accepts EITHER actor key by design (§7.1) — call it
-    // with no key at all to also confirm `require_any_actor` genuinely
-    // means "some recognized key", not "no gate", the way `today`/`areas`
-    // GETs above have none at all.
+    // with no ACTOR key (but still the daemon token, so this exercises
+    // Sin90's own `require_any_actor` gate specifically, not the kernel's
+    // separate `Authorization` check) to confirm `require_any_actor`
+    // genuinely means "some recognized key", not "no gate", the way
+    // `today`/`areas` GETs above have none at all.
     let no_key_capture = http_call(
         d2.port,
         "POST",
         "/api/v1/sin90/capture",
+        Some(&d2.token),
         None,
         Some(r#"{"text":"note"}"#),
     );
     assert_eq!(
         no_key_capture.as_ref().map(|(s, _)| *s),
-        Some(401),
-        "capture with no key at all must still be rejected: {no_key_capture:?}"
+        // 403, not 401: Sin90's own `http::actor::forbidden` (design §7.1)
+        // uses FORBIDDEN for "no recognized actor key", distinct from the
+        // kernel's own 401 for a missing/wrong DAEMON token — two different
+        // gates, two different status codes, on purpose.
+        Some(403),
+        "capture with no actor key at all must still be rejected: {no_key_capture:?}"
     );
 
     // ── A3: this is NOT the "seven routes" T11 was originally scoped
@@ -491,6 +544,7 @@ fn sin90_mounts_under_a_real_agent24_daemon() {
         d2.port,
         "POST",
         "/api/v1/sin90/capture",
+        Some(&d2.token),
         Some(&human_key),
         Some(r#"{"text":"a real note, captured through the real proxy"}"#),
     )
@@ -498,16 +552,29 @@ fn sin90_mounts_under_a_real_agent24_daemon() {
     assert_eq!(status, 201, "{body}");
 
     // ── Event forwarding, at the real WS consumer boundary ──────────────
+    // The writes above emitted several `module`/`sin90` events in sequence
+    // (`area.created`, `task.created`, `task.transitioned`, two
+    // `capture`-triggered `task.created`s) — the subscriber started before
+    // any of them, so it sees all of them in order. Matching specifically on
+    // `task.created` for THIS test's `task_id` (not just "the first sin90
+    // event") is what actually proves forwarding works, not merely that
+    // some event arrived.
     let overall_deadline = Instant::now() + Duration::from_secs(30);
     let event = loop {
         let remaining = overall_deadline.saturating_duration_since(Instant::now());
         assert!(
             !remaining.is_zero(),
-            "never observed sin90's task.created event on the real WS boundary; daemon log:\n{}",
+            "never observed sin90's task.created event (id {task_id}) on the real WS boundary; \
+             daemon log:\n{}",
             d2.combined_log()
         );
         match events.recv_timeout(remaining.min(Duration::from_secs(5))) {
-            Ok(event) if event["type"] == "module" && event["payload"]["module"] == "sin90" => {
+            Ok(event)
+                if event["type"] == "module"
+                    && event["payload"]["module"] == "sin90"
+                    && event["payload"]["kind"] == "task.created"
+                    && event["payload"]["payload"]["id"] == task_id =>
+            {
                 break event
             }
             Ok(_) => continue,

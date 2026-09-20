@@ -291,17 +291,27 @@ async fn read_frame(reader: &mut BufReader<UnixStream>) -> Result<Vec<u8>, Adapt
     Ok(buf)
 }
 
-/// Build a `tokio::net::TcpListener` from the kernel-bound `A24_LISTEN_FD`.
+/// Build a `tokio::net::UnixListener` from the kernel-bound `A24_LISTEN_FD`.
+///
+/// Agent24's `agent24-os-proto::launch::LaunchSpec::listener` is a
+/// `std::os::unix::net::UnixListener` (FU-60: "a Unix domain socket, not a
+/// TCP port") — wrapping this fd as a `TcpListener` compiles and even binds,
+/// but every real `accept()` on it then fails with `EINVAL` ("invalid input
+/// parameter"), because the fd's actual address family is `AF_UNIX`, not
+/// `AF_INET`. Caught by `tests/agent24_mount_blackbox.rs` against a real
+/// daemon — no unit test using a loopback TCP or Unix socket of its own
+/// choosing could have caught this, since both sides would agree with
+/// themselves about which family to use.
 ///
 /// # Safety
 /// The fd is a real, kernel-opened, non-owned-by-anything-else listener
 /// socket for the lifetime of this process — that is the entire contract
 /// `A24_LISTEN_FD` exists to state (`docs/STATUS.md`). This function must be
 /// called at most once per process.
-pub fn listener_from_fd(fd: i32) -> std::io::Result<tokio::net::TcpListener> {
-    let std_listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+pub fn listener_from_fd(fd: i32) -> std::io::Result<tokio::net::UnixListener> {
+    let std_listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
     std_listener.set_nonblocking(true)?;
-    tokio::net::TcpListener::from_std(std_listener)
+    tokio::net::UnixListener::from_std(std_listener)
 }
 
 #[cfg(test)]

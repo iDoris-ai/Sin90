@@ -60,7 +60,7 @@ fn automation_req(method: &str, uri: &str, body: Value) -> Request<Body> {
         .method(method)
         .uri(uri)
         .header(header::CONTENT_TYPE, "application/json")
-        .header(header::AUTHORIZATION, format!("Bearer {AUTOMATION}"))
+        .header("x-sin90-actor-key", AUTOMATION)
         .body(Body::from(body.to_string()))
         .unwrap()
 }
@@ -70,7 +70,7 @@ fn human_req(method: &str, uri: &str, body: Value) -> Request<Body> {
         .method(method)
         .uri(uri)
         .header(header::CONTENT_TYPE, "application/json")
-        .header(header::AUTHORIZATION, format!("Bearer {HUMAN}"))
+        .header("x-sin90-actor-key", HUMAN)
         .body(Body::from(body.to_string()))
         .unwrap()
 }
@@ -340,7 +340,7 @@ async fn automation_key_cannot_write_directly_but_can_submit_a_proposal() {
         .method("POST")
         .uri("/areas")
         .header(header::CONTENT_TYPE, "application/json")
-        .header(header::AUTHORIZATION, format!("Bearer {AUTOMATION}"))
+        .header("x-sin90-actor-key", AUTOMATION)
         .body(Body::from(json!({"title": "x"}).to_string()))
         .unwrap();
     let resp = app.clone().oneshot(direct).await.unwrap();
@@ -354,7 +354,7 @@ async fn automation_key_cannot_write_directly_but_can_submit_a_proposal() {
         .method("POST")
         .uri("/proposals")
         .header(header::CONTENT_TYPE, "application/json")
-        .header(header::AUTHORIZATION, format!("Bearer {AUTOMATION}"))
+        .header("x-sin90-actor-key", AUTOMATION)
         .body(Body::from(
             json!({
                 "id": "p1", "status": "pending", "source": "local_brain",
@@ -380,7 +380,7 @@ async fn proposal_round_trip_creates_area_only_after_accept() {
         .method("POST")
         .uri("/proposals")
         .header(header::CONTENT_TYPE, "application/json")
-        .header(header::AUTHORIZATION, format!("Bearer {AUTOMATION}"))
+        .header("x-sin90-actor-key", AUTOMATION)
         .body(Body::from(
             json!({
                 "id": "p1", "status": "pending", "source": "local_brain",
@@ -401,7 +401,7 @@ async fn proposal_round_trip_creates_area_only_after_accept() {
     let accept = Request::builder()
         .method("POST")
         .uri("/proposals/p1/accept")
-        .header(header::AUTHORIZATION, format!("Bearer {AUTOMATION}"))
+        .header("x-sin90-actor-key", AUTOMATION)
         .body(Body::empty())
         .unwrap();
     assert_eq!(
@@ -752,7 +752,7 @@ fn automation_proposal(body: Value) -> Request<Body> {
         .method("POST")
         .uri("/proposals")
         .header(header::CONTENT_TYPE, "application/json")
-        .header(header::AUTHORIZATION, format!("Bearer {AUTOMATION}"))
+        .header("x-sin90-actor-key", AUTOMATION)
         .body(Body::from(body.to_string()))
         .unwrap()
 }
@@ -761,7 +761,7 @@ fn accept_req(id: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri(format!("/proposals/{id}/accept"))
-        .header(header::AUTHORIZATION, format!("Bearer {AUTOMATION}"))
+        .header("x-sin90-actor-key", AUTOMATION)
         .body(Body::empty())
         .unwrap()
 }

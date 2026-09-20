@@ -102,6 +102,18 @@ async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = listener_from_fd(env.listen_fd)?;
     tracing::info!("sin90: accepting on kernel-bound listener");
-    axum::serve(listener, router(state)).await?;
+    // Agent24's proxy forwards the ORIGINAL request path, not a
+    // namespace-stripped one (`agent24-os-proto::proxy::forward` builds the
+    // upstream URI from `original.path_and_query()` verbatim) — so a request
+    // for `_a24/memory/private/remember`-style Sin90 routes arrives here as
+    // `/api/v1/sin90/today`, not `/today`. Agent24 also enforces
+    // `route_namespace == "/api/v1/{name}"` at manifest validation
+    // (`agent24-domain`), so hardcoding it here can never drift from what
+    // `domain-os.yml` declares without the kernel refusing to mount at all.
+    // `router(state)` itself stays un-nested — `run_standalone` and every
+    // existing test call it directly at bare paths, and both are legitimate:
+    // Sin90 served on its own vs. Sin90 served behind Agent24's proxy.
+    let mounted = axum::Router::new().nest("/api/v1/sin90", router(state));
+    axum::serve(listener, mounted).await?;
     Ok(())
 }

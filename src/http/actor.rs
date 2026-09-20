@@ -51,7 +51,7 @@ impl ActorKeys {
         Self { human, automation }
     }
 
-    /// Identify the actor behind `Authorization: Bearer <key>`. `None` means
+    /// Identify the actor behind the `x-sin90-actor-key` header. `None` means
     /// no recognized key was presented at all (missing header, or a key that
     /// matches neither).
     pub fn identify(&self, headers: &HeaderMap) -> Option<Actor> {
@@ -82,11 +82,17 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// `x-sin90-actor-key`, deliberately NOT the standard `Authorization` header:
+/// `agent24-os-proto::proxy` strips `Authorization`/`Cookie` (and anything
+/// `X-A24-*`) from every request before it reaches an out-of-process module —
+/// a key read off `Authorization` would always be `None` for every request
+/// that actually arrived through Agent24's real proxy, only ever working in
+/// tests that call `router()` directly. Caught by
+/// `tests/agent24_mount_blackbox.rs` against a real daemon.
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     headers
-        .get(axum::http::header::AUTHORIZATION)
+        .get("x-sin90-actor-key")
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
 }
 
 fn random_key() -> String {
@@ -127,16 +133,13 @@ mod tests {
         let k = keys();
         let mut h = HeaderMap::new();
         h.insert(
-            "authorization",
-            HeaderValue::from_static("Bearer human-secret"),
+            "x-sin90-actor-key",
+            HeaderValue::from_static("human-secret"),
         );
         assert_eq!(k.identify(&h), Some(Actor::Human));
 
         let mut a = HeaderMap::new();
-        a.insert(
-            "authorization",
-            HeaderValue::from_static("Bearer auto-secret"),
-        );
+        a.insert("x-sin90-actor-key", HeaderValue::from_static("auto-secret"));
         assert_eq!(k.identify(&a), Some(Actor::Automation));
     }
 
@@ -146,8 +149,18 @@ mod tests {
         assert_eq!(k.identify(&HeaderMap::new()), None);
 
         let mut wrong = HeaderMap::new();
-        wrong.insert("authorization", HeaderValue::from_static("Bearer nope"));
+        wrong.insert("x-sin90-actor-key", HeaderValue::from_static("nope"));
         assert_eq!(k.identify(&wrong), None);
+
+        // Regression: `Authorization` must NOT be recognized — Agent24's real
+        // proxy strips it before a request reaches this module, so a key read
+        // off it would only ever work in a test that bypasses the proxy.
+        let mut auth_header = HeaderMap::new();
+        auth_header.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer human-secret"),
+        );
+        assert_eq!(k.identify(&auth_header), None);
     }
 
     #[test]
