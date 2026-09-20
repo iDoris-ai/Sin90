@@ -28,7 +28,9 @@ use axum::routing::{get, patch, post};
 use axum::Json;
 use serde::Deserialize;
 
-use crate::core::{AreaStatus, Energy, ScheduleBlockStatus, Sin90Proposal, TaskKind, TaskStatus};
+use crate::core::{
+    AreaStatus, Energy, ScheduleBlockStatus, Sin90Proposal, TaskKind, TaskStatus, WeekStatus,
+};
 use crate::store::StoreError;
 
 pub use actor::{Actor, ActorKeys};
@@ -124,6 +126,9 @@ pub fn router(state: Sin90State) -> axum::Router {
         .route("/tasks/{id}", patch(transition_task))
         .route("/schedule-blocks", post(create_block).get(list_blocks))
         .route("/schedule-blocks/{id}", patch(transition_block))
+        .route("/weeks", post(create_week).get(list_weeks))
+        .route("/weeks/{id}", patch(transition_week))
+        .route("/weeks/{id}/attention", get(week_attention))
         .route("/proposals", post(submit_proposal).get(list_proposals))
         .route("/proposals/{id}", get(get_proposal))
         .route("/proposals/{id}/accept", post(accept_proposal))
@@ -207,6 +212,18 @@ struct BlockTransitionReq {
 struct AttentionQuery {
     start: String,
     end: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewWeekReq {
+    iso_week: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WeekTransitionReq {
+    to: WeekStatus,
 }
 
 #[derive(Deserialize)]
@@ -445,6 +462,76 @@ async fn transition_block(
 async fn list_blocks(State(state): State<Sin90State>) -> Response {
     match state.store.list_blocks().await {
         Ok(v) => Json(serde_json::json!({ "blocks": v })).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
+// ---- Week handlers (new, design M2) -----------------------------------------
+
+/// `POST /weeks` — open a new week (`planning`). Direct write, human gate:
+/// starting a week is a planning-ritual action, same convention as
+/// `create_area`/`create_task` above, not something an automated intake
+/// should be minting on its own.
+async fn create_week(State(state): State<Sin90State>, headers: HeaderMap, body: Bytes) -> Response {
+    if let Err(r) = state.require_human(&headers) {
+        return r;
+    }
+    let req: NewWeekReq = match parse(&body, "week") {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    match state.store.create_week(&req.iso_week).await {
+        Ok(w) => {
+            state.emit(
+                "week.created",
+                serde_json::json!({ "id": w.id, "iso_week": w.iso_week }),
+            );
+            (StatusCode::CREATED, Json(w)).into_response()
+        }
+        Err(e) => map_err(e),
+    }
+}
+
+async fn list_weeks(State(state): State<Sin90State>) -> Response {
+    match state.store.list_weeks().await {
+        Ok(v) => Json(serde_json::json!({ "weeks": v })).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
+/// `PATCH /weeks/{id}` — `planning -> active -> reviewing -> closed`. Direct
+/// write, human gate, same convention as `transition_area`/`transition_task`.
+async fn transition_week(
+    State(state): State<Sin90State>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    body: Bytes,
+) -> Response {
+    if let Err(r) = state.require_human(&headers) {
+        return r;
+    }
+    let req: WeekTransitionReq = match parse(&body, "week transition") {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    match state.store.transition_week(&id, req.to).await {
+        Ok(w) => {
+            state.emit(
+                "week.transitioned",
+                serde_json::json!({ "week_id": w.id, "to": w.status }),
+            );
+            Json(w).into_response()
+        }
+        Err(e) => map_err(e),
+    }
+}
+
+/// `GET /weeks/{id}/attention` — planned vs. actual for this week (design M2
+/// acceptance line). No auth gate: a read commits nothing, same posture as
+/// `GET /tasks`/`GET /today`.
+async fn week_attention(State(state): State<Sin90State>, AxPath(id): AxPath<String>) -> Response {
+    match state.store.week_attention(&id).await {
+        Ok(a) => Json(a).into_response(),
         Err(e) => map_err(e),
     }
 }

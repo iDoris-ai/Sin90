@@ -36,6 +36,19 @@ pub struct AttentionDailyRow {
     pub actual_min: i64,
 }
 
+/// Planned vs. actual for one Week (design M2). See
+/// [`crate::store::repo::Sin90Store::week_attention`] for why `planned_min`
+/// is a live query and `actual_min` is pure event replay — two different
+/// sourcing disciplines on purpose, not an inconsistency.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeekAttention {
+    pub week_id: String,
+    pub planned_min: i64,
+    pub actual_min: i64,
+    /// `actual_min - planned_min`. Negative = under; positive = over.
+    pub deviation_min: i64,
+}
+
 impl Sin90Store {
     /// Pure replay: realized minutes per direction for `[start, end)` (ISO-8601
     /// bounds, lexical compare == chronological on fixed-width UTC).

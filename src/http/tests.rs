@@ -741,3 +741,390 @@ async fn today_carry_over_candidates_are_in_progress_tasks_started_before_today(
          one started today (however in-progress) is not yet stale"
     );
 }
+
+// ============================================================================
+// M2 — Work Pack: Week lifecycle, CreateTasks/CarryOverTask via Proposal,
+// week_attention (planned vs. actual, pure event replay for the actual side).
+// ============================================================================
+
+fn automation_proposal(body: Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/proposals")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {AUTOMATION}"))
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+fn accept_req(id: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(format!("/proposals/{id}/accept"))
+        .header(header::AUTHORIZATION, format!("Bearer {AUTOMATION}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn week_full_lifecycle_planning_to_closed() {
+    let (app, _sink) = test_app().await;
+    let week = body_json(
+        app.clone()
+            .oneshot(human_req("POST", "/weeks", json!({"iso_week": "2026-W40"})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(week["status"], "planning");
+    let id = week["id"].as_str().unwrap().to_string();
+
+    for to in ["active", "reviewing", "closed"] {
+        let resp = app
+            .clone()
+            .oneshot(human_req(
+                "PATCH",
+                &format!("/weeks/{id}"),
+                json!({"to": to}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "planning->...->{to}");
+        let body = body_json(resp).await;
+        assert_eq!(body["status"], to);
+    }
+}
+
+#[tokio::test]
+async fn week_illegal_transition_is_rejected_and_no_state_moves() {
+    // Regression for "judgement must first be verified": a matrix that only
+    // ever sees legal transitions in tests can't tell "correctly permissive"
+    // from "checks nothing" apart. Skipping straight from planning to
+    // reviewing (over active) must be rejected.
+    let (app, _sink) = test_app().await;
+    let week = body_json(
+        app.clone()
+            .oneshot(human_req("POST", "/weeks", json!({"iso_week": "2026-W41"})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let id = week["id"].as_str().unwrap().to_string();
+
+    let resp = app
+        .clone()
+        .oneshot(human_req(
+            "PATCH",
+            &format!("/weeks/{id}"),
+            json!({"to": "reviewing"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // Still `planning` — the rejected PATCH must not have partially applied.
+    let weeks = body_json(app.oneshot(get_req("/weeks")).await.unwrap()).await;
+    let w = weeks["weeks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["id"] == id)
+        .unwrap();
+    assert_eq!(w["status"], "planning");
+}
+
+/// Shared setup for the two tests below: an Area + Direction (so created
+/// tasks are findable via `GET /tasks?direction_id=`, which has no
+/// `week_id` filter of its own) and an open Week.
+async fn area_direction_and_open_week(app: &axum::Router) -> (String, String) {
+    let area = body_json(
+        app.clone()
+            .oneshot(human_req("POST", "/areas", json!({"title": "工作"})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let direction = body_json(
+        app.clone()
+            .oneshot(human_req(
+                "POST",
+                "/directions",
+                json!({
+                    "title": "Q4 交付 v0.5", "target_window": "2026-Q4",
+                    "area_id": area["id"].as_str().unwrap()
+                }),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let week = body_json(
+        app.clone()
+            .oneshot(human_req("POST", "/weeks", json!({"iso_week": "2026-W42"})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    (
+        direction["id"].as_str().unwrap().to_string(),
+        week["id"].as_str().unwrap().to_string(),
+    )
+}
+
+#[tokio::test]
+async fn carry_over_task_via_proposal_leaves_a_traceable_chain_into_the_next_week() {
+    let (app, _sink) = test_app().await;
+    let (direction_id, week1) = area_direction_and_open_week(&app).await;
+
+    // CreateTasks (design §1.3/§3.3): batch-create into week1, via the
+    // Proposal path — this is the ONLY path that sets a task's `week_id`.
+    let submit = app
+        .clone()
+        .oneshot(automation_proposal(json!({
+            "id": "p-create", "status": "pending", "source": "local_brain",
+            "ops": [{"op": "create_tasks", "week_id": week1,
+                     "tasks": [{"title": "写 M2 设计", "direction_id": direction_id}]}],
+            "rationale": null
+        })))
+        .await
+        .unwrap();
+    assert_eq!(submit.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        app.clone()
+            .oneshot(accept_req("p-create"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+
+    let tasks = body_json(
+        app.clone()
+            .oneshot(get_req(&format!("/tasks?direction_id={direction_id}")))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let tasks = tasks["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 1);
+    let task_id = tasks[0]["id"].as_str().unwrap().to_string();
+    assert_eq!(tasks[0]["status"], "planned");
+    assert_eq!(tasks[0]["week_id"], week1);
+
+    // Advance it partway (direct write — `transition_task` does not gate on
+    // week-open status, only `CreateTasks`/`ReorderTasks`/`CarryOverTask` do).
+    assert_eq!(
+        app.clone()
+            .oneshot(human_req(
+                "PATCH",
+                &format!("/tasks/{task_id}"),
+                json!({"to": "in_progress"})
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+
+    let week2 = body_json(
+        app.clone()
+            .oneshot(human_req("POST", "/weeks", json!({"iso_week": "2026-W43"})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let week2 = week2["id"].as_str().unwrap().to_string();
+
+    let submit = app
+        .clone()
+        .oneshot(automation_proposal(json!({
+            "id": "p-carry", "status": "pending", "source": "local_brain",
+            "ops": [{"op": "carry_over_task", "task_id": task_id, "to_week": week2}],
+            "rationale": null
+        })))
+        .await
+        .unwrap();
+    assert_eq!(submit.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        app.clone()
+            .oneshot(accept_req("p-carry"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+
+    let tasks = body_json(
+        app.oneshot(get_req(&format!("/tasks?direction_id={direction_id}")))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let tasks = tasks["tasks"].as_array().unwrap();
+    assert_eq!(
+        tasks.len(),
+        2,
+        "carry-over closes the source task AND creates a fresh one — the row count must grow, not stay flat"
+    );
+    let old = tasks.iter().find(|t| t["id"] == task_id).unwrap();
+    assert_eq!(
+        old["status"], "carried_over",
+        "the source task is closed, not deleted — it's the chain's first link"
+    );
+    let new = tasks.iter().find(|t| t["id"] != task_id).unwrap();
+    assert_eq!(
+        new["carried_from"], task_id,
+        "the new task must point back to the one it replaced — this is the traceable chain, not a fresh unrelated task"
+    );
+    assert_eq!(new["week_id"], week2);
+    assert_eq!(new["status"], "planned");
+}
+
+#[tokio::test]
+async fn week_attention_computes_planned_vs_actual_purely_from_event_replay() {
+    let (app, _sink) = test_app().await;
+    let (direction_id, week_id) = area_direction_and_open_week(&app).await;
+
+    let submit = app
+        .clone()
+        .oneshot(automation_proposal(json!({
+            "id": "p1", "status": "pending", "source": "local_brain",
+            "ops": [{"op": "create_tasks", "week_id": week_id,
+                     "tasks": [{"title": "deep work", "direction_id": direction_id}]}],
+            "rationale": null
+        })))
+        .await
+        .unwrap();
+    assert_eq!(submit.status(), StatusCode::ACCEPTED);
+    app.clone().oneshot(accept_req("p1")).await.unwrap();
+
+    let tasks = body_json(
+        app.clone()
+            .oneshot(get_req(&format!("/tasks?direction_id={direction_id}")))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let task_id = tasks["tasks"][0]["id"].as_str().unwrap().to_string();
+
+    // A block planned for 90 minutes, in this week's task — before it's
+    // completed, `actual_min` must be 0: the plan exists, nothing happened yet.
+    let block = body_json(
+        app.clone()
+            .oneshot(human_req(
+                "POST",
+                "/schedule-blocks",
+                json!({"direction_id": direction_id, "task_id": task_id, "planned_minutes": 90}),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let block_id = block["id"].as_str().unwrap().to_string();
+
+    let a = body_json(
+        app.clone()
+            .oneshot(get_req(&format!("/weeks/{week_id}/attention")))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(a["planned_min"], 90);
+    assert_eq!(a["actual_min"], 0);
+    assert_eq!(a["deviation_min"], -90);
+
+    // A SECOND block, on a task with NO week (an M1-style inbox task) — this
+    // is the negative control for "the query is scoped by week, not just
+    // summing every completed block system-wide": it must complete without
+    // moving week_id's numbers at all.
+    let unrelated_task = body_json(
+        app.clone()
+            .oneshot(human_req(
+                "POST",
+                "/tasks",
+                json!({"title": "unrelated inbox item"}),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let unrelated_task_id = unrelated_task["id"].as_str().unwrap().to_string();
+    let unrelated_block = body_json(
+        app.clone()
+            .oneshot(human_req(
+                "POST",
+                "/schedule-blocks",
+                json!({"task_id": unrelated_task_id, "planned_minutes": 500}),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let unrelated_block_id = unrelated_block["id"].as_str().unwrap().to_string();
+    for to in ["started", "completed"] {
+        app.clone()
+            .oneshot(human_req(
+                "PATCH",
+                &format!("/schedule-blocks/{unrelated_block_id}"),
+                json!({"to": to}),
+            ))
+            .await
+            .unwrap();
+    }
+    let a = body_json(
+        app.clone()
+            .oneshot(get_req(&format!("/weeks/{week_id}/attention")))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        a["planned_min"], 90,
+        "a block on a task outside this week must not inflate this week's planned total"
+    );
+    assert_eq!(
+        a["actual_min"], 0,
+        "...nor its actual total, even after that unrelated block completes"
+    );
+
+    // Now complete THIS week's block — both numbers must move, and only now.
+    for to in ["started", "completed"] {
+        let resp = app
+            .clone()
+            .oneshot(human_req(
+                "PATCH",
+                &format!("/schedule-blocks/{block_id}"),
+                json!({"to": to}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    let a = body_json(
+        app.oneshot(get_req(&format!("/weeks/{week_id}/attention")))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(a["planned_min"], 90);
+    assert_eq!(
+        a["actual_min"], 90,
+        "actual_min must come from the completed-block event, not from re-reading planned_minutes off the live row"
+    );
+    assert_eq!(a["deviation_min"], 0);
+}
+
+#[tokio::test]
+async fn week_attention_for_an_unknown_week_is_404_not_a_silent_zero() {
+    // Without this check, `week_attention` would happily run its two
+    // COALESCE(...,0) aggregates against a week_id that matches nothing and
+    // report 0/0/0 for a week that was never created — indistinguishable
+    // from a real, empty week. That's a client-facing lie, not "no data yet".
+    let (app, _sink) = test_app().await;
+    let resp = app
+        .oneshot(get_req("/weeks/does-not-exist/attention"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
