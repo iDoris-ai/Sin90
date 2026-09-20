@@ -16,7 +16,7 @@ pub mod attention;
 pub mod packs;
 pub mod repo;
 
-pub use attention::AttentionRow;
+pub use attention::{AttentionRow, WeekAttention};
 pub use packs::{five_life_systems, SeedArea};
 pub use repo::{AppliedProposal, ApplyOutcome, EventRow, StoredProposal, TodayView};
 

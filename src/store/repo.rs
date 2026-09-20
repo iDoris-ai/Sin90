@@ -13,17 +13,17 @@ use std::collections::HashMap;
 
 use crate::core::{
     check_area_transition, check_rhythm_transition, check_schedule_block_transition,
-    check_task_transition, now_iso8601, ulid, validate, week_is_open, Area, AreaStatus, Direction,
-    DirectionStatus, Energy, ProposalSource, ProposalStatus, RhythmStatus, ScheduleBlock,
-    ScheduleBlockStatus, Sin90Op, Sin90Proposal, Task, TaskKind, TaskStatus, ValidationCtx, Week,
-    WeekStatus,
+    check_task_transition, check_week_transition, now_iso8601, ulid, validate, week_is_open, Area,
+    AreaStatus, Direction, DirectionStatus, Energy, ProposalSource, ProposalStatus, RhythmStatus,
+    ScheduleBlock, ScheduleBlockStatus, Sin90Op, Sin90Proposal, Task, TaskKind, TaskStatus,
+    ValidationCtx, Week, WeekStatus,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::json;
 use sqlx::{Row, Sqlite, Transaction};
 
-use crate::store::{Result, Sin90Store, StoreError};
+use crate::store::{Result, Sin90Store, StoreError, WeekAttention};
 
 /// Receipt of a successful (or idempotently-replayed) proposal apply.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -403,6 +403,127 @@ impl Sin90Store {
         })
     }
 
+    pub async fn list_weeks(&self) -> Result<Vec<Week>> {
+        let rows = sqlx::query(
+            "SELECT id, status, iso_week, created_at, updated_at
+             FROM sin90_weeks
+             ORDER BY created_at DESC, rowid DESC",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(|r| {
+                Ok(Week {
+                    id: r.get("id"),
+                    status: from_wire(&r.get::<String, _>("status"))?,
+                    iso_week: r.get("iso_week"),
+                    created_at: r.get("created_at"),
+                    updated_at: r.get("updated_at"),
+                })
+            })
+            .collect()
+    }
+
+    /// Transition a Week through `planning -> active -> reviewing -> closed`
+    /// (design §1.1 — the state machine and `week_is_open`/terminal checks
+    /// were already ported and tested in M0; M2 is the first thing to call
+    /// this transition, planning/reviewing a week is a human weekly-ritual
+    /// action, same convention as `transition_area`/`transition_task`).
+    pub async fn transition_week(&self, id: &str, to: WeekStatus) -> Result<Week> {
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let row = sqlx::query("SELECT status, iso_week, created_at FROM sin90_weeks WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(row) = row else {
+            return Err(StoreError::NotFound(format!("week {id}")));
+        };
+        let from: WeekStatus = from_wire(&row.get::<String, _>("status"))?;
+        check_week_transition(from, to)?;
+        let now = now_iso8601();
+        let to_str = to_wire(&to)?;
+        sqlx::query("UPDATE sin90_weeks SET status = ?, updated_at = ? WHERE id = ?")
+            .bind(&to_str)
+            .bind(&now)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        append_event(
+            &mut tx,
+            "week",
+            id,
+            "transitioned",
+            Some(&to_wire(&from)?),
+            Some(&to_str),
+            &json!({"week_id": id}),
+            &now,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Week {
+            id: id.to_string(),
+            status: to,
+            iso_week: row.get("iso_week"),
+            created_at: row.get("created_at"),
+            updated_at: now,
+        })
+    }
+
+    /// Planned-vs-actual for one Week (design M2 acceptance line). Two
+    /// independently-sourced numbers, deliberately not computed by the same
+    /// query:
+    ///
+    /// - `planned_min`: a LIVE query — "what is currently planned for this
+    ///   week" is, by definition, a statement about current linkage
+    ///   (`sin90_schedule_blocks.task_id -> sin90_tasks.week_id`), not a
+    ///   historical fact to replay. Reordering or adding blocks to the week
+    ///   changes what "planned" means going forward; that's the intended
+    ///   behavior, not drift.
+    /// - `actual_min`: pure event replay, same discipline as
+    ///   [`Sin90Store::attention`] above — reads only `sin90_events.payload`,
+    ///   never joins the mutable `sin90_schedule_blocks`/`sin90_tasks` tables.
+    ///   That is WHY [`Sin90Store::transition_block`] now snapshots `week_id`
+    ///   into the completion event payload (a block's `task_id`, and that
+    ///   task's `week_id`, do not change after creation — see
+    ///   `direction_title` above for the established precedent of snapshotting
+    ///   a value specifically so a later edit or deletion can't rewrite what
+    ///   already happened).
+    pub async fn week_attention(&self, week_id: &str) -> Result<WeekAttention> {
+        let exists = sqlx::query("SELECT 1 FROM sin90_weeks WHERE id = ?")
+            .bind(week_id)
+            .fetch_optional(self.pool())
+            .await?;
+        if exists.is_none() {
+            return Err(StoreError::NotFound(format!("week {week_id}")));
+        }
+        let planned_min: i64 = sqlx::query(
+            "SELECT COALESCE(SUM(b.planned_minutes), 0) AS m
+             FROM sin90_schedule_blocks b
+             JOIN sin90_tasks t ON t.id = b.task_id
+             WHERE t.week_id = ?",
+        )
+        .bind(week_id)
+        .fetch_one(self.pool())
+        .await?
+        .get("m");
+        let actual_min: i64 = sqlx::query(
+            "SELECT COALESCE(SUM(json_extract(payload,'$.minutes')), 0) AS m
+             FROM sin90_events
+             WHERE entity = 'block' AND kind = 'transitioned' AND to_state = 'completed'
+               AND json_extract(payload,'$.week_id') = ?",
+        )
+        .bind(week_id)
+        .fetch_one(self.pool())
+        .await?
+        .get("m");
+        Ok(WeekAttention {
+            week_id: week_id.to_string(),
+            planned_min,
+            actual_min,
+            deviation_min: actual_min - planned_min,
+        })
+    }
+
     pub async fn create_block(
         &self,
         direction_id: Option<&str>,
@@ -492,6 +613,22 @@ impl Sin90Store {
                 .map(|r| r.get::<String, _>("title")),
             None => None,
         };
+        // (design M2) Snapshot the task's `week_id` at transition time, same
+        // reason `direction_title` is snapshotted above: `Sin90Store::
+        // week_attention`'s `actual_min` must replay purely from
+        // `sin90_events.payload`, never joining the live (mutable)
+        // `sin90_tasks` table — a task's `week_id` does not change after
+        // creation (see `Task::parent_task_id`'s doc comment for the same
+        // "set once" property), so this snapshot cannot drift from the join
+        // it stands in for.
+        let week_id: Option<String> = match &task_id {
+            Some(tid) => sqlx::query("SELECT week_id FROM sin90_tasks WHERE id = ?")
+                .bind(tid)
+                .fetch_optional(&mut *tx)
+                .await?
+                .and_then(|r| r.get::<Option<String>, _>("week_id")),
+            None => None,
+        };
         append_event(
             &mut tx,
             "block",
@@ -502,6 +639,7 @@ impl Sin90Store {
             &json!({
                 "block_id": id,
                 "direction_id": direction_id,
+                "week_id": week_id,
                 "direction_title": direction_title,
                 "minutes": minutes,
                 "occurred_at": now,
