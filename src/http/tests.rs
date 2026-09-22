@@ -401,7 +401,7 @@ async fn proposal_round_trip_creates_area_only_after_accept() {
     let accept = Request::builder()
         .method("POST")
         .uri("/proposals/p1/accept")
-        .header("x-sin90-actor-key", AUTOMATION)
+        .header("x-sin90-actor-key", HUMAN)
         .body(Body::empty())
         .unwrap();
     assert_eq!(
@@ -412,6 +412,70 @@ async fn proposal_round_trip_creates_area_only_after_accept() {
     let areas = body_json(app.oneshot(get_req("/areas")).await.unwrap()).await;
     assert_eq!(areas["areas"].as_array().unwrap().len(), 1);
     assert_eq!(areas["areas"][0]["title"], "Learning");
+}
+
+// ---- Regression: automation must not be able to self-approve (Codex High) --
+
+/// Codex 2026-09-22 review, High: `accept_proposal` used to accept either
+/// actor key, so an automated caller could submit a proposal and immediately
+/// accept it itself, making the "a human must approve" boundary (design
+/// §7.1) cosmetic. Pins the fix: automation may still submit, but only the
+/// human key may accept.
+#[tokio::test]
+async fn automation_can_submit_but_not_accept_its_own_proposal() {
+    let (app, _sink) = test_app().await;
+    let submit = Request::builder()
+        .method("POST")
+        .uri("/proposals")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-sin90-actor-key", AUTOMATION)
+        .body(Body::from(
+            json!({
+                "id": "p1", "status": "pending", "source": "local_brain",
+                "ops": [{"op": "create_area", "title": "Learning"}], "rationale": null
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(submit).await.unwrap().status(),
+        StatusCode::ACCEPTED,
+        "automation must still be able to submit a Proposal"
+    );
+
+    let accept_as_automation = Request::builder()
+        .method("POST")
+        .uri("/proposals/p1/accept")
+        .header("x-sin90-actor-key", AUTOMATION)
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone()
+            .oneshot(accept_as_automation)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN,
+        "automation must not be able to accept (self-approve) a Proposal"
+    );
+
+    // Negative control: unapplied — no Area exists yet.
+    let areas = body_json(app.clone().oneshot(get_req("/areas")).await.unwrap()).await;
+    assert_eq!(areas["areas"].as_array().unwrap().len(), 0);
+
+    // Positive control: the human key can still accept the same proposal.
+    let accept_as_human = Request::builder()
+        .method("POST")
+        .uri("/proposals/p1/accept")
+        .header("x-sin90-actor-key", HUMAN)
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(accept_as_human).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let areas = body_json(app.oneshot(get_req("/areas")).await.unwrap()).await;
+    assert_eq!(areas["areas"].as_array().unwrap().len(), 1);
 }
 
 // ---- Area archive/reactivate round-trip (design §3.2: both edges legal) ----
@@ -757,11 +821,14 @@ fn automation_proposal(body: Value) -> Request<Body> {
         .unwrap()
 }
 
+/// Accept is a human-only action (Codex 2026-09-22 review, High: accepting
+/// used to work with either key, letting automation self-approve its own
+/// proposal — see `automation_can_submit_but_not_accept_its_own_proposal`).
 fn accept_req(id: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri(format!("/proposals/{id}/accept"))
-        .header("x-sin90-actor-key", AUTOMATION)
+        .header("x-sin90-actor-key", HUMAN)
         .body(Body::empty())
         .unwrap()
 }
