@@ -150,7 +150,7 @@
 ### T3.5.1 M3 真实挂载验收  `BACKLOG`
 - **优先级**：high
 - **目标**：DESIGN §M3 验收原文成立。
-- **开发范围**：扩展 `tests/agent24_mount_blackbox.rs`（daemon 以 `A24_SCHEDULER_TICK_SECS=1` 启动）：建「每周 3 次运动」（`0 7 * * 1,3,5`）→ 内核 `GET /api/v1/schedules` 该模块 1 行；
+- **开发范围**：扩展 `tests/agent24_mount_blackbox.rs`（daemon 以 `A24_SCHEDULER_TICK_SECS=1` 启动）：建「每周 3 次运动」（`0 7 * * MON,WED,FRI`）→ 内核 `GET /api/v1/schedules` 该模块 1 行；
   重启 daemon → 仍 1 行且未被禁用；**正对照**：测试钩子让对账器对同一 routine 连发两次 upsert → 仍 1 行；
   另建一条测试 Routine，cron 定到**下一分钟**（Sin90 的 Routine 只有 cron，不为测试加 `At`）→ **经真实 tick 到点** → Sin90 `routine.fired` 恰好 1 条；`run_now` 仅作额外正对照；
   客户端伪造 fired → 404；pause → 内核行 `enabled=false`；用户经内核 REST 暂停 → Sin90 重启对账后仍暂停；retire → 内核行消失。

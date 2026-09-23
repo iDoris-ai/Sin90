@@ -10,7 +10,11 @@ CHECK(kind IN ('deep_work','exercise','review','read','other')), cron TEXT NOT N
 target_count INTEGER NULL CHECK(target_count>0), target_minutes INTEGER NULL CHECK(target_minutes>0),
 status TEXT NOT NULL CHECK(status IN ('active','paused','retired')), created_at TEXT, updated_at TEXT`。
 
-状态机：`active ⇄ paused`，`active|paused → retired`（终态）。事件：`routine.created|updated|paused|resumed|retired|fired`。
+状态机：`active ⇄ paused`，`active|paused → retired`（终态；retired 之后 update 也被拒，409）。
+
+**cron 规则**：5 段；**星期字段只接受 `*` 与英文缩写（MON..SUN 及范围/列表），拒绝数字** —— Sin90 与内核共用的 cron 0.15 以 1=周日，与 POSIX（0/7=周日、1=周一）不同，数字会静默错一天；名字在两种语义下都无歧义。`cron`/`chrono-tz` 版本与 Agent24 `agent24-scheduler` 精确同步。
+
+**迁移编号预分配**：0004 routines（T3.1.1）· 0005 routine_fires（T3.2.2）· 0006 outbox_failed（T3.3.1）· 0007 reviews 扩展（T4.1.1/T4.2.1）。事件：`routine.created|updated|paused|resumed|retired|fired`。
 
 **`sin90_routine_fires`**：`fire_id TEXT PK, routine_id TEXT NOT NULL FK, scheduled_for TEXT NOT NULL, received_at TEXT NOT NULL`。
 
