@@ -222,7 +222,7 @@
 
 ### T5.2.1 classify  `BACKLOG`
 - **优先级**：high
-- **目标**：inbox 条目 → 指派 Area/Direction 的提议（`source = local_brain`）。
+- **目标**：inbox 条目 → 指派 Direction 的提议（新 Op `AssignTaskDirection`，见 DESIGN §11）；`source` 由 store 按实际产出引擎推导（reflex → `rule`，本地模型 → `local_brain`，远端 → `executive`，依据内核返回的 `result.tier`）。
 - **依赖**：T5.1.1
 - **验收命令**：`cargo test classify_`（桩模型）：产出 pending 提议且数据未变；人类 accept 后任务离开 inbox。
 - **证据**：
