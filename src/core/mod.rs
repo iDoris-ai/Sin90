@@ -29,4 +29,4 @@ pub use types::{
     ScheduleBlock, ScheduleBlockId, ScheduleBlockStatus, Task, TaskId, TaskKind, TaskStatus, Week,
     WeekId, WeekStatus,
 };
-pub use util::{canonical_iso_week, is_fixed_iso8601, now_iso8601, ulid};
+pub use util::{canonical_iso_week, is_fixed_iso8601, local_day_start_utc, now_iso8601, ulid};

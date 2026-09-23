@@ -897,12 +897,14 @@ impl Sin90Store {
     /// - **inbox**: `direction_id IS NULL` tasks not yet `done`/`dropped`
     ///   (M1's "not-yet-classified" bucket, oldest first).
     /// - **carry-over candidates**: `in_progress` tasks (WITH a direction —
-    ///   distinct from inbox) whose `created_at` falls before today's UTC date
-    ///   boundary — started on an earlier day and still open, so a human
+    ///   distinct from inbox) whose most recent move INTO `in_progress` (from
+    ///   the event log; `created_at` only if no such event exists) happened
+    ///   before the start of the user's local day — started on an earlier
+    ///   day and still open, so a human
     ///   should decide whether to keep pushing, drop, or (M2) actually
     ///   `CarryOverTask` it into next week.
     pub async fn today_view(&self) -> Result<TodayView> {
-        let today_start = format!("{}T00:00:00Z", &now_iso8601()[..10]);
+        let today_start = crate::core::local_day_start_utc();
         // All four sections from one read transaction (one snapshot), so a
         // concurrent transition can't show a task in two sections at once.
         let mut tx = self.pool().begin().await?;
@@ -967,10 +969,14 @@ impl Sin90Store {
         let carry_over_candidates = sqlx::query(
             "SELECT id, direction_id, week_id, parent_task_id, title, status, kind, energy,
                     est_minutes, carried_from, created_at, updated_at
-             FROM sin90_tasks
+             FROM sin90_tasks t
              WHERE direction_id IS NOT NULL
                AND status = 'in_progress'
-               AND created_at < ?
+               AND COALESCE(
+                     (SELECT MAX(e.at) FROM sin90_events e
+                      WHERE e.entity = 'task' AND e.entity_id = t.id
+                        AND e.to_state = 'in_progress'),
+                     t.created_at) < ?
              ORDER BY created_at ASC",
         )
         .bind(&today_start)
@@ -1579,13 +1585,22 @@ async fn apply_op(tx: &mut Tx<'_>, op: &Sin90Op, event_ids: &mut Vec<String>) ->
 
         Sin90Op::CarryOverTask { task_id, to_week } => {
             require_task_week_open(tx, task_id).await?;
-            let src =
-                sqlx::query("SELECT title, direction_id, week_id FROM sin90_tasks WHERE id = ?")
-                    .bind(task_id)
-                    .fetch_optional(&mut **tx)
-                    .await?
-                    .ok_or_else(|| StoreError::NotFound(format!("task {task_id}")))?;
+            let src = sqlx::query(
+                "SELECT title, direction_id, week_id, parent_task_id, kind, energy, est_minutes
+                 FROM sin90_tasks WHERE id = ?",
+            )
+            .bind(task_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("task {task_id}")))?;
             let title: String = src.get("title");
+            // Carrying a task into next week changes WHEN, not WHAT: kind,
+            // energy and estimate come along, and it stays in the same project
+            // (parent_task_id unchanged — a project spans weeks).
+            let parent_task_id: Option<String> = src.get("parent_task_id");
+            let kind: String = src.get("kind");
+            let energy: String = src.get("energy");
+            let est_minutes: Option<i64> = src.get("est_minutes");
             let direction_id: Option<String> = src.get("direction_id");
             let src_week: Option<String> = src.get("week_id");
             if src_week.as_deref() == Some(to_week.as_str()) {
@@ -1617,12 +1632,16 @@ async fn apply_op(tx: &mut Tx<'_>, op: &Sin90Op, event_ids: &mut Vec<String>) ->
                 "INSERT INTO sin90_tasks
                      (id, direction_id, week_id, parent_task_id, title, status, kind, energy,
                       est_minutes, sort_key, carried_from, created_at, updated_at)
-                 VALUES (?, ?, ?, NULL, ?, 'planned', 'other', 'mid', NULL, 0, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, 'planned', ?, ?, ?, 0, ?, ?, ?)",
             )
             .bind(&new_id)
             .bind(&direction_id)
             .bind(to_week)
+            .bind(&parent_task_id)
             .bind(&title)
+            .bind(&kind)
+            .bind(&energy)
+            .bind(est_minutes)
             .bind(task_id)
             .bind(&now)
             .bind(&now)
