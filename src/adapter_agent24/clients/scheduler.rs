@@ -149,20 +149,41 @@ impl SchedulerClient {
         })
     }
 
-    /// `_a24/scheduler/upsert`. `enabled`/`label`/`request_id` are omitted
-    /// from the wire params entirely when `None` — the kernel already
-    /// defaults `enabled` to `true` and `label` to `key` (design §6.1), so
-    /// omitting is the correct way to say "use the default," not `null`.
+    /// `_a24/scheduler/upsert`. `label` is omitted from the wire params
+    /// entirely when `None` — the kernel defaults it to `key` (design §6.1),
+    /// so omitting is the correct way to say "use the default," not `null`.
+    ///
+    /// L3 (post-review correction): `enabled` is REQUIRED here, not
+    /// `Option<bool>` the way `label`/`request_id` are. The kernel's own
+    /// default (`enabled` absent → `true`, design §6.1's
+    /// `SchedulerUpsertParams`) is an EXPECTED-STATE default, not a
+    /// "leave whatever it currently is" default — there is no wire shape
+    /// for "don't touch `enabled`" at all. An `Option<bool>` on this side
+    /// would silently invite exactly the bug that distinction is meant to
+    /// prevent: a caller passing `None` meaning "leave it paused" would
+    /// actually RE-ENABLE a `Routine` the user deliberately suspended,
+    /// because omitting the field on the wire means `true`, not "keep the
+    /// paused state." T3.3.2's reconciler must always compute and pass the
+    /// exact desired `enabled` value (from `sin90_outbox`'s `desired.enabled`,
+    /// spec.md M3) — never `None`.
+    ///
+    /// `request_id`: H1's companion rule — pass `Some(id)` ONLY the id from
+    /// the currently in-flight proxied request that is calling this (i.e.
+    /// from inside a `POST /_a24/scheduler/fired` handler, echoing that
+    /// request's own `X-A24-Request-Id`, T3.2.2). Any OTHER caller —
+    /// T3.3.2's background reconciliation loop in particular — MUST pass
+    /// `None`: a `request_id` that is not currently bound to a live proxied
+    /// request gets `ClientError::RequestNotInFlight` (H1), not a background
+    /// admission.
     pub async fn upsert(
         &self,
         key: &str,
         spec: &ModuleSpec,
-        enabled: Option<bool>,
+        enabled: bool,
         label: Option<&str>,
         request_id: Option<&str>,
     ) -> Result<UpsertResponse, ClientError> {
-        let mut params = json!({ "key": key, "spec": spec });
-        super::set_optional(&mut params, "enabled", enabled);
+        let mut params = json!({ "key": key, "spec": spec, "enabled": enabled });
         super::set_optional(&mut params, "label", label);
         super::set_optional(&mut params, "request_id", request_id);
         self.call("upsert", params).await
@@ -171,6 +192,9 @@ impl SchedulerClient {
     /// `_a24/scheduler/delete`. `{outcome: absent}` for a key this module
     /// never owned, or already deleted — see [`DeleteOutcome`]'s doc; that is
     /// success, not [`ClientError::NotFound`].
+    ///
+    /// `request_id`: same H1 rule as [`Self::upsert`] — only the current
+    /// in-flight proxied request's id, `None` for background calls.
     pub async fn delete(
         &self,
         key: &str,
@@ -182,7 +206,10 @@ impl SchedulerClient {
     }
 
     /// `_a24/scheduler/list`. No pagination params (design §6.1: ≤ 256 rows,
-    /// never paginated) — `request_id` is the only optional field.
+    /// never paginated) — `request_id` is the only optional field, same H1
+    /// rule as [`Self::upsert`]/[`Self::delete`]. In practice `list` is
+    /// almost always the reconciler's own background full-account call
+    /// (T3.3.2), so `None` is the common case here specifically.
     pub async fn list(&self, request_id: Option<&str>) -> Result<ListResponse, ClientError> {
         let mut params = json!({});
         super::set_optional(&mut params, "request_id", request_id);
@@ -238,7 +265,7 @@ mod tests {
                 .upsert(
                     "routine.abc",
                     &spec,
-                    Some(true),
+                    true,
                     Some("Morning run"),
                     Some("req-1"),
                 )
@@ -283,16 +310,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_omits_absent_optional_fields_rather_than_sending_null() {
+    async fn upsert_omits_absent_optional_fields_but_always_sends_enabled() {
         let (clients, mut peer) = fake_kernel(vec!["_a24/scheduler/".to_string()]).await;
         let client = SchedulerClient::new(&clients).unwrap();
         let spec = ModuleSpec::Every { secs: 3600 };
-        tokio::spawn(async move { client.upsert("k", &spec, None, None, None).await });
+        tokio::spawn(async move { client.upsert("k", &spec, true, None, None).await });
 
         let req = read_request(&mut peer).await;
         assert_eq!(
             req["params"],
-            json!({"key": "k", "spec": {"type": "every", "secs": 3600}})
+            json!({"key": "k", "spec": {"type": "every", "secs": 3600}, "enabled": true})
+        );
+    }
+
+    /// L3: positive control for the test above and for the signature change
+    /// itself — `enabled: false` must appear on the wire literally as
+    /// `false`, never omitted the way `label`/`request_id` are. A caller
+    /// pausing a `Routine` (`enabled: false`) must not accidentally leave the
+    /// field off and re-enable it by the kernel's own "absent → true"
+    /// default (design §6.1) — the whole point of L3 making this a required
+    /// `bool` instead of `Option<bool>`.
+    #[tokio::test]
+    async fn upsert_enabled_false_is_sent_explicitly_not_omitted() {
+        let (clients, mut peer) = fake_kernel(vec!["_a24/scheduler/".to_string()]).await;
+        let client = SchedulerClient::new(&clients).unwrap();
+        let spec = ModuleSpec::Every { secs: 3600 };
+        tokio::spawn(async move { client.upsert("k", &spec, false, None, None).await });
+
+        let req = read_request(&mut peer).await;
+        assert_eq!(
+            req["params"],
+            json!({"key": "k", "spec": {"type": "every", "secs": 3600}, "enabled": false})
         );
     }
 
@@ -379,7 +427,7 @@ mod tests {
         let (clients, mut peer) = fake_kernel(vec!["_a24/scheduler/".to_string()]).await;
         let client = SchedulerClient::new(&clients).unwrap();
         let spec = ModuleSpec::Every { secs: 3600 };
-        let call = tokio::spawn(async move { client.upsert("k", &spec, None, None, None).await });
+        let call = tokio::spawn(async move { client.upsert("k", &spec, true, None, None).await });
         let req = read_request(&mut peer).await;
         respond_error(
             &mut peer,
