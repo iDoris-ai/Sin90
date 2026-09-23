@@ -74,6 +74,25 @@
 //! kernel-callback client lives on a separate branch,
 //! `feat/t3.2.1-kernel-clients`, not yet merged here). See "T5.1.2 接线"
 //! above for the full, itemized handoff list.
+//!
+//! # 已知限制（2026-09-24 评审，接受，不在本轮改）
+//!
+//! - **`privacy_tripwire` 之后不熔断该引擎**：`tripwire()` 命中时只把这一
+//!   步降级（弃用远端回复），run 剩余条目仍会再请求同一引擎——设计原文
+//!   如此（§11.3.4 的熔断表只列 `no_provider`/`backend_config`/
+//!   `forbidden` 三种，`privacy_tripwire` 不在表内）。列为待重新考虑：
+//!   如果远端在开关关闭期间持续把 `simple` 调用送到远端（R3 的已知场景），
+//!   本 run 会反复触发绊线而不是提早放弃。
+//! - **`Defer` 之后当前条目仍先跑过 `ReflexDecisive`**：`run_item` 对
+//!   `classify` 的梯是 `[ReflexDecisive, Model(..), ReflexFallback]`；
+//!   `ReflexDecisive` 本身不消耗调用预算/不检查 `models_off`，所以即使
+//!   上一条目已经把 `models_off` 置位，下一条目仍会先跑一次
+//!   `ReflexDecisive`（可能产出 `undecided` 调用记录）才走到
+//!   `Model(..)` 步被 `Deferred` 短路。纯粹是统计噪声（多几行
+//!   `error_kind = 'undecided'` 的调用记录），不影响正确性
+//!   （§11.3.5 L5：`undecided` 本就不算入降级统计）。
+
+#![forbid(unsafe_code)]
 
 pub mod ladder;
 pub mod ports;

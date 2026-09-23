@@ -15,8 +15,8 @@ use std::time::Instant;
 use crate::core::ProposalSource;
 
 use super::ports::{
-    AiCallRecord, AiSettings, AiSink, Capability, Engine, LadderAction, ModelAccess, ModelPort,
-    ModelReply, ModelRequest, ReadError, ServedTier, SettingsRead,
+    AiCallRecord, AiSettings, AiSink, Capability, Engine, LadderAction, ModelAccess, ModelFailure,
+    ModelPort, ModelReply, ModelRequest, ReadError, ServedTier, SettingsRead, UnavailableCause,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,7 +181,7 @@ where
                 }
                 // L5: "no decisive rule" is not a failure; not counted as degradation.
                 rec.error_kind = Some("undecided");
-                let _ = sink.record_call(rec).await;
+                record_call_best_effort(sink, rec).await;
             }
             Step::ReflexFallback => {
                 rec.fallback_from = failed_from;
@@ -196,7 +196,7 @@ where
                     };
                 }
                 rec.error_kind = Some("no_match");
-                let _ = sink.record_call(rec).await;
+                record_call_best_effort(sink, rec).await;
             }
             Step::Model(engine) => {
                 let Some(m) = model else { continue };
@@ -224,7 +224,7 @@ where
                             let fresh = settings_src.settings().await.unwrap_or_default();
                             if tripwire(reply.tier, fresh) {
                                 rec.error_kind = Some("privacy_tripwire");
-                                let _ = sink.record_call(rec).await;
+                                record_call_best_effort(sink, rec).await;
                                 failed_from = Some(*engine);
                                 continue;
                             }
@@ -240,14 +240,20 @@ where
                             }
                             Err(why) => {
                                 rec.error_kind = Some(why);
-                                let _ = sink.record_call(rec).await;
+                                record_call_best_effort(sink, rec).await;
                                 failed_from = Some(*engine);
                             }
                         }
                     }
                     Err(f) => {
+                        // §11.3.4's own-bug flags: `backend_config`/
+                        // `forbidden` are configuration mistakes worth a
+                        // `warn!`; `response_too_large`/`bad_request` are
+                        // THIS end's bug (max_tokens ≤ 1024 by construction,
+                        // or a malformed request) and get `error!`.
+                        log_model_failure(&f);
                         rec.error_kind = Some(f.kind_str());
-                        let _ = sink.record_call(rec).await;
+                        record_call_best_effort(sink, rec).await;
                         match f.action() {
                             LadderAction::Abort => {
                                 st.aborted = true;
@@ -272,6 +278,43 @@ where
     Outcome::Nothing
 }
 
+/// R6 (§11.3.5): a non-producing attempt's call record is best-effort — the
+/// model didn't misbehave, the sink did, and that must not abort the run.
+/// Failure is logged at `warn!` (2026-09-24 review: was silently swallowed
+/// via `let _ =`), so an operator can still notice "we're losing call
+/// history" without it ever affecting `run_item`'s control flow.
+async fn record_call_best_effort<S: AiSink>(sink: &S, rec: AiCallRecord) {
+    if let Err(e) = sink.record_call(rec).await {
+        tracing::warn!(error = %e, "ai: failed to record a non-producing call attempt (not fatal, R6)");
+    }
+}
+
+/// §11.3.4's own two logging rows: `backend_config`/`forbidden` are
+/// configuration mistakes (someone else's setup, or a manifest/settings
+/// mismatch) worth a `warn!`; `response_too_large`/`bad_request` can only
+/// happen if THIS code sent a bad request (`max_tokens` is ≤ 1024 by
+/// construction, so a `response_too_large` here means a real bug) — `error!`.
+fn log_model_failure(f: &ModelFailure) {
+    match f {
+        ModelFailure::Unavailable {
+            cause: UnavailableCause::BackendConfig,
+            ..
+        } => tracing::warn!(?f, "ai model backend misconfigured"),
+        ModelFailure::Unavailable {
+            cause: UnavailableCause::ResponseTooLarge,
+            ..
+        } => tracing::error!(?f, "ai model response too large (max_tokens bug?)"),
+        ModelFailure::Forbidden => {
+            tracing::warn!(
+                ?f,
+                "ai model call forbidden (models capability not granted?)"
+            )
+        }
+        ModelFailure::BadRequest => tracing::error!(?f, "ai model request malformed (our bug)"),
+        _ => {}
+    }
+}
+
 // Referenced only through the generic bound above at monomorphization time;
 // named here so this file's own `use` stays honest about what it needs.
 #[allow(dead_code)]
@@ -280,7 +323,9 @@ type _ReadErrorUsed = ReadError;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::ports::{Complexity, ModelFailure, ModelMessage, Role, SinkError};
+    use crate::ai::ports::{
+        Complexity, ModelFailure, ModelMessage, Role, SinkError, UnavailableCause,
+    };
     use crate::ai::ProposalDraft;
     use serde_json::Map;
     use std::future::Future;
@@ -495,22 +540,76 @@ mod tests {
 
     #[test]
     fn ai_ladder_failure_table() {
-        // J3: exhaustive `match` over every `ModelFailure` variant.
+        // J3 (2026-09-24 review: exhaustive over `action()`, `opens_circuit()`
+        // AND `kind_str()`, with all four `Unavailable` causes distinguished
+        // — §11.3.4's table verbatim). `action()`'s own `match` has no
+        // wildcard arm, so a forgotten new `ModelFailure` variant fails to
+        // COMPILE, not just fails this test.
         use LadderAction::*;
-        for (f, want) in [
-            (NO_PROVIDER, Degrade),
-            (ModelFailure::Timeout, Degrade),
-            (ModelFailure::Forbidden, Degrade),
-            (ModelFailure::BadRequest, Degrade),
-            (ModelFailure::Other, Degrade),
-            (ModelFailure::Busy, Defer),
-            (ModelFailure::RateLimited, Defer),
-            (ModelFailure::NotReady, Defer),
-            (ModelFailure::GenerationEnding, Abort),
-            (ModelFailure::ConnectionLost, Abort),
-            (ModelFailure::Cancelled, Abort),
-        ] {
-            assert_eq!(f.action(), want, "{f:?}");
+        use UnavailableCause::*;
+        let cases: [(ModelFailure, LadderAction, bool, &str); 14] = [
+            (
+                ModelFailure::Unavailable {
+                    retryable: true,
+                    cause: NoProvider,
+                },
+                Degrade,
+                true,
+                "unavailable.no_provider",
+            ),
+            (
+                ModelFailure::Unavailable {
+                    retryable: false,
+                    cause: RequestRejected,
+                },
+                Degrade,
+                false,
+                "unavailable.request_rejected",
+            ),
+            (
+                ModelFailure::Unavailable {
+                    retryable: false,
+                    cause: BackendConfig,
+                },
+                Degrade,
+                true,
+                "unavailable.backend_config",
+            ),
+            (
+                ModelFailure::Unavailable {
+                    retryable: false,
+                    cause: ResponseTooLarge,
+                },
+                Degrade,
+                false,
+                "unavailable.response_too_large",
+            ),
+            (ModelFailure::Timeout, Degrade, false, "timeout"),
+            (ModelFailure::Forbidden, Degrade, true, "forbidden"),
+            (ModelFailure::BadRequest, Degrade, false, "bad_request"),
+            (ModelFailure::Other, Degrade, false, "other"),
+            (ModelFailure::Busy, Defer, false, "busy"),
+            (ModelFailure::RateLimited, Defer, false, "rate_limited"),
+            (ModelFailure::NotReady, Defer, false, "not_ready"),
+            (
+                ModelFailure::GenerationEnding,
+                Abort,
+                false,
+                "generation_ending",
+            ),
+            (
+                ModelFailure::ConnectionLost,
+                Abort,
+                false,
+                "connection_lost",
+            ),
+            (ModelFailure::Cancelled, Abort, false, "cancelled"),
+        ];
+        assert_eq!(cases.len(), 14, "4 Unavailable causes + 10 other variants");
+        for (f, want_action, want_circuit, want_kind) in cases {
+            assert_eq!(f.action(), want_action, "{f:?} action");
+            assert_eq!(f.opens_circuit(), want_circuit, "{f:?} opens_circuit");
+            assert_eq!(f.kind_str(), want_kind, "{f:?} kind_str");
         }
     }
 
@@ -566,8 +665,13 @@ mod tests {
 
     #[tokio::test]
     async fn ai_ladder_abort_connection_lost_and_generation_ending() {
-        // J2
-        for f in [ModelFailure::ConnectionLost, ModelFailure::GenerationEnding] {
+        // J2 (2026-09-24 review: also cover `Cancelled` — the kernel-shutdown
+        // abort case, §11.3.4's third "中止" row).
+        for f in [
+            ModelFailure::ConnectionLost,
+            ModelFailure::GenerationEnding,
+            ModelFailure::Cancelled,
+        ] {
             let sink = MemSink::default();
             let m = StubModel::new(Err(f));
             let mut s = st();
@@ -848,5 +952,175 @@ mod tests {
             .await
         });
         assert!(matches!(h.await.unwrap(), Outcome::Produced { .. }));
+    }
+
+    // ---- 2026-09-24 review: warn!/error! logging + record_call R6 --------
+
+    /// A minimal `tracing::Subscriber` that just records the level of every
+    /// event — enough to prove `log_model_failure`/`record_call_best_effort`
+    /// actually call `tracing::warn!`/`error!`, without pulling in a
+    /// tracing-subscriber test helper crate this project doesn't otherwise
+    /// depend on.
+    #[derive(Default, Clone)]
+    struct LevelSpy(Arc<Mutex<Vec<tracing::Level>>>);
+    impl tracing::Subscriber for LevelSpy {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            self.0.lock().unwrap().push(*event.metadata().level());
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    fn levels_during<F: FnOnce()>(f: F) -> Vec<tracing::Level> {
+        let spy = LevelSpy::default();
+        tracing::subscriber::with_default(spy.clone(), f);
+        let out = spy.0.lock().unwrap().clone();
+        out
+    }
+
+    /// §11.3.4's own two logging rows: `backend_config`/`forbidden` ->
+    /// `warn!`; `response_too_large`/`bad_request` -> `error!`. Mutation
+    /// target: change any one of `log_model_failure`'s match arms (e.g. drop
+    /// the `BackendConfig` arm to the `_ => {}` catch-all) and the
+    /// corresponding level goes missing.
+    #[test]
+    fn ai_ladder_logs_backend_config_and_forbidden_as_warn_response_too_large_and_bad_request_as_error(
+    ) {
+        let cases = [
+            (
+                ModelFailure::Unavailable {
+                    retryable: false,
+                    cause: UnavailableCause::BackendConfig,
+                },
+                tracing::Level::WARN,
+            ),
+            (ModelFailure::Forbidden, tracing::Level::WARN),
+            (
+                ModelFailure::Unavailable {
+                    retryable: false,
+                    cause: UnavailableCause::ResponseTooLarge,
+                },
+                tracing::Level::ERROR,
+            ),
+            (ModelFailure::BadRequest, tracing::Level::ERROR),
+        ];
+        for (f, want) in cases {
+            let levels = levels_during(|| log_model_failure(&f));
+            assert_eq!(levels, vec![want], "{f:?}");
+        }
+        // Positive control: a failure NOT in §11.3.4's logging rows (e.g.
+        // `Timeout`, an ordinary/expected condition) logs nothing.
+        assert_eq!(
+            levels_during(|| log_model_failure(&ModelFailure::Timeout)),
+            Vec::<tracing::Level>::new()
+        );
+    }
+
+    /// R6: `record_call`'s failure is logged at `warn!` but does NOT stop
+    /// the run — the model didn't misbehave, the sink did. Mutation target:
+    /// revert `record_call_best_effort` to `let _ = sink.record_call(rec).await;`
+    /// and the `warn!` assertion goes from `vec![WARN]` to `vec![]`.
+    #[test]
+    fn ai_ladder_record_call_failure_warns_but_does_not_abort_the_run() {
+        #[derive(Default)]
+        struct AlwaysFailsRecordCall;
+        impl AiSink for AlwaysFailsRecordCall {
+            async fn submit(
+                &self,
+                _cap: Capability,
+                _draft: ProposalDraft,
+                _rec: AiCallRecord,
+            ) -> Result<(), SinkError> {
+                unreachable!("this test never produces")
+            }
+            async fn record_call(&self, _rec: AiCallRecord) -> Result<(), SinkError> {
+                Err(SinkError::Store("boom".into()))
+            }
+            async fn precheck(&self, _cap: Capability, drafts: &[ProposalDraft]) -> Vec<bool> {
+                vec![true; drafts.len()]
+            }
+        }
+
+        let sink = AlwaysFailsRecordCall;
+        let spy = LevelSpy::default();
+        let out = tracing::subscriber::with_default(spy.clone(), || {
+            // `with_default` is sync; drive the async ladder step to
+            // completion on the current thread so the thread-local
+            // subscriber stays active across every `.await` inside it.
+            futures_lite_block_on(go_with_sink(&sink))
+        });
+        // The run still completed normally (fell through to the reflex
+        // fallback) despite `record_call` failing on every non-producing
+        // attempt.
+        assert!(matches!(
+            out,
+            Outcome::Produced {
+                engine: Engine::Reflex,
+                ..
+            }
+        ));
+        let levels = spy.0.lock().unwrap();
+        assert!(
+            levels.contains(&tracing::Level::WARN),
+            "a failed record_call must be logged at warn!, levels seen: {levels:?}"
+        );
+    }
+
+    async fn go_with_sink<S: AiSink>(sink: &S) -> Outcome<&'static str> {
+        let m = StubModel::new(Err(NO_PROVIDER));
+        let steps = [
+            Step::ReflexDecisive,
+            Step::Model(Engine::Local),
+            Step::ReflexFallback,
+        ];
+        run_item(
+            "run1",
+            Capability::Classify,
+            &steps,
+            &mut st(),
+            Some(&m),
+            sink,
+            &Settings(false),
+            req,
+            |r| {
+                if r.text == "ok" {
+                    Ok("model")
+                } else {
+                    Err("bad_output")
+                }
+            },
+            || None,
+            || Some("reflex-guess"),
+            || "2026-09-24T00:00:00Z".into(),
+            || "id".into(),
+        )
+        .await
+    }
+
+    /// `tracing::subscriber::with_default` takes a SYNC closure; `go_with_sink`
+    /// is async. A tiny current-thread block_on avoids pulling in a runtime
+    /// just for this one test — `futures_lite`/`pollster` aren't
+    /// dependencies, so this hand-rolls the minimum needed: poll in a loop
+    /// with a no-op waker (every future here is either already-ready or
+    /// resolves on the first poll after an immediately-ready inner future,
+    /// since nothing in `go_with_sink`'s path ever actually awaits I/O).
+    fn futures_lite_block_on<F: std::future::Future>(fut: F) -> F::Output {
+        use std::task::{Context, Poll};
+        futures::pin_mut!(fut);
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        loop {
+            if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+                return v;
+            }
+        }
     }
 }
