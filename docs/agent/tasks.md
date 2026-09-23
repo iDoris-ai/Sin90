@@ -216,8 +216,16 @@
 - **优先级**：high
 - **目标**：`ai` 模块：reflex（规则）→ local（`_a24/model/complete`，内核强制 LocalOnly）→ executive（仅当 manifest `model_access: remote_allowed` 且用户设置开启）；每次调用写 `sin90_ai_calls`（engine、fallback_from、latency、ok）。
 - **开发范围**：**AI 模块只能调 `submit_proposal`，不能调任何 store 写函数**（结构约束：AI 模块不 import 写接口；加一条编译期/grep 测试）。
-- **依赖**：T5.0.1；Agent24 `ME4-4.3.1`（含 4.2.3 按模块用量）
+- **依赖**：T5.0.1（T5.1.2 接线另列）
 - **验收命令**：`cargo test ai_ladder_`：local 不可用 → 降到 reflex 并记 `fallback_from`；`cargo test ai_boundary`（AI 模块对 store 写函数引用数 = 0，正对照：故意引用 → 测试变红）。
+- **证据**：
+
+### T5.1.2 AI 接线（真实模型客户端 + manifest 常量）  `BACKLOG`
+- **优先级**：high
+- **目标**：把 T5.1.1 的 `ModelPort` 接到真实内核 `_a24/model/complete`，并落地 manifest 侧的编译期常量。
+- **开发范围**（T5.1.1 回报的「留给接线任务」清单，原文在 `src/ai/mod.rs` 模块文档）：`adapter_agent24/clients/model.rs`（`ModelClient` 实现 `ModelPort`；`ClientError` 加 `Unavailable{retryable, cause}` / `Cancelled`，`map_rpc_error` 计数 17→18，即 SFU-11）；`domain-os.yml` 加 `kernel_capabilities: models`（**不**声明 `remote_allowed`，DESIGN §2 #26 硬约束）；`remote-allowed-manifest` feature 与 `domain-os.remote-allowed.yml`（只给测试包 B）；`MODEL_ACCESS` 常量与 `sin90 print-model-access` 子命令；判据 J10、J10c、J23b。
+- **依赖**：T5.1.1；T3.2.1（Transport 线的客户端）；Agent24 推理回调合并（ME4-4.2.2b2）。**两条 stacked 线合并后从 main 开工。**
+- **验收命令**：设计 §11.7 的 J10 / J10c / J23b。
 - **证据**：
 
 ### T5.2.1 classify  `BACKLOG`
