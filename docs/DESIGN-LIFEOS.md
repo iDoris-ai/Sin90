@@ -4,7 +4,7 @@
 > 输入：[`LIFEOS-DESIGN-INPUT.md`](LIFEOS-DESIGN-INPUT.md)（2026-09-20 用户构想 + GPT 提议）
 > 核对对象：Agent24 主仓库 `rust/crates/agent24-sin90{,-store,-os}`（2026-09-20 实读源码，非文档转述）
 > 状态：本文冻结数据模型与 M0 范围；M1+ 只给方向，不冻结
-> 最后更新：2026-09-24（T5.0.1 追加 §11 AI v1 设计补丁，草稿 v1 待评审；§1.3 / §2 #17–#24 / §3.3 / §4.1 / §6 M5 随之更新）
+> 最后更新：2026-09-24（T5.0.1 §11 AI v1 设计补丁，草稿 v2 待第 2 轮评审；§1.3 / §2 #17–#26 / §3.3 / §4.1 / §6 M5 随之更新）
 
 > **2026-09-23 起，执行状态与 M3–M5 的任务拆分以 [`agent/tasks.md`](agent/tasks.md) 为准**（pilot 规划层，见 [`agent/roadmap.md`](agent/roadmap.md)）。
 > 本文仍是数据模型裁决的权威；下面的进度表是 2026-09-20 的快照，不再更新。
@@ -144,11 +144,13 @@ manifest 的 `impl_kind: out_of_process_provider` 必须**同时**带 `spawn: {c
 | 17 | 新 Op `AssignTaskDirection{task_id, direction_id}`（T5.0.1，M5 classify） | **采纳** | classify 的产出必须是一条可被人批准的变更，现有八个 Op 没有一个能改 `sin90_tasks.direction_id`（人类路由 `PATCH /tasks/{id}` 也只收 `{to}`）。**只在 inbox 上生效**（前置：任务 `direction_id IS NULL` 且非终态；目标 Direction 存在且非终态），所以它同时是一个比较并交换：人先归了类，AI 的旧提议在 accept 时 422，不会覆盖人的决定。事件 `task.direction_assigned`。细则 §11.2.1。**复审触发条件**：出现「改已归类任务的归属」的真实需求（届时加 `from_direction_id` 字段做 CAS，而不是放宽前置条件）。 |
 | 18 | 新 Op `DraftReviewBody{review_id, base_body_sha256, body}`（T5.0.1，M5 summarize） | **采纳** | 复盘正文今天只能走人类直写 `PATCH /reviews/{id}`；AI 必须走提议门。`base_body_sha256` 是提议生成时看到的正文摘要——人在提议挂起期间改过正文，accept 即 422（`StaleBase`），人写的字不会被 AI 静默覆盖。只作用于 `draft`，定稿后拒。事件复用 `review.updated`（payload 与人类路径逐字段相同），重放方不需要区分来源。细则 §11.2.2。 |
 | 19 | `ValidationCtx` 第二次加宽：`direction_status` / `task_direction` / `review_snap` | **采纳（推翻 §3.3「唯一一次」）** | #17/#18 的前置条件都是「按实体读当前值」，正是这个 trait 的既定职责（`proposal.rs:110-118` 的 SCOPE 注释：per-entity existence + status）。实现者只有 `DbSnapshot` 与测试 Mock，三个方法在 T5.2.1 一次加齐。 |
-| 20 | `sin90_ai_calls` 加列 `run_id / proposal_id / served_tier / model_id / error_kind` | **采纳** | 原表（`0001_sin90.sql:120-128`）回答不了验收要的两件事：这条提议是哪次调用产出的（`proposal_id`）、调用实际在本地还是远端服务（`served_tier`——内核按 `complexity` 路由，模块请求的引擎 ≠ 实际服务层级，Agent24 ME4-S2 §2.2/§4.3）。纯 `ADD COLUMN`，全部可空。§11.6。 |
+| 20 | `sin90_ai_calls` 加列 `run_id / proposal_id / served_tier / model_id / prompt_tokens / completion_tokens / error_kind` | **采纳** | 原表（`0001_sin90.sql:120-128`）回答不了验收要的两件事：这条提议是哪次调用产出的（`proposal_id`）、调用实际在本地还是远端服务（`served_tier`——内核按 `complexity` 路由，模块请求的引擎 ≠ 实际服务层级，Agent24 ME4-S2 §2.2/§4.3）。纯 `ADD COLUMN`，全部可空。§11.6。 |
 | 21 | 新表 `sin90_settings(key PK, value, updated_at)`，首个键 `ai.executive_enabled` | **采纳** | executive 需要「用户设置开启」，设置必须持久、只由人改、改动留痕。单独一张 KV 表而不是塞进 `actor-keys.json`（那是凭据文件，权限 0600，语义不同）。改动走人类直写路由 + `setting.changed` 事件（#12 的硬约束）。缺行 = 关。 |
 | 22 | classify 允许「只指派 Area、不指派 Direction」（给 `sin90_tasks` 加 `area_id`） | **拒绝** | §3.1 的对象图里 Area 在 Direction 之上、不与 Task 并列；`list_tasks` 按 Area 过滤就是经 `sin90_directions` join（`repo.rs:1214-1240`）。加列 = Task 有两条可能互相矛盾的归属路径。classify 在「有 Area 没有合适 Direction」时**不产出提议**（任务留在 inbox，理由写进 run 结果）。**复审触发条件**：用户反馈 inbox 里长期堆着「知道属于哪个领域、但不值得为它开方向」的条目。 |
 | 23 | reflex（纯规则）产出的提议 `source = rule` | **改造（改 §M5 验收原文）** | §M5 原文只列 `{local_brain, executive}`，但引擎梯最底层 reflex 不调任何模型；把它记成 `local_brain` 是「措辞比机制强」（§2.1）。`rule` 早在 `ProposalSource` 里（`proposal.rs:89-95`）。T5.5.1 的 SQL 本来就含 `rule`。 |
 | 24 | M5 用内核私有记忆（T4.4.1 写入的定稿摘要）做 AI 上下文 | **v1 不用** | SQLite 是真相（architecture.md 边界 #1），summarize 需要的「上周定稿」本地直接可读；走 `_a24/memory/private/recall` 只多一个失败面，且 v1 三个能力没有一个需要跨设备/跨模块上下文。T4.4.1 照做（它的价值是给内核侧 agent 用）。**复审触发条件**：出现需要「非 Sin90 数据」的 AI 能力。 |
+| 25 | `CreateTasks` / `CarryOverTask` 的 `task.created` payload 加 `direction_id`（T5.4.1，v2 M2） | **采纳** | 今天只有 `CreateTask` 的 payload 带归属（`repo.rs:1129`、`:2658`），另两处没有（`:2744`、`:2869`），违背 #12「payload 自包含」；按 Direction 回放完成任务数时只能去 join 可变表。只加字段，旧事件缺字段时按 §11.2.1 的规则顺 `carried_from` 回溯。 |
+| 26 | Sin90 正式包声明 `model_access: remote_allowed` | **拒绝（硬约束）** | 声明后内核对本模块**所有**调用按 `Privacy::Any` 路由，本地不可用时连 `simple` 调用也会被送到远端，acceptance.md M5「不开远端时只用本地模型」不再成立（§11.3.2）。只在测试包（cargo feature `remote-allowed-manifest`）里声明，用来验证 executive 路径；J10c 钉住正式 manifest。**复审触发条件**：Agent24 提供逐次「只能收窄」的隐私字段，使 `local` 调用在 `remote_allowed` 包里仍由内核保证留在本机。 |
 
 ### 2.1 一处名不副实，值得单独记一笔
 
@@ -229,7 +231,7 @@ CreateTask   { title, direction_id?, parent_task_id?, kind?, energy?, est_minute
 | `sin90_outbox`（T3.3.1） | `status` 值域扩 `pending\|done\|failed`（无 CHECK，代码约束）；+ `failure_kind TEXT NULL`、`last_error TEXT NULL`、`attempts INTEGER NOT NULL DEFAULT 0`、`next_attempt_at TEXT NULL` | 加列 |
 | `sin90_routine_fires`（T3.2.2） | `fire_id PK, routine_id FK, scheduled_for, trigger CHECK(tick\|run_now), received_at` —— 按 `fire_id` 去重内核的至少一次 fired 投递 | **新** |
 | `sin90_reviews`（T4.1.1 + T4.2.1） | + `period TEXT NOT NULL`（`daily=YYYY-MM-DD` / `weekly=YYYY-Www` / `rhythm=<rhythm_id>`），+ `UNIQUE(kind, period)`（`sin90_reviews_kind_period_uq`）；`week_id` 列保留（旧列不删）但新代码不再写它——`period` 取代它成为 Review 的唯一身份轴。迁移 `0007_review_period.sql`：本表在此之前从未被任何代码写入过（无 `INSERT INTO sin90_reviews`），所以回填在实际存量库上不可达；仍防御性实现——有 `week_id` 且指向真实 Week 的行回填该周 `iso_week`，其余回填 `'legacy-' || id`（`id` 是主键，不会与唯一约束冲突）。+ `body_ref TEXT NULL`（T4.2.1，迁移 `0008_review_body_ref.sql`，纯 `ALTER TABLE ... ADD COLUMN`，既有行读回 `NULL`）——定稿（`draft → finalized`）时写入，值是**相对 `data_dir` 的路径** `reviews/<kind>/<period>.md`（见 §4.2）；草稿始终 `NULL`。 | 加列 |
-| `sin90_ai_calls`（T5.1.1，§11.6） | + `run_id TEXT NULL`、`proposal_id TEXT NULL`、`served_tier TEXT NULL`（`local\|remote`，reflex/失败为 `NULL`）、`model_id TEXT NULL`、`error_kind TEXT NULL`；+ `idx_sin90_ai_calls_run(run_id)`、`idx_sin90_ai_calls_proposal(proposal_id)`。`task_kind` 的值域定为 `classify\|summarize\|propose`，`engine` 仍是 `reflex\|local\|executive`（请求的引擎）。迁移取当时的 max+1（spec.md「迁移编号不预分配」），与下一行同一个文件 | 加列 |
+| `sin90_ai_calls`（T5.1.1，§11.6） | + `run_id TEXT NULL`、`proposal_id TEXT NULL`、`served_tier TEXT NULL`（`local\|remote`，reflex/失败为 `NULL`）、`model_id TEXT NULL`、`prompt_tokens INTEGER NULL`、`completion_tokens INTEGER NULL`、`error_kind TEXT NULL`；+ `idx_sin90_ai_calls_run(run_id)`、`idx_sin90_ai_calls_proposal(proposal_id)`。`task_kind` 的值域定为 `classify\|summarize\|propose`，`engine` 仍是 `reflex\|local\|executive`（请求的引擎）。迁移取当时的 max+1（spec.md「迁移编号不预分配」），与下一行同一个文件 | 加列 |
 | `sin90_settings`（T5.1.1，§11.6） | `key TEXT PRIMARY KEY, value TEXT NOT NULL`（JSON 标量）`, updated_at TEXT NOT NULL`；v1 唯一的键 `ai.executive_enabled`，缺行 = `false` | **新** |
 | 其余 7 张 | 不变 | 旧 |
 
@@ -408,7 +410,7 @@ Rhythm 的路由（实体和状态机在，但不开 HTTP 面）、Week 路由�
 
 **交付**：三个能力，**只有三个**：`classify`（inbox 条目 → Area/Direction）、`summarize`（事件 → 复盘草稿）、`propose`（排期建议）。全部只产 `Sin90Proposal`，一条都不直写。
 **验收**：AI 产出的所有变更在 `sin90_proposals` 里都有 `source ∈ {local_brain, executive}` 的行；拔掉网络后 classify 仍可用（走 oMLX 本地脑）。
-**T5.0.1 设计补丁（§11，草稿 v1，待评审）对这段的两处收紧/改动**：
+**T5.0.1 设计补丁（§11，草稿 v2，待评审）对这段的两处收紧/改动**：
 1. 「Area/Direction」落成**只指派 Direction**（Area 由 `direction.area_id` 派生）——Task 没有 `area_id` 列，inbox 的定义是 `direction_id IS NULL`，只给 Area 不会让任务离开 inbox（§2 #22）。
 2. 引擎梯最底层是**无模型的 reflex 规则**，它产出的提议 `source = rule`（而不是冒充 `local_brain`，§2 #23）。所以验收句改为：AI 模块产出的每条提议都有 `source ∈ {local_brain, executive, rule}`，且与产出它的那次 `sin90_ai_calls` 记录（引擎 + 实际服务层级）一致；「断网 classify 仍可用」= 远端不可达、本地可达时 classify 产出 `source = local_brain` 的提议（判据 J16/J23）。
 
@@ -483,15 +485,40 @@ Projection 层（tiny-world-builder 的 `world[x][z]` vs `cellMeshes` 那条思�
 
 ## 11. M5 设计补丁 —— AI v1：新 Op、引擎梯、三能力契约（T5.0.1）
 
-> **草稿 v1，待评审**（2026-09-24）。评审方：Codex 额度 2026-09-29 19:28 前耗尽，期间按 tasks.md T5.0.1 由**全新上下文的 Opus 子代理**做对抗评审（Critical/High/Medium/Low + file:line），评审记录逐轮追加在本节头部的表里，到 APPROVE 才改为「冻结」。
+> **草稿 v2，待评审**（2026-09-24）。评审方：Codex 额度 2026-09-29 19:28 前耗尽，期间按 tasks.md T5.0.1 由**全新上下文的 Opus 子代理**做对抗评审（Critical/High/Medium/Low + file:line），评审记录逐轮追加在本节头部的表里，到 APPROVE 才改为「冻结」。
 >
 > | 轮次 | 评审方 | 结论 | C / H / M / L |
 > |---|---|---|---|
-> | —— | —— | 待评审 | —— |
+> | 第 1 轮（v1，`2ffe621`） | 全新上下文 Opus 子代理（Tier 2，Codex 额度耗尽；验证 crate `scratchpad/review-probe/`，依赖 `t501-check`） | REQUEST_CHANGES（两个新 Op 的校验、`Working` 叠加、accept 时 CAS 成立） | 0 / 3 / 8 / 7 |
+> | 第 2 轮（v2） | —— | 待评审 | —— |
 >
 > 事实核对基线：本 worktree `docs/t5.0.1-ai-v1-design`（叠在 `feat/t4.2.1-body-ref` `7925c4d` 上）；类型化客户端在分支 `feat/t3.2.1-kernel-clients`（`db80b88`）；内核推理回调以 Agent24 `docs/design/ME4-S2-model-callback.md` **v3.1 冻结版**为准（本文引用不复述，§10）。
-> 文中每一段 Rust 签名都在 scratch crate `t501-check`（path 依赖本 worktree 的 `sin90`）里 `cargo check --all-targets` + `cargo test` 过，见 §11.12。
+> 文中每一段 Rust 签名都在 scratch crate `t501-check`（path 依赖本 worktree 的 `sin90`）里 `cargo check --all-targets` + `cargo test` + `cargo clippy --all-targets` 过，见 §11.12。
 > 标 ⚖️ 的数值是**选的**，不是推出来的。标 🟡 的是**待用户拍板的产品问题**（§11.11），文中给的是拍板前的**最保守占位**，不是结论。
+
+#### v1 → v2 改动记录（第 1 轮：REQUEST_CHANGES，0 C / 3 H / 8 M / 7 L，全部采纳）
+
+| 条 | 问题（评审原意） | v2 改法 | 位置 |
+|---|---|---|---|
+| H1 | `{{fN}}` 只代数值、标签由模型写：「编码投入达到{{f2}}」（f2 实为 Business）、「完成任务{{f3}}小时」、在叙述区仿造「## 本周数字（修正）」都能通过 | 取消只代数值的占位：唯一的数值占位 `{{fN}}` 由程序**整体**渲染成 `〔标签：数值〕`，数值永远带着它自己的标签；占位后紧跟 `MEASURE` 量词即拒；叙述里出现「本周数字」即拒；叙述逐行剥掉行首 Markdown 块语法（井号、减号、星号、加号、大于号、竖线、反引号、波浪号、等号、下划线），只剩纯段落；J17 加标签错位、仿造数字块两个负对照 | §11.4.2、J17 |
+| H2 | J7 黑名单被合并 import 绕过（`use crate::{core::Sin90Op, http::Sin90State};` + `s.store.update_review_body(..)`）；按 `//` 切注释会吃掉 `"http://x"` 之后的代码 | 检查器改用 `syn` 解析：展开全部 use 树，访问所有表达式/类型/模式路径、宏路径与宏 token 里的 `a::b` 链；**白名单**——以 `crate`/`sin90`（或足够多 `super` 到达 crate 根）开头的路径下一段只能是 `core`/`ai`，外部 crate 只能是列表内的；注释与字符串由 syn 处理；正对照加合并 import、`Sin90State` 两种写法等 18 条 | §11.5、J7、§11.12 |
+| H3 | T5.4.1「非法建议被 validate 拒」做不到：`ReorderTasks` 的 validate 不查任务存在/在本周（`proposal.rs:262-271`），J21 两可 | `AiSink::submit` 在同一个 `BEGIN IMMEDIATE` 里：`allowed_ops` → `validate` → `SAVEPOINT` + 逐个 `apply_op` 试跑 → `ROLLBACK TO SAVEPOINT` → 插 `pending`；J21 改为确定断言「submit 拒绝且不写任何行」；scratch `dryrun.rs` 在 sqlx 0.8 + SQLite 上实测嵌套事务即 SAVEPOINT、回滚不留痕 | §11.4 公共、J21 |
+| M1 | 后台 run 的 Busy/RateLimited 不该按「交互式等不起」降到弱规则；缺调用预算与总时限；Draining/Revoked 应中止 | 动作三分：**降级** / **延后**（`Busy`/`RateLimited`/`NotReady`：本 run 停掉所有模型步，当前与剩余条目记 `deferred`，**不走 R2**）/ **中止**（`ConnectionLost`/`Cancelled`/`Draining`/`Revoked`/`NotSent`）；每 run 模型调用预算 20 ⚖️（≤ 桶容量 30，两级梯每条目最多 2 次）、总时限 600s ⚖️，用完即延后；另加 run 内熔断：`no_provider`/`backend_config`/`forbidden` 之后该引擎本 run 不再调用 | §11.3.4、§11.3.5 |
+| M2 | `CreateTasks`/`CarryOverTask` 的 `task.created` payload 不含 `direction_id`（`repo.rs:2744`、`:2869`） | T5.4.1 给这两处 payload 只加字段 `direction_id`（`CarryOverTask` 取源任务的）；§11.2.1 与给 T4.3.1 的注记补「归属 = 最近一次 `direction_assigned`，否则 `task.created.direction_id`，旧事件缺字段时顺 `carried_from` 链回溯」 | §11.2.1、§2 #25 |
+| M3 | 调用记录与提议应原子写；`source` 不该由 ai 传入；scratch 写入顺序错 | `AiSink::submit(cap, ProposalDraft, AiCallRecord)`：`ProposalDraft` 没有 `source`/`status` 字段，store 在同一事务里按 `(engine, served_tier)` 推导 `source`、插提议、插 `ok=1` 的调用行；scratch `run_item` 不再自己写产出行，把它随 `Outcome::Produced` 交给调用方 | §11.3.5、§11.5 |
+| M4 | J23 包 B 空转（`MODEL_ACCESS` 是 `include_str!` 编译期常量） | 包 B 用 cargo feature `remote-allowed-manifest` 编译（`include_str!` 另一份 `domain-os.remote-allowed.yml`，同一份文件随包 B 安装）；J23 断言调用表里有 `engine='executive'` 行；加钉子 `sin90 print-model-access` 输出 == 已安装 manifest 解析值 | J23、J23b |
+| M5 | 汉字数词规则措辞过强；任务标题无法引用 | 措辞收窄为「不含**`MEASURE` 表里的**量词紧跟汉字数词串」；加 `{{tN}}`（渲染 `「任务标题」`，标题里的数字来自数据而非模型） | §11.4.2 |
+| M6 | Q7「改写非空草稿」实为整体替换 | 拍板前占位改为：只在正文为空、或正文只有程序生成的数字块时才提议（`is_program_only`） | §11.4.2、Q7 |
+| M7 | Q1 应为冻结硬约束 | 正式包**不声明** `remote_allowed`（acceptance「不开远端时只用本地模型」排除了 (b)）；manifest 钉子测试钉住；executive 只在测试包 B 可达；绊线表述保持「检测不是防护」。Agent24 侧「逐次只能收窄的隐私字段」followup 由统筹登记 | §11.3.2、§2 #26、J10c |
+| M8 | J8 排除清单不确定 | `AiReadModel` 的 store 实现走**独立只读连接池**（`SqliteConnectOptions::read_only(true)`），写即报错；J8 排除清单写死为三项（`sin90_proposals`、`sin90_ai_calls`、`sin90_events WHERE entity='proposal'`），`sin90_attention_*` **不**排除——它是读时可被 `attention_apply_new_events`（`attention.rs:83`）折叠的派生投影，AI 读路径若去折叠它，J8 应当变红 | §11.5、J8 |
+| L1 | AI 提交缺 `proposal.submitted` 内核镜像事件 | http 组装层在 `submit` 成功后补发 `emit("proposal.submitted", {id})`，与 `POST /proposals`（`http/mod.rs:623-626`）同形 | §11.4 公共 |
+| L2 | J17 判据改为「每个数字串出现在 `render_facts` 输出里」 | 采纳，并把 `{{tN}}` 渲染的标题算进允许集；带篡改正对照 | J17 |
+| L3 | 去重「仍然有效」要可判定 | = 现在对该挂起提议重跑提交前校验（validate + 试跑）能通过；目标 Direction 已 abandoned 的挂起提议不再挡任务 | §11.4 公共 |
+| L4 | 采用远端回复前应重读设置 | 采纳：`tier == remote` 时先重读 `AiSettings` 再判绊线（run 途中用户关掉开关也生效） | §11.3.2 |
+| L5 | R1 无结论不是失败 | 记 `error_kind='undecided'`，降级统计里排除 | §11.3.5 |
+| L6 | 父子任务归属 | 写明：父子任务可以归不同 Direction，本 Op 不检查一致性（与 `CreateTask` 一致） | §11.2.1 |
+| L7 | `task_ids` 超 20 的行为；`result.usage` 未记录 | `task_ids` 超 20 → 400（不截断）；`sin90_ai_calls` 加 `prompt_tokens`/`completion_tokens` | §11.4.1、§11.6 |
+| Q | Q1/Q2/Q5 不是开放产品问题 | Q1 → 硬约束（不声明）；Q2 → 默认关；Q5 → `rule`（tasks.md T5.5.1 已含 `rule`；DESIGN §M5 已同步，tasks.md T5.2.1 文字在规划分支，由统筹同步）；Q3/Q4/Q6/Q7（新占位）/Q8 仍留给用户，Q8 附评审的技术输入 | §11.11 |
 
 ### 11.0 解决什么、不解决什么
 
@@ -502,18 +529,19 @@ Projection 层（tiny-world-builder 的 `world[x][z]` vs `cellMeshes` 那条思�
 | classify 的产出落成什么变更 | §11.2.1、§2 #17/#22 | 新 Op `AssignTaskDirection{task_id, direction_id}`，只作用于 inbox；Area 由 Direction 派生，不单独指派 |
 | summarize 的产出落成什么变更 | §11.2.2、§2 #18 | 新 Op `DraftReviewBody{review_id, base_body_sha256, body}`，只作用于草稿，正文摘要做比较并交换 |
 | 校验放哪、与 `Working` 叠加怎么交互 | §11.2.3、§2 #19 | `ValidationCtx` 加三个读法；`Working` 加两张叠加表；apply 里补关系约束 |
-| 引擎梯 | §11.3 | classify：reflex(决定性) → [executive] → local → reflex(兜底)；summarize/propose：[executive] → local → reflex。失败**按错误种类**降级或中止，每次尝试一行 `sin90_ai_calls` |
-| executive 的开关在哪、默认什么 | §11.3.2、§2 #21 | manifest `model_access: remote_allowed` **且** `sin90_settings['ai.executive_enabled'] = true`；🟡 占位：manifest 保持 `local_only`、开关默认关 |
-| 三个能力各自的输入/输出/规则/提示词/触发/限流 | §11.4 | 三条 `POST /ai/*` 触发路由，后台 run、单飞、批量上限；模型输出一律 `response_format: json_schema, strict` + 程序复核 |
-| summarize「数字只来自草稿」怎么保证 | §11.4.2 | 数字区由程序从 T4.3.1 草稿渲染；模型只写叙述，叙述里的字面数字一律拒，数值只能用 `{{fN}}` 占位由程序代入 |
-| AI 模块碰不到直写接口 | §11.5 | `ai/` 只依赖三个 trait（只读模型、两个写法的 sink、模型端口）；文本结构测试 + 行为级表快照测试 |
-| 判据 | §11.7 | J1–J26，覆盖 T5.1.1–T5.5.1，每条带正对照 |
+| 引擎梯 | §11.3 | classify：reflex(决定性) → [executive] → local → reflex(兜底)；summarize/propose：[executive] → local → reflex。失败按种类**降级 / 延后 / 中止**；每 run 有调用预算与总时限 |
+| executive 的开关在哪、默认什么 | §11.3.2、§2 #21/#26 | 需要 manifest `remote_allowed` **且** `sin90_settings['ai.executive_enabled'] = true`；**正式包不声明 `remote_allowed`（硬约束）**，开关默认关 |
+| 三个能力各自的输入/输出/规则/提示词/触发/限流 | §11.4 | 三条 `POST /ai/*` 触发路由，后台 run、单飞、批量与调用预算；模型输出一律 `response_format: json_schema, strict` + 程序复核 |
+| 非法建议在提交时就被拒 | §11.4 公共 | 提交前校验 = `validate` + 在 SAVEPOINT 里试跑 `apply_op` 后回滚 |
+| summarize「数字只来自草稿」怎么保证 | §11.4.2 | 数字块由程序渲染；叙述里数值只能以程序渲染的 `〔标签：数值〕` 原子单元出现；叙述只剩纯段落 |
+| AI 模块碰不到直写接口 | §11.5 | `ai/` 只依赖三个 trait；syn 白名单结构测试 + 只读连接池 + 行为级表快照 |
+| 判据 | §11.7 | J1–J26（含 J10b/J10c/J23b），覆盖 T5.1.1–T5.5.1，每条带正对照 |
 
 **不解决**（写进 §11.9 残余风险或留给后续）：
 - 提议的**拒绝**路由（今天没有 `POST /proposals/{id}/reject`，过期提议只能一直 `pending`）——🟡 Q6。
 - 改**已归类**任务的归属、跨 Area 迁移 Direction、AI 建 Direction/Area（§2 #17/#22 的复审触发条件）。
 - daily / rhythm 复盘的 summarize（T4.3.1 只给周草稿；没有数字来源就没有「数字只来自草稿」可言）。
-- 按日 token/费用预算（内核 ME4-S2 §0 明确不做；Sin90 只有次数与并发上限）。
+- 按日 token/费用预算（内核 ME4-S2 §0 明确不做；Sin90 只有次数、预算与并发上限）。
 - 流式输出、tools / function calling（内核不开）。
 - HTTP `POST /proposals` 的提交期校验（F-2，§11.9 R7）——AI 路径自己做提交前校验，人类/自动化 key 的 HTTP 路径 v1 行为不变。
 
@@ -533,8 +561,11 @@ Projection 层（tiny-world-builder 的 `world[x][z]` vs `cellMeshes` 那条思�
 11. **本端超时**：`transport.rs:94` `RESPONSE_TIMEOUT = 35s`（为内核 30s 通用超时留余量），而内核给 `_a24/model/complete` 的是 **120s**（ME4-S2 §5.2）——不改就会被本端提前判超时、把「内核还在算」误报成 `timeout`。`call_with_timeout`（`:402`）已有，按调用覆盖。
 12. **内核推理回调（ME4-S2 v3.1，冻结）要点**：params `{messages 1..=64, response_format?: json_schema, max_tokens? 1..=4096 缺省 1024, complexity? simple|complex, request_id?}`（§4.2）；result `{text, model_id|null, tier: local|remote, usage}`（§4.3）；隐私**只**由 manifest `model_access` 决定，`local_only` 下内核只路由到 Local/Lora，`remote_allowed` 下以 `Privacy::Any` 路由、`simple` 本地优先、`complex` 远端优先、**选哪个 provider 全由内核**（§2.2）；每模块在途 2、令牌桶 30 突发 / 0.5 每秒（§5.2）；满了不排队直接 `busy` / `rate_limited`；错误新增 `unavailable{retryable, cause ∈ no_provider|request_rejected|backend_config|response_too_large}`（§7）；被代理请求的总时限 30s（ME4-S2 §1 第 9 条 `UPSTREAM_DEADLINE`）。
 13. **T4.3.1 周草稿**：本 worktree 未实现（分支 `feat/t4.3.1-weekly-draft` 尚无提交）；形状以 spec.md M4 为准：`{week, by_area:[{area_id,minutes}], by_direction:[…], tasks_done, routines:[{routine_id, fired, completed}]}`。
+14. **（v2，M2）`task.created` payload 不一致**：`CreateTask`（直写与提议两条路径）的 payload 含 `direction_id`（`repo.rs:1129`、`:2658`），`CreateTasks` 的只有 `{id, week_id, title}`（`:2744`），`CarryOverTask` 新任务的只有 `{id, week_id, carried_from}`（`:2869`）——重放方今天无法只凭事件知道这两类任务的归属。
+15. **（v2，H3）`ReorderTasks` 的 validate 只查周开放、列表非空、无重复**（`proposal.rs:262-271`），不查任务存在、不查任务属于该周；这些在 apply 里才查（`repo.rs:2753-2770`）。所以「非法建议被 validate 拒」对 `ReorderTasks` 不成立，必须把 apply 本身拿来试跑（§11.4 公共）。同理 `idx_sin90_task_carried` 唯一索引（一个任务只能被顺延一次，§1.2）也只在 apply 时才会响。
+16. **（v2，M8）attention 物化视图**：`attention()` 是纯读回放（`attention.rs:55`），但 `attention_apply_new_events()`（`:83`）会写 `sin90_attention_daily` 与水位行——它是一个「读侧」可能顺手调用的写者。
 
-### 11.2 新 Op（§2 #17–#19）
+### 11.2 新 Op（§2 #17–#19、#25）
 
 两个 Op 都加进 `Sin90Op`（wire：`#[serde(tag = "op", rename_all = "snake_case")]`，与既有一致），同时给整个枚举补 `#[serde(deny_unknown_fields)]`（F-1）。scratch `ops.rs` 用一个平行枚举验证了 wire 形状与「内部标签枚举 + `deny_unknown_fields`」的组合确实拒未知键。
 
@@ -577,7 +608,13 @@ pub fn body_sha256(body: &str) -> String;
 4. 事件：`entity = task`、`kind = direction_assigned`（对外 `task.direction_assigned`）、`from_state = to_state = NULL`（状态没变）、payload **自包含**：`{"task_id", "from_direction_id": null, "direction_id", "area_id": <apply 时 direction 的 area_id 或 null>}`。
 5. `build_snapshot` 新增：`AssignTaskDirection` 载入任务（状态 + 归属）与 Direction 状态。
 
-**对重放方的影响（交给 T4.3.1）**：任务的 Direction 归属不再只在 `task.created` 的 payload 里——按 Direction/Area 统计「完成任务数」的回放必须把 `task.direction_assigned` 折叠进来（取完成事件之前最后一次归属）。attention 回放按 `ScheduleBlock.direction_id` 计时，不受影响。
+**对重放方的影响（交给 T4.3.1）**：任务的 Direction 归属不再只在 `task.created` 的 payload 里。按 Direction/Area 统计「完成任务数」的回放，一个任务在其完成事件时刻的归属 =
+1. 该时刻之前最后一条 `task.direction_assigned` 的 `direction_id`；没有则
+2. `task.created` payload 的 `direction_id`（v2 起 `CreateTasks` 与 `CarryOverTask` 也写这个字段，§2 #25，T5.4.1 落地）；字段缺失（旧事件）则
+3. 若 payload 有 `carried_from`，对源任务递归同样的规则（顺延链最长 = 周数，`idx_sin90_task_carried` 保证无分叉）；仍无则归「未分类」。
+attention 回放按 `ScheduleBlock.direction_id` 计时，不受影响。
+
+**父子任务**（v2，L6）：父任务与子任务可以归不同的 Direction；本 Op 不检查父子归属一致性（与既有 `CreateTask` 不检查一致）。一个 Project 横跨两个方向是合法的建模。
 
 #### 11.2.2 `DraftReviewBody{review_id, base_body_sha256, body}`
 
@@ -618,23 +655,23 @@ pub trait ValidationCtxV5: ValidationCtx {
 
 #### 11.3.1 三级引擎
 
-| 引擎 | 是什么 | `ProposalSource` | 可用条件 |
+| 引擎 | 是什么 | `ProposalSource`（store 推导，§11.3.5） | 可用条件 |
 |---|---|---|---|
-| `reflex` | 纯规则，进程内，无 I/O 之外的依赖（只读 Sin90 自己的库） | `rule` | 永远可用（含 standalone、内核未授予 models、断网） |
+| `reflex` | 纯规则，进程内，只读 Sin90 自己的库 | `rule` | 永远可用（含 standalone、内核未授予 models、断网） |
 | `local` | `_a24/model/complete`，`complexity: simple` | 按 `result.tier`：`local` → `local_brain` | 握手 `Offer.provides` 含 `_a24/model/`（`ModelClient::new` 返回 `Some`） |
-| `executive` | `_a24/model/complete`，`complexity: complex` | 按 `result.tier`：`remote` → `executive`，`local` → `local_brain` | 上一行 **且** 编译期 manifest `model_access == remote_allowed` **且** `sin90_settings['ai.executive_enabled'] == true` |
+| `executive` | `_a24/model/complete`，`complexity: complex` | 按 `result.tier`：`remote` → `executive`，`local` → `local_brain` | 上一行 **且** 编译期 `MODEL_ACCESS == remote_allowed` **且** `sin90_settings['ai.executive_enabled'] == true`。**正式包里前一条恒假**（§11.3.2） |
 
-**关键事实（决定了本节的措辞）**：Sin90 **选不了** provider（ME4-S2 §2.2）。「executive」只是「请内核按 `complex` 路由」，内核可能仍用本地服务它；所以 `source` 按 **`result.tier`（实际服务层级）** 定，不按请求的引擎（scratch `executive_request_served_locally_is_local_brain`）。
+**关键事实**：Sin90 **选不了** provider（ME4-S2 §2.2）。「executive」只是「请内核按 `complex` 路由」，内核可能仍用本地服务它；所以 `source` 按 **`result.tier`（实际服务层级）** 定，不按请求的引擎（scratch `executive_request_served_locally_is_local_brain`）。
 
-#### 11.3.2 executive 的两道闸与它们各自保证什么
+#### 11.3.2 executive 的两道闸，与正式包的硬约束
 
-1. **manifest `model_access`**（内核强制）：Sin90 的 `domain-os.yml` 是否声明 `remote_allowed`。Sin90 用 `include_str!("../domain-os.yml")` 在编译期取这个值（`const MODEL_ACCESS`），只用来决定**要不要尝试** executive——真正的隐私保证在内核。
-2. **用户设置**（Sin90 自己的）：`sin90_settings` 表的 `ai.executive_enabled`，缺行 = `false`；只能经 `PUT /settings/ai {"executive_enabled": bool}` 改（`require_human`，`deny_unknown_fields`，同事务写事件 `setting.changed` payload `{key, value}`），`GET /settings/ai` 读（任一 key）。
+1. **manifest `model_access`**（内核强制）：Sin90 用 `include_str!` 在编译期取随包 manifest 的值（`const MODEL_ACCESS`），只用来决定**要不要尝试** executive；真正的隐私保证在内核。
+2. **用户设置**（Sin90 自己的）：`sin90_settings` 的 `ai.executive_enabled`，缺行 = `false`；只能经 `PUT /settings/ai {"executive_enabled": bool}` 改（`require_human`，`deny_unknown_fields`，同事务写事件 `setting.changed` payload `{key, value}`），`GET /settings/ai` 读（任一 key）。
 
-**必须如实写出的一条（措辞不能比机制强）**：一旦 manifest 是 `remote_allowed`，内核对 Sin90 的**所有**调用都以 `Privacy::Any` 路由——包括 `local` 引擎发的 `simple` 调用：本地 provider 不可用时，内核会**自己**把它送到远端（ME4-S2 §2.2「`Simple` 本地优先」= 本地不行就远端）。模块没有逐次调用收窄隐私的字段（ME4-S2 §4.2：`privacy` 字段不存在）。所以：
-- manifest `local_only`：`local` 调用**由内核保证**不出本机（以 ME4-S2 §2.3 的 `Local` 定义为准）；executive 永不尝试。
-- manifest `remote_allowed` + 用户开关**关**：Sin90 不发 `complex` 调用，但**不能保证** `simple` 调用不被内核送到远端；Sin90 只能**事后发现**（`result.tier == remote` 且开关关 → 丢弃结果、记 `error_kind = privacy_tripwire`、降级，scratch `remote_reply_while_executive_off_trips_and_degrades`）——字节已经出去了，这是检测不是防护。
-- 🟡 **占位**：发布包保持 `local_only`（不写 `model_access`），executive 代码路径存在、被测试覆盖（测试包用 `remote_allowed` 的 manifest 变体），但**正式包里不可达**；用户开关默认关。是否发布 `remote_allowed` 版本、是否向 Agent24 提「逐次收窄到 LocalOnly」的字段（只能收窄、不能放宽，不破坏 ME4-S2 的隐私模型），见 §11.11 Q1/Q2。
+**为什么正式包不声明 `remote_allowed`（硬约束，§2 #26）**：一旦声明，内核对 Sin90 的**所有**调用都以 `Privacy::Any` 路由——包括 `local` 引擎发的 `simple` 调用：本地 provider 不可用时内核会**自己**把它送到远端（ME4-S2 §2.2「`Simple` 本地优先」= 本地不行就远端），模块没有逐次收窄隐私的字段（ME4-S2 §4.2）。acceptance.md M5「不开远端时只用本地模型」因此只在 `local_only` 下成立。所以：
+- **正式包**：`domain-os.yml` 不写 `model_access`（= `local_only`），`local` 调用**由内核保证**不出本机（以 ME4-S2 §2.3 的 `Local` 定义为准），executive 永不尝试。钉子测试 J10c 钉住。
+- **测试包 B**（cargo feature `remote-allowed-manifest`，只用于 J16/J23 验证 executive 路径）：`include_str!("../domain-os.remote-allowed.yml")`，同一份文件随包安装。它的已知性质：开关关时 Sin90 不发 `complex` 调用，但内核仍可能把 `simple` 调用送到远端；Sin90 只能**事后发现**——`result.tier == remote` 时**先重读 `AiSettings`**（run 途中用户关掉开关也生效，L4），开关关则丢弃结果、记 `error_kind='privacy_tripwire'`、降级（scratch `switch_turned_off_mid_run_trips_remote_reply`）。这是**检测，不是防护**：字节已经出去了。
+- 让正式包也能安全地用 executive，需要 Agent24 给 `_a24/model/complete` 一个**只能收窄**的逐次隐私字段；该 followup 由统筹在 Agent24 侧登记，落地前本约束不放松。
 
 manifest 同时要改：`kernel_capabilities` 加 `models`（M3/M4 另加的 `scheduler`/`memory` 不归本文）；`requires_models` **保持 `[]`**——它是挂载时资源检查（ME4-S2 §1 第 11 条），写了会让「没有本地模型」的机器装不上 Sin90，而 reflex 让 AI 在没模型时仍可用。
 
@@ -649,35 +686,45 @@ pub fn plan(cap: Capability, access: ModelAccess, settings: AiSettings, model_po
 // Executive 出现 ⇔ port 在 ∧ access == RemoteAllowed ∧ settings.executive_enabled；Local 出现 ⇔ port 在
 ```
 
-- **向上（升级）**：只有 classify 有 `ReflexDecisive`——规则能**确定**时不花模型（§11.4.1 R1）；确定不了是正常情况，不叫失败，`fallback_from` 不记。
-- **向下（降级）**：模型尝试失败按下表处理；降到下一步时，下一步那行的 `fallback_from` = 刚失败的引擎。
-- **同一引擎不重试**（v1）：本地推理基本串行、内核满了就 `busy` 不排队，同一 run 里原地重试只会再撞一次；用户可以再触发一次 run。
+- **向上（升级）**：只有 classify 有 `ReflexDecisive`——规则能**确定**时不花模型（§11.4.1 R1）；确定不了记 `undecided`，不是失败，`fallback_from` 不记，降级统计里排除（L5）。
+- **向下（降级）**：模型尝试失败按 §11.3.4 处理；降到下一步时，下一步那行的 `fallback_from` = 刚失败的引擎。
+- **同一引擎不原地重试**（v1）。
 
-#### 11.3.4 失败 → 动作（`ModelFailure::action()`，scratch 已 check + test）
+#### 11.3.4 失败 → 动作（`ModelFailure::action()`，scratch `failure_table_is_exhaustive` 用穷尽表钉住）
 
-`ai/` 不认识 `ClientError`（它不许 import `adapter_agent24`，§11.5）；adapter 实现 `ModelPort` 时把 `ClientError` 折叠成 `ModelFailure`：
+`ai/` 不认识 `ClientError`（它不许 import `adapter_agent24`，§11.5）；adapter 实现 `ModelPort` 时把 `ClientError` 折叠成 `ModelFailure`。三种动作：
 
-| `ClientError`（T5.1.1 补齐后） | `ModelFailure` | 动作 | `error_kind` |
-|---|---|---|---|
-| `Unavailable{retryable:true, cause:no_provider}` | `Unavailable{..}` | **降级** | `unavailable.no_provider` |
-| `Unavailable{retryable:false, cause:request_rejected}` | 同上 | **降级**（本请求对这个模型不合格；reflex 不受影响） | `unavailable.request_rejected` |
-| `Unavailable{retryable:false, cause:backend_config}` | 同上 | **降级** + `warn!`（后端配置坏了，要告诉用户，但不该让 inbox 分类停摆） | `unavailable.backend_config` |
-| `Unavailable{retryable:false, cause:response_too_large}` | 同上 | **降级**（我们的 `max_tokens` ≤ 1024，出现即本端 bug，`error!`） | `unavailable.response_too_large` |
-| `Busy` / `RateLimited` | `Busy` / `RateLimited` | **降级**（不排队、不原地退避：交互式触发，等不起） | `busy` / `rate_limited` |
-| `Timeout`（本端 125s 或内核 120s） | `Timeout` | **降级** | `timeout` |
-| `Forbidden`（未授予 models） | `Forbidden` | **降级**（正常构造时 port 就是 `None`，走不到这里；到了说明 offer 与授予不一致，`warn!`） | `forbidden` |
-| `InvalidParams` / `PayloadTooLarge` | `BadRequest` | **降级** + `error!`（本端 bug） | `bad_request` |
-| `NotReady` / `Draining` / `Revoked` / `NotSent` / `RequestNotInFlight` / `NotFound` / `QuotaExceeded` / `TokenInvalid` / `Other` | `NotUsable` | **降级**（reflex 不需要内核） | `not_usable` |
-| `ConnectionLost` | `ConnectionLost` | **中止整个 run**，不走 reflex、不产提议（结果不确定、这一代正在结束，architecture.md 边界 #5；进程随后退出） | `connection_lost` |
-| `Cancelled`（内核停机） | `Cancelled` | **中止** | `cancelled` |
-| 模型返回了，但输出不合格（JSON 解析失败、不在 schema 的 enum、叙述里有数字……§11.4） | —— | **降级** | `bad_output` / 各能力自己的子种类 |
-| 返回了，`tier == remote` 而开关关 | —— | **降级**（丢弃结果） | `privacy_tripwire` |
+- **降级**：记本步失败，走梯的下一步（最终可到 R2 / 纯数字块 / reflex 排期）。
+- **延后**：容量用尽——本 run **停掉所有模型步**；当前条目与剩余条目结束为 `deferred`，**不走 reflex 兜底**（弱规则不该因为内核忙而替代模型；用户稍后再触发一次即可）。
+- **中止**：本 run 立即结束，不再产出任何提议；已提交的保留。
 
-T5.1.1 对 `ClientError` 的配套改动（在 adapter 里，交给实现）：加 `Unavailable{retryable: bool, cause: UnavailableCause}` 与 `Cancelled` 两个变体；`map_rpc_error` 认 `unavailable`（读 `data.retryable`、`data.cause`，cause 不在四值闭集内 → `Other`）与 `cancelled`；`every_spec_error_kind_maps_to_its_documented_variant` 的计数 17 → 18（`unavailable`）并把 `cancelled` 从「落 `Other`」移出；`is_permanent`：`Unavailable{retryable:false}` 为真；`is_retryable`：`Unavailable{retryable:true}` 为真。
+| `ClientError`（T5.1.1 补齐后） | `ModelFailure` | 动作 | 熔断 | `error_kind` |
+|---|---|---|---|---|
+| `Unavailable{retryable:true, cause:no_provider}` | `Unavailable` | 降级 | **是** | `unavailable.no_provider` |
+| `Unavailable{retryable:false, cause:request_rejected}` | `Unavailable` | 降级 | 否（下一条目的请求不同） | `unavailable.request_rejected` |
+| `Unavailable{retryable:false, cause:backend_config}` | `Unavailable` | 降级 + `warn!` | **是** | `unavailable.backend_config` |
+| `Unavailable{retryable:false, cause:response_too_large}` | `Unavailable` | 降级 + `error!`（本端 `max_tokens` ≤ 1024，出现即 bug） | 否 | `unavailable.response_too_large` |
+| `Timeout`（本端 125s 或内核 120s） | `Timeout` | 降级 | 否 | `timeout` |
+| `Forbidden`（未授予 models；正常构造时 port 为 `None` 走不到） | `Forbidden` | 降级 + `warn!` | **是** | `forbidden` |
+| `InvalidParams` / `PayloadTooLarge` | `BadRequest` | 降级 + `error!`（本端 bug） | 否 | `bad_request` |
+| `NotFound` / `QuotaExceeded` / `TokenInvalid` / `RequestNotInFlight` / `Other` | `Other` | 降级 | 否 | `other` |
+| `Busy` / `RateLimited` | `Busy` / `RateLimited` | **延后** | —— | `busy` / `rate_limited` |
+| `NotReady`（握手未完成） | `NotReady` | **延后** | —— | `not_ready` |
+| `Draining` / `Revoked` / `NotSent` | `GenerationEnding` | **中止**（这一代正在结束，architecture.md 边界 #5） | —— | `generation_ending` |
+| `ConnectionLost` | `ConnectionLost` | **中止**（结果不确定） | —— | `connection_lost` |
+| `Cancelled`（内核停机） | `Cancelled` | **中止** | —— | `cancelled` |
+| 模型返回了但输出不合格（§11.4 各能力的复核） | —— | 降级 | 否 | `bad_output` 等 |
+| 返回了，`tier == remote` 而（重读后的）开关关 | —— | 降级 | 否 | `privacy_tripwire` |
 
-#### 11.3.5 `sin90_ai_calls`：每次尝试一行
+**熔断**（run 内）：标「是」的失败之后，该引擎在本 run 剩余条目里不再调用（直接当作已失败，下一步 `fallback_from` = 它），省下预算、不反复撞一个已知不可用的后端（scratch `circuit_breaker_skips_engine_for_rest_of_run`）。
 
-**每个 `Step` 实际执行一次写一行**（跳过的步——比如 port 不在时的 `Model(Local)`——不写）。scratch `AiCallRecord`：
+**每 run 预算**（`RunState`，⚖️）：模型调用 ≤ `MAX_MODEL_CALLS_PER_RUN = 20`（内核令牌桶突发 30 之内；两级梯每条目最多 2 次，所以一个 run 覆盖的条目可能少于 20）；总时限 `RUN_DEADLINE_SECS = 600`。预算或时限用尽 → 同「延后」（scratch `call_budget_defers`）。
+
+T5.1.1 对 `ClientError` 的配套改动（在 adapter 里）：加 `Unavailable{retryable: bool, cause: UnavailableCause}` 与 `Cancelled` 两个变体；`map_rpc_error` 认 `unavailable`（读 `data.retryable`、`data.cause`，cause 不在四值闭集内 → `Other`）与 `cancelled`；`every_spec_error_kind_maps_to_its_documented_variant` 的计数 17 → 18（`unavailable`）并把 `cancelled` 从「落 `Other`」移出；`is_permanent`：`Unavailable{retryable:false}` 为真；`is_retryable`：`Unavailable{retryable:true}` 为真。
+
+#### 11.3.5 `sin90_ai_calls`：每次尝试一行，产出行与提议同事务
+
+**每个 `Step` 实际执行一次写一行**（熔断跳过、延后未执行的步不写）。scratch `AiCallRecord`：
 
 | 列 | 值 |
 |---|---|
@@ -685,69 +732,84 @@ T5.1.1 对 `ClientError` 的配套改动（在 adapter 里，交给实现）：�
 | `run_id`（新） | 本次 `POST /ai/*` 的 run id；classify 的一个 run 覆盖多个条目 |
 | `task_kind` | `classify` / `summarize` / `propose` |
 | `engine` | **请求的**引擎 `reflex` / `local` / `executive` |
-| `fallback_from` | 上一步失败的引擎；升级（`ReflexDecisive` 无结论 → 模型）不记 |
+| `fallback_from` | 上一步失败（或被熔断）的引擎；升级（R1 `undecided` → 模型）不记 |
 | `served_tier`（新） | 模型返回时的 `result.tier`；reflex 与传输失败为 `NULL` |
-| `model_id`（新） | `result.model_id`（内核给 `null` 就 `NULL`） |
+| `model_id`（新） | `result.model_id` |
+| `prompt_tokens` / `completion_tokens`（新，L7） | `result.usage` |
 | `latency_ms` | 本步墙钟（含内核排队与推理） |
-| `ok` | 本步**产出了可用结果**（模型返回且输出通过复核 / reflex 有结论） |
-| `error_kind`（新） | §11.3.4 的串；`ok = 1` 时为 `NULL`；reflex 无结论为 `no_match` |
-| `proposal_id`（新） | 只在**产出提议的那一行**填；每条 AI 提议恰好对应一行 `ok = 1` 的调用记录 |
+| `ok` | 本步**产出了可用结果**（模型返回且复核通过 / reflex 有结论） |
+| `error_kind`（新） | §11.3.4 的串；R1 无结论 `undecided`；R2 无结论 `no_match`；产出但提交前校验失败 `rejected_by_precheck`；`ok = 1` 时为 `NULL` |
+| `proposal_id`（新） | 只在产出提议的那一行填，由 store 在 `submit` 事务里填 |
 | `at` | ISO-8601 |
 
-写入走 `AiSink::record_call`，失败只 `warn!` 不阻断 run（调用记录是审计不是业务真相；丢一行不该让分类失败）——这意味着「可追溯」是**尽力而为**，§11.9 R6。
+**原子性（M3）**：`run_item` 对产出的那一步**不写**调用行，把 `ok=1` 的 `AiCallRecord` 随 `Outcome::Produced` 返回；调用方把它和 `ProposalDraft` 一起交给 `AiSink::submit(cap, draft, rec)`，store 在**同一事务**里插提议、插调用行（`proposal_id = draft.id`）。所以「每条 AI 提议恰好对应一行 `ok=1` 调用记录」是事务保证，不是尽力而为。`submit` 被拒（`SinkError::Invalid`）→ 调用方改写这行为 `ok=0, error_kind='rejected_by_precheck'` 经 `record_call` 写入，继续下一条目（不降级——模型没错，是状态变了）。
+**`source` 由 store 推导**：`ProposalDraft` 没有 `source`、`status` 字段；store 用 `source_for(rec.engine, rec.served_tier)`（reflex → `rule`；`served_tier = remote` → `executive`；否则 `local_brain`）。ai 模块没有任何途径写入一个与调用记录不一致的 `source`。
+非产出步的 `record_call` 失败只 `warn!`，不阻断 run（R6）。
 
 ### 11.4 三个能力的契约
 
 **公共部分**：
-- **触发**：三条路由，全部 `require_any_actor`（触发本身只写 `sin90_proposals` 的 `pending` 行与 `sin90_ai_calls`，不改业务状态；人类 UI 与 Pet0 这类自动化都可以点「帮我分类」），返回 `202 {"run_id", "capability"}`，run 在后台跑：
-  `POST /ai/classify {"task_ids"?: [...]}`、`POST /ai/summarize {"review_id"}`、`POST /ai/propose {"week_id"}`；`GET /ai/runs/{run_id}` 返回 `{run_id, capability, state: running|done|aborted, proposals: [...], calls: [...sin90_ai_calls 行]}`（运行态在进程内存里，上限 64 条 LRU ⚖️；重启后只剩 `calls`，`state` 由「有没有行」推不出来就报 `unknown`）。
-  standalone 模式同样注册（port 为 `None`，只有 reflex）。**不在** `/_a24/*` 下，不依赖内核代理。
-- **为什么后台跑、不绑 `request_id`**：被代理请求的总时限是 30s（§11.1 第 12 条），一次本地推理可以到 120s；绑上 `request_id` 就会在 30s 被内核截断（`RequestNotInFlight`）。所以模型调用**不带 `request_id`**，run 的生命周期属于 Sin90 进程；进程退出时在途 run 直接丢弃（已写的调用记录与已提交的提议保留）。
-- **限流（Sin90 这一侧）**：每个能力**单飞**——同一能力已有 run 在跑，再触发返回 `409 {"code":"ai_busy","run_id":<在跑的>}`；进程内模型调用信号量 = 2（= 内核每模块在途上限，本端不自己制造 `busy`）；本端对 `_a24/model/complete` 用 `call_with_timeout(125s)` ⚖️（内核 120s + 5s 余量，§11.1 第 11 条）。内核的令牌桶（30 突发 / 0.5 每秒）是最终上限。
-- **自动触发**：🟡 占位 = **v1 只有手动触发**（没有 Routine fired / capture 后自动跑）。见 Q3。
-- **提议的形状**：`id = "ai-<capability>-<ULID>"`（只是便于人看；「这是不是 AI 产出」以 `sin90_ai_calls.proposal_id` 关联为准，J24）；`status = pending`；`source` 按 §11.3.1；`rationale` = `"<engine>: <理由>"`，去控制字符、截到 280 字符 ⚖️。
-- **提交前校验**：AI 经 `AiSink::submit` 提交，它在**一个** `BEGIN IMMEDIATE` 里 `build_snapshot` → `validate` → `INSERT … 'pending'`；校验不过就不入库（`SinkError::Invalid`，该条目计入 run 结果的 `rejected`）。accept 时照旧再校验一次（状态可能已变）。人类/自动化 key 的 `POST /proposals` 不变（F-2）。
-- **每个能力只准产出自己的 Op**：`AiSink::submit` 的 store 实现先查 `allowed_ops(capability)`——classify ⇒ 仅 `AssignTaskDirection`；summarize ⇒ 仅 `DraftReviewBody`；propose ⇒ 仅 `CarryOverTask` / `ReorderTasks` / `CreateTasks`。越界即 `SinkError::Invalid`。这让「只有三个能力」在写入口有一道机制，而不只是代码约定（J22）。
-- **去重**：触发时跳过已有**仍然有效**的挂起提议的目标（classify：仍在 inbox 的任务；summarize：base 摘要仍等于当前正文的复盘）。已过期的挂起提议（任务已被归类、正文已被改）不挡新 run——否则没有拒绝路由（Q6）时，一条过期提议会永久挡住这个目标。
+- **触发**：三条路由，全部 `require_any_actor`（触发本身只写 `sin90_proposals` 的 `pending` 行与 `sin90_ai_calls`，不改业务状态），返回 `202 {"run_id", "capability"}`，run 在后台跑：
+  `POST /ai/classify {"task_ids"?: [...]}`、`POST /ai/summarize {"review_id"}`、`POST /ai/propose {"week_id"}`；`GET /ai/runs/{run_id}` 返回 `{run_id, capability, state: running|done|aborted|unknown, items: [{target, result: proposed|nothing|deferred|rejected|skipped}], calls: [...]}`（运行态在进程内存，上限 64 条 LRU ⚖️；重启后只剩 `calls`，`state = unknown`）。
+  standalone 模式同样注册（port 为 `None`，只有 reflex）。**不在** `/_a24/*` 下。
+- **为什么后台跑、不绑 `request_id`**：被代理请求的总时限是 30s（§11.1 第 12 条），一次本地推理可以到 120s；绑上就会被截断（`RequestNotInFlight`）。所以模型调用**不带 `request_id`**，run 属于 Sin90 进程；进程退出时在途 run 丢弃（已提交的提议与已写的调用记录保留）。
+- **限流（Sin90 这一侧）**：每个能力**单飞**（再触发 → `409 {"code":"ai_busy","run_id"}`）；进程内模型调用信号量 = 2（= 内核每模块在途上限）；`_a24/model/complete` 用 `call_with_timeout(125s)` ⚖️；每 run 调用预算 20、总时限 600s（§11.3.4）。
+- **自动触发**：🟡 占位 = **v1 只有手动触发**。见 Q3。
+- **提议形状**：`id = "ai-<capability>-<ULID>"`（便于人看；「是不是 AI 产出」以 `sin90_ai_calls.proposal_id` 关联为准，J24）；`rationale` = `"<engine>: <理由>"`，去控制字符、截到 280 字符 ⚖️；`source` 由 store 推导（§11.3.5）。
+- **提交前校验（H3）**：`AiSink::submit` 的 store 实现在**一个** `BEGIN IMMEDIATE` 里依次：
+  1. `allowed_ops(cap)`——classify ⇒ 仅 `AssignTaskDirection`；summarize ⇒ 仅 `DraftReviewBody`；propose ⇒ 仅 `CarryOverTask`/`ReorderTasks`/`CreateTasks`（J22）；
+  2. `build_snapshot` → `validate`；
+  3. **试跑**：开嵌套事务（sqlx 在已开事务的连接上 `begin()` 即发 `SAVEPOINT`），对每个 op 调**同一个** `apply_op`，然后**无条件** `ROLLBACK TO SAVEPOINT`——关系约束（`ReorderTasks` 引用的任务是否在该周、`require_task_week_open`、`idx_sin90_task_carried` 唯一索引、CAS UPDATE 的 `affected`）在这里全部真实地跑一遍，试跑里铸造的 ULID 与事件随回滚消失；
+  4. 推导 `source`，`INSERT` 提议（`pending`）+ `proposal.submitted` 事件行 + `ok=1` 调用行；`COMMIT`。
+  任一步失败 → `SinkError::Invalid`，整个事务回滚，**不写任何行**。scratch `dryrun.rs` 在 sqlx 0.8 + SQLite 上实测了「嵌套事务 = SAVEPOINT、回滚后外层照常插入、试跑不留痕、非法重排整体拒绝」。accept 时照旧 validate + apply（状态可能已变）。人类/自动化 key 的 `POST /proposals` 不变（F-2）。
+  **镜像事件（L1）**：`submit` 成功后，http 组装层（持有 `EventSink` 的那一层，不是 `ai/`）补发 `emit("proposal.submitted", {"id"})`，与 `POST /proposals` 同形（`http/mod.rs:623-626`）。
+- **去重（L3）**：触发时跳过已有**仍然有效**挂起提议的目标。「仍然有效」= 现在对那条挂起提议重跑提交前校验的第 2–3 步能通过（只读快照 + 试跑后回滚，不写）。于是：任务已被归类、正文已被人改、目标 Direction 已 abandoned 的挂起提议都不再挡新 run——否则没有拒绝路由（Q6）时，一条过期提议会永久挡住它的目标。
 
 #### 11.4.1 classify（T5.2.1）
 
-- **输入**：`task_ids` 给了就用（每个必须在 inbox，否则 400）；没给就取 inbox 里最老的、未被去重挡掉的条目。每 run 至多 **20** 条 ⚖️（20 次调用在内核 30 次突发之内）。
-- **候选集**：非终态 Direction，按 `updated_at` 倒序至多 **40** 个 ⚖️（`{direction_id, title, status, area_title}`）；候选为空 → 该条目直接结束（run 结果记 `no_candidates`，不写调用行、不产提议）。
-- **reflex R1（决定性）**：`normalize_title`（去首尾空白、压缩内部空白、小写，scratch 已测）后，库里**已归类**（非 inbox）、归属 Direction 仍非终态的任务中，同标准化标题的任务**全部**指向同一个 Direction D → 提议 `AssignTaskDirection(t, D)`，`source = rule`，不调模型。
+- **输入**：`task_ids` 给了就用——至多 20 个 ⚖️，**超过 → 400**（不截断，L7），每个必须在 inbox，否则 400；没给就取 inbox 里最老的、未被去重挡掉的至多 20 条。调用预算（20）可能先于条目耗尽，剩下的记 `deferred`。
+- **候选集**：非终态 Direction，按 `updated_at` 倒序至多 **40** 个 ⚖️（`{direction_id, title, status, area_title}`）；候选为空 → 该条目结束为 `nothing`（不写调用行、不产提议）。
+- **reflex R1（决定性）**：`normalize_title`（去首尾空白、压缩内部空白、小写，scratch 已测）后，库里**已归类**、归属 Direction 仍非终态的任务中，同标准化标题的任务**全部**指向同一个 Direction D → 提议 `AssignTaskDirection(t, D)`，`source = rule`，不调模型；否则 `undecided`。
 - **模型（executive / local）**：
-  - 候选以**不透明短键** `d1…dn` 呈现（scratch `candidate_keys`），模型看不到 ULID，也就造不出 ULID。
+  - 候选以**不透明短键** `d1…dn` 呈现（scratch `candidate_keys`），模型看不到、也就造不出 ULID。
   - messages：`system` = 固定指令（「从候选里选一个最合适的方向；都不合适就选 none；只输出 JSON」）；`user` = JSON `{"item": {"title": …}, "candidates": [{"key":"d1","title":…,"area":…}, …]}`。
   - `response_format`：`{"type":"json_schema","json_schema":{"name":"sin90_classify","strict":true,"schema": <scratch classify::schema>}}`——`{choice: enum[d1…dn, none], confidence: enum[low, medium, high], reason: string ≤ 200}`，`additionalProperties: false`。`max_tokens: 256` ⚖️。
-  - 程序复核（scratch `classify::parse`）：容忍一层 ```` ```json ```` 围栏；`deny_unknown_fields`；`choice` 必须在本次的键集内（否则 `bad_output`）；`none` 或 `low` → **本条不产提议**（记 `ok = 1`，不是失败——模型认真地说了「不知道」）🟡 Q8。
-- **reflex R2（兜底，仅在模型步全部失败或不存在时）**：任务标题与「候选 Direction 标题 + Area 标题」的重合度——ASCII 按长度 ≥ 3 的词、CJK 按字二元组；**唯一最高分**且 ≥ 2 个二元组或 ≥ 1 个词 ⚖️ → 提议；否则 `no_match`、不产提议。R2 是弱规则，它的存在只是让「模型全挂」时不至于完全没有建议；它产出的提议 `source = rule`，人一眼能看出不是模型给的。
-- **输出**：每个条目至多一条提议，`ops = [AssignTaskDirection]`。条目之间独立（人可以只批其中几条）。
+  - 程序复核（scratch `classify::parse`）：容忍一层 ```` ```json ```` 围栏；`deny_unknown_fields`；`choice` 必须在本次键集内（否则 `bad_output`）；`none` 或 `low` → 本条 `nothing`（记 `ok = 1`——模型认真地说了「不知道」）🟡 Q8。
+- **reflex R2（兜底，仅在模型步全部失败/熔断或不存在时；延后不走）**：任务标题与「候选 Direction 标题 + Area 标题」的重合度——ASCII 按长度 ≥ 3 的词、CJK 按字二元组；**唯一最高分**且 ≥ 2 个二元组或 ≥ 1 个词 ⚖️ → 提议；否则 `no_match`。R2 是弱规则，产出的提议 `source = rule`，人一眼能看出不是模型给的。
+- **输出**：每个条目至多一条提议，`ops = [AssignTaskDirection]`，条目之间独立。
 
 #### 11.4.2 summarize（T5.3.1）
 
 - **输入**：`review_id`，必须 `kind = weekly` 且 `status = draft`（否则 409；daily/rhythm 400 `unsupported_kind`）；周 = `period`。
-- **数字来源**：`AiReadModel` 调 T4.3.1 的周草稿函数得到 `WeeklyDraft`（形状见 §11.1 第 13 条）；另取该周 `task.transitioned → done` 事件对应的任务标题（至多 50 条 ⚖️，只作叙述素材，不作数字来源）。
-- **「数字只能来自草稿」的机制**（scratch `summarize.rs` 已 check + test）：
-  1. `facts(draft, title_of)` 把草稿的每个数值变成一条 `Fact{key: "fN", label, value}`；`render_facts` 把它们渲染成正文的「本周数字」块——**这一块完全由程序生成**，模型碰不到。
-  2. 模型只输出 `{"narrative": string ≤ 2000}`（`response_format` 同上，`max_tokens: 1024` ⚖️），提示词给它 `[{key, label, value}]` 并要求：**不许写任何数字**，要提到数值就写 `{{fN}}`，要提到标签就写 `{{fN.label}}`。
-  3. `fill_narrative` 复核：占位符之外的字面文本里出现任何 `char::is_numeric()` 为真的字符（阿拉伯、全角、其它 Unicode 数字）→ 拒；出现「汉字数词串 + 量词」（`七个`、`两小时`、`三次`……）→ 拒；未知占位符、未闭合 → 拒；拒 = `bad_output`，降级。通过后程序把占位符代成 `Fact` 的值/标签。
-  4. 正文 = `compose_body(facts 块, Some(叙述))`；reflex（兜底）= `compose_body(facts 块, None)`，只有数字块、没有叙述。
-  结论的**准确说法**：正文里「本周数字」块的每个数字逐字来自草稿；叙述块里的数值只能以占位符形式出现、由程序代入同一批值；叙述块不含阿拉伯/全角数字与「汉字数词 + 量词」。**不**声称模型无法表达数量（「近半」「翻倍」「seven」这类仍能漏过，§11.9 R1）。
-- **比较并交换**：提议的 `base_body_sha256` = 触发时读到的正文摘要；正文与新正文相同 → 不产提议（`NoChange`，run 结果记 `unchanged`）。
-- **数字的时效**：数字冻结在提议生成时；accept 前又有 block 完成，提议里的数字就旧了。人重新触发一次即可；v1 不做 accept 时重算（那等于让 apply 调模型）。§11.9 R4。
-- **非空草稿**：🟡 占位 = 允许（人写过的草稿也能收到 AI 改写提议，CAS 保证不会覆盖提议之后的编辑）。Q7。
+- **可改写条件（M6，🟡 Q7 拍板前占位）**：当前正文为空，**或**只由程序生成的数字块构成（scratch `is_program_only`：首个非空行是 `## … 本周数字`，其余非空行都是 `- 标签：值`）。否则不产提议，run 结果记 `skipped: human_text`——`DraftReviewBody` 是整体替换，人写过的字不应出现在「整体改写」提议里。
+- **数字来源**：`AiReadModel` 调 T4.3.1 的周草稿函数得到 `WeeklyDraft`（形状见 §11.1 第 13 条）；另取该周完成任务的标题（至多 50 条 ⚖️），只作为可引用的素材。
+- **「数字只来自草稿」的机制**（scratch `summarize.rs` 已 check + test）：
+  1. `facts(draft, title_of)` 把草稿每个数值变成 `Fact{key: "fN", label, value}`；`render_facts` 渲染「本周数字」块——**完全由程序生成**。
+  2. 模型只输出 `{"narrative": string ≤ 2000}`（`response_format` 同上，`max_tokens: 1024` ⚖️）。提示词给它 `[{key, label, value}]` 与 `[{key: "tN", title}]`，要求：不写任何数字；要引用一个数值就写 `{{fN}}`，要引用任务就写 `{{tN}}`。
+  3. `fill_narrative` 复核并渲染，以下任一即拒（`bad_output`，降级）：
+     - 占位之外的字面文本里有任何 `char::is_numeric()` 为真的字符（阿拉伯、全角、其它 Unicode 数字）；
+     - 汉字数词串（`〇零一二两三…百千万`）**紧跟 `MEASURE` 表里的量词**（小时、分钟、个、件、次、项、天、周、%、倍、成）；
+     - `{{fN}}` 之后紧跟 `MEASURE` 量词（「完成任务{{f3}}小时」——给一个数值单元换单位）；
+     - 未知占位、未闭合；叙述里出现「本周数字」字样（仿造数字块）。
+     通过后：`{{fN}}` **整体**渲染为 `〔标签：数值〕`——数值永远带着它自己的标签出现，模型只决定它放在哪句话里；`{{tN}}` 渲染为 `「任务标题」`；然后逐行剥掉行首 Markdown 块语法（井号、减号、星号、加号、大于号、竖线、反引号、波浪号、等号、下划线），空行分段——叙述只能是纯段落，造不出标题、列表、表格、引用、代码块。
+  4. 正文 = `compose_body(数字块, Some(叙述))`；reflex（兜底）= `compose_body(数字块, None)`。
+  结论的**准确说法**：正文里每个数字串都出现在程序渲染的数字块里，或出现在程序代入的任务标题里（J17 的判法）；叙述里的每个数值都以 `〔标签：数值〕` 单元出现，标签与数值来自同一条 `Fact`；叙述不含字面数字，也不含「汉字数词 + `MEASURE` 表里的量词」。**不**声称：模型写在单元前后的文字与单元一致（「编码投入达到〔领域「Business」投入：2 小时 0 分钟〕」能通过——矛盾是可见的，但没被阻止，R1）；也不声称模型无法表达数量（「近半」「翻倍」「seven」、不在表里的量词仍能漏过，R1）。
+- **比较并交换**：`base_body_sha256` = 触发时读到的正文摘要；新旧正文相同 → 不产提议（run 结果 `nothing`）。
+- **数字的时效**：数字冻结在提议生成时；人重新触发即可（R4）。
 
 #### 11.4.3 propose（T5.4.1）
 
 - **输入**：`week_id` = 目标周 W，必须 open（planning/active），否则 409。
-- **读**：W 的非终态任务；**上一周** P = `iso_week` 小于 W 的最近一周，且仍 open（reviewing/closed 的周里的任务不许动，`require_task_week_open`）——P 不存在或已关就没有顺延建议；Rhythm 当前配额（非 retired 的最新一条）；W 里没有任何任务、但配额 pct > 0 的 Direction = 「缺口 Direction」。
+- **读**：W 的非终态任务；**上一周** P = `iso_week` 小于 W 的最近一周且仍 open（reviewing/closed 周里的任务不许动）——P 不存在或已关就没有顺延建议；Rhythm 当前配额（非 retired 的最新一条）；W 里没有任何任务、但配额 pct > 0 的 Direction = 「缺口 Direction」。
 - **只用三个既有 Op**，分成**至多三条独立提议**（人可以分开批）：
   1. `propose.carry`：`[CarryOverTask(t, W) …]`，t ∈ P 中 planned/in_progress 的任务（`backlog → carried_over` 不合法，`transitions.rs:121-133`）。
   2. `propose.reorder`：`[ReorderTasks{week_id: W, order}]`，`order` 是 W 全部非终态任务的一个**排列**（程序保证：模型漏掉的按原顺序补在后面，重复即 `bad_output`）；与当前 `sort_key` 顺序相同 → 不产。
   3. `propose.create`：`[CreateTasks{week_id: W, tasks: [{title, direction_id}]}]`，至多 3 条 ⚖️，`direction_id` 只能是缺口 Direction；**只有模型步产出**（reflex 不编标题）。
 - **reflex**：carry = P 中全部 planned/in_progress；reorder = in_progress → planned → backlog，同层按所属 Direction 的配额 pct 降序、再按 `created_at`；create = 无。
-- **模型**：候选任务与缺口 Direction 同样用不透明键（`p1…` / `w1…` / `g1…`）；schema `{carry: [enum p*], order: [enum w*], new_tasks: [{title: string 1..120, direction: enum g*}] ≤ 3, reason: string ≤ 200}`，`max_tokens: 512` ⚖️；复核：键必须在集合内、`order` 无重复、标题去控制字符后非空。
-- **半应用不可能**：每条提议 accept 是一个事务；`ReorderTasks` 引用不在该周的任务 → apply 内 `NotFound` 整体回滚（§11.1 第 4 条）；`CarryOverTask` 与 `ReorderTasks` 不在同一条提议里，所以「顺延产生的新任务 id 无法在同批排序」不成问题。**已知的小瑕疵**：先批 reorder、再批 carry，顺延进来的任务 `sort_key = 0`（`repo.rs` `CarryOverTask` 分支），会与排第一的任务并列（§11.9 R9）。
+- **模型**：候选任务与缺口 Direction 用不透明键（`p1…` / `w1…` / `g1…`）；schema `{carry: [enum p*], order: [enum w*], new_tasks: [{title: string 1..120, direction: enum g*}] ≤ 3, reason: string ≤ 200}`，`max_tokens: 512` ⚖️；复核：键必须在集合内、`order` 无重复、标题去控制字符后非空。
+- **非法建议在提交时被拒、不半应用**：每条提议先过 §11.4 公共的提交前校验（含 `apply_op` 试跑），所以「引用不存在/不在该周的任务的 `ReorderTasks`」「重复顺延」在 `submit` 就被拒、不写任何行（J21，确定断言）；accept 仍是单事务。
+- **事件 payload（M2，§2 #25）**：T5.4.1 同时给 `CreateTasks` 与 `CarryOverTask` 的 `task.created` payload **只加字段** `direction_id`（`CarryOverTask` 取源任务的归属），让 §11.2.1 的重放规则第 2 条对 propose 产出的任务成立。
+- **已知小瑕疵**：先批 reorder、再批 carry，顺延进来的任务 `sort_key = 0` 与排第一的并列（R9）。
 
 ### 11.5 结构约束：AI 模块只能提议（T5.1.1）
 
@@ -758,42 +820,60 @@ pub trait ModelPort: Send + Sync {
     fn complete(&self, req: ModelRequest) -> impl Future<Output = Result<ModelReply, ModelFailure>> + Send;
 }
 /// ai/ 的全部写能力：只有这两个方法。由 Sin90Store 在 store/ai_port.rs 实现。
+pub struct ProposalDraft { pub id: String, pub ops: Vec<Sin90Op>, pub rationale: Option<String> } // 没有 source / status
 pub trait AiSink: Send + Sync {
-    /// 一个 BEGIN IMMEDIATE：allowed_ops(cap) → build_snapshot → validate → INSERT 'pending'。永不 apply。
-    fn submit(&self, cap: Capability, p: Sin90Proposal) -> impl Future<Output = Result<(), SinkError>> + Send;
+    /// 一个 BEGIN IMMEDIATE：allowed_ops → validate → SAVEPOINT 试跑 apply_op → ROLLBACK TO
+    /// → source = source_for(rec.engine, rec.served_tier) → INSERT 提议 + 事件行 + ok=1 调用行 → COMMIT
+    fn submit(&self, cap: Capability, draft: ProposalDraft, rec: AiCallRecord)
+        -> impl Future<Output = Result<(), SinkError>> + Send;
+    /// 只写非产出的尝试
     fn record_call(&self, rec: AiCallRecord) -> impl Future<Output = Result<(), SinkError>> + Send;
 }
-pub trait AiReadModel: Send + Sync {
+pub trait SettingsRead: Send + Sync {
     fn settings(&self) -> impl Future<Output = Result<AiSettings, ReadError>> + Send;
+}
+/// store 实现走独立的只读连接池（SqliteConnectOptions::read_only(true)）：写即报错
+pub trait AiReadModel: SettingsRead {
     fn inbox(&self, limit: u32) -> impl Future<Output = Result<Vec<Task>, ReadError>> + Send;
     fn direction_candidates(&self, limit: u32) -> impl Future<Output = Result<Vec<DirectionCandidate>, ReadError>> + Send;
     fn title_history(&self, normalized: &str) -> impl Future<Output = Result<Vec<DirectionId>, ReadError>> + Send;
-    fn pending_targets(&self, cap: Capability) -> impl Future<Output = Result<Vec<String>, ReadError>> + Send;
     fn review(&self, id: &str) -> impl Future<Output = Result<Option<Review>, ReadError>> + Send;
     fn week_tasks(&self, week_id: &WeekId) -> impl Future<Output = Result<Vec<Task>, ReadError>> + Send;
-    // T5.3.1 / T5.4.1 各自再加：weekly_draft(week)、done_titles(week)、previous_open_week(week)、rhythm_alloc()
+    // T5.2.1/T5.3.1/T5.4.1 各自再加：still_valid_pending(cap)、weekly_draft(week)、done_titles(week)、
+    // previous_open_week(week)、rhythm_alloc()
 }
 ```
 
-**依赖方向**：`ai/` 只 `use crate::core::*` 与 `crate::ai::*`；`store/ai_port.rs` 实现 `AiReadModel + AiSink`（store → `ai::ports`，后者只含 trait 与值类型）；`adapter_agent24/clients/model.rs` 实现 `ModelPort`；`http/` 组装三者、起后台 run。`ai/` 里的函数全部对三个 trait 泛型，**不出现具体类型**。
+`still_valid_pending` 需要「重跑提交前校验」，而试跑要写（再回滚）——只读池做不到。所以它不在 `AiReadModel` 上，而是 `AiSink` 的 store 实现内部在 `submit` 之前、由调用方经一个只返回布尔的方法 `AiSink::precheck(cap, &ProposalDraft) -> bool` 完成（同 `submit` 的第 1–3 步，最后 `ROLLBACK` 整个事务）。它不改变任何行，J8 覆盖。
 
-**三层判据，从弱到强**：
-1. **文本结构测试** `ai_boundary`（J7）：遍历 `src/ai/**/*.rs`，对每个文件 `forbidden_refs(src)` 必须为空。检查器先剥 `//` 注释、再去掉**全部空白**后找子串：`crate::store`、`::store::`、`super::store`、`Sin90Store`、`sqlx`、`crate::http`、`super::http`、`adapter_agent24`、`#[path`、`include!`（scratch `boundary.rs`，正对照覆盖 `crate :: store`、`super::super::store::Sin90Store`、`#[path = …]`、`include!(…)` 等写法）。这是 T5.1.1 要的「编译期/grep 测试」；它挡的是**顺手 import**，挡不住刻意绕路（R2）。
-2. **类型层**：`ai/` 的一切写都只能经 `AiSink` 的两个方法；`AiSink` 的 store 实现只写 `sin90_proposals`（`pending`）、它自带的 `proposal.submitted` 事件、`sin90_ai_calls`。
-3. **行为级表快照**（J8，最强）：在夹具库上用桩模型把三个能力各跑一遍，比较运行前后**除** `sin90_proposals`、`sin90_ai_calls`、`sin90_events WHERE entity = 'proposal'` 之外所有表的全部行——必须逐字节相同。正对照：随后用人类 key accept 其中一条 → 快照必变。这条不关心代码怎么写，只关心库里发生了什么，文本检查器漏掉的绕路它也会抓到。
+**依赖方向**：`ai/` 只 `use crate::core::*` 与 `crate::ai::*`；`store/ai_port.rs` 实现 `AiReadModel + AiSink`（store → `ai::ports`，后者只含 trait 与值类型）；`adapter_agent24/clients/model.rs` 实现 `ModelPort`；`http/` 组装三者、起后台 run、补发镜像事件。`ai/` 里的函数全部对三个 trait 泛型，**不出现具体类型**。
 
-**为什么不拆 crate**：把 `core` 拆成独立 crate、`ai` 另成 crate 只依赖 `core`，才是真正的编译期保证；但今天 `core/store/http` 是一个 crate，拆分是一次与 M5 无关的大改（TS.1.1 换 SDK 时一起评估更合适）。v1 以「文本检查 + 行为快照」组合代替，并如实写成「结构测试」而不是「编译期保证」。
+**三层判据**：
+1. **syn 白名单结构测试** `ai_boundary`（J7，H2）：Sin90 加 dev-dependency `syn = { version = "2", features = ["full", "visit"] }`。测试遍历 `src/ai/**/*.rs`，按文件位置算模块深度（`ai/mod.rs` = 1，`ai/x.rs` = 2，内联 `mod` 再 +1），对每个文件 `check_source(src, depth)` 必须为 `Ok`（scratch `boundary.rs`）。规则：
+   - 展开全部 use 树（分组、重命名、glob），访问所有表达式/类型/模式路径、宏路径，以及宏 token 流里的 `a::b` 链（`format!("{:?}", crate::store::X)` 也会被看见）；注释与字符串字面量由 syn 天然排除。
+   - 路径根是 `crate`/`sin90` → 第二段 ∈ {`core`, `ai`}；根是 `super` → 数出 `super` 个数 k，k 到达 crate 根时下一段 ∈ {`core`, `ai`}，超过 crate 根即拒；`self`/`Self` 放行。
+   - use 路径的根只能是上面几种或外部 crate 白名单（`std core alloc serde serde_json thiserror tracing sha2 hex`）；带前导 `::` 的只能是外部 crate 白名单。
+   - 非 use 的多段路径，根还可以是本文件的局部名（use 绑定的名字、本文件定义的条目、泛型参数）或 prelude/原始类型（`String::new`、`u32::MAX`）——这些名字本身已经过 use 检查或是本地定义。
+   - `extern crate`、`#[path]`、`include!` 一律拒。
+   - 正对照 18 条（scratch `positive_controls_each_trip`），含评审的两种绕法：`use crate::{core::Sin90Op, http::Sin90State};` + `s.store.update_review_body(..)`；`let u = "http://x"; use crate::store::Sin90Store;`。
+   白名单信任一个前提：`core` 与 `ai` 不再导出 store/http 的东西（`core` 零 I/O 依赖是 §5.2 的既有层规则）。
+2. **类型与连接层**：`ai/` 的一切写都只能经 `AiSink` 的方法；`AiReadModel` 的实现拿的是只读池，哪怕 store 侧有人在读路径里顺手调了 `attention_apply_new_events` 也会直接报错。
+3. **行为级表快照**（J8，M8）：在夹具库上用桩模型把三个能力各跑一遍，比较运行前后除以下**写死的三项**之外所有表的全部行，必须逐字节相同：`sin90_proposals`、`sin90_ai_calls`、`sin90_events WHERE entity = 'proposal'`。`sin90_attention_daily` / `sin90_attention_watermark` **不排除**：它们是派生投影，AI 读路径若去折叠它（读时写），J8 就应当变红——那是真回归。正对照：随后用人类 key accept 其中一条 → 快照必变。
+
+**为什么不拆 crate**：真正的编译期保证要把 `core` 与 `ai` 拆成独立 crate；今天 `core/store/http` 是一个 crate，拆分与 M5 无关，留给 TS.1.1 评估。v1 以「syn 白名单 + 只读池 + 行为快照」组合代替，并如实称为「结构测试」。
 
 ### 11.6 存储改动（§2 #20/#21，§4.1 已登记）
 
 一个迁移文件（编号取当时 max+1，spec.md「不预分配」）：
 
 ```sql
-ALTER TABLE sin90_ai_calls ADD COLUMN run_id      TEXT;
-ALTER TABLE sin90_ai_calls ADD COLUMN proposal_id TEXT;   -- 不加 FK：调用记录先于提议写入，且提议提交可能失败
-ALTER TABLE sin90_ai_calls ADD COLUMN served_tier TEXT;   -- local|remote|NULL，无 CHECK（与 outbox.status 同一约定：代码约束）
-ALTER TABLE sin90_ai_calls ADD COLUMN model_id    TEXT;
-ALTER TABLE sin90_ai_calls ADD COLUMN error_kind  TEXT;
+ALTER TABLE sin90_ai_calls ADD COLUMN run_id            TEXT;
+ALTER TABLE sin90_ai_calls ADD COLUMN proposal_id       TEXT;     -- 不加 FK：失败行没有提议
+ALTER TABLE sin90_ai_calls ADD COLUMN served_tier       TEXT;     -- local|remote|NULL，代码约束
+ALTER TABLE sin90_ai_calls ADD COLUMN model_id          TEXT;
+ALTER TABLE sin90_ai_calls ADD COLUMN prompt_tokens     INTEGER;
+ALTER TABLE sin90_ai_calls ADD COLUMN completion_tokens INTEGER;
+ALTER TABLE sin90_ai_calls ADD COLUMN error_kind        TEXT;
 CREATE INDEX idx_sin90_ai_calls_run      ON sin90_ai_calls(run_id);
 CREATE INDEX idx_sin90_ai_calls_proposal ON sin90_ai_calls(proposal_id);
 CREATE TABLE sin90_settings (
@@ -803,7 +883,7 @@ CREATE TABLE sin90_settings (
 );
 ```
 
-**写入顺序**：产出提议的那一步先 `submit`、成功后再 `record_call(ok=1, proposal_id)`；`submit` 失败则 `record_call(ok=0, error_kind="rejected_by_validate")` 并继续下一条目（不降级——模型没错，是状态变了）。事件：`setting.changed`（`entity = setting`、`entity_id = <key>`）是本补丁唯一新增的非 Op 事件。
+事件：`setting.changed`（`entity = setting`、`entity_id = <key>`）是本补丁唯一新增的非 Op 事件；`task.direction_assigned` 由 Op 产生（§11.2.1）；`CreateTasks`/`CarryOverTask` 的 `task.created` payload 加字段 `direction_id`（§2 #25，不改 schema）。
 
 ### 11.7 判据（每条带正对照；`cargo test <过滤>` 先 `-- --list` 断言匹配数 > 0；新回归测试一律变异验证）
 
@@ -811,17 +891,20 @@ CREATE TABLE sin90_settings (
 
 | # | 测试（过滤名） | 断言 | 正对照 / 变异 |
 |---|---|---|---|
-| J1 | `ai_ladder_local_unavailable_degrades_to_reflex` | classify 一条、R1 无结论、local 桩回 `unavailable/no_provider`、R2 有结论 → 恰好 3 行调用记录：`reflex ok=0 no_match`、`local ok=0 unavailable.no_provider`、`reflex ok=1 fallback_from=local proposal_id=<p>`；提议 `source = rule` | 桩改回成功 → 2 行、`source = local_brain`、没有 `fallback_from` |
-| J2 | `ai_ladder_connection_lost_aborts` | `ConnectionLost` → run `aborted`、0 条提议、之后**没有** reflex 行 | 同一位置换 `Timeout` → 降级并产出 reflex 提议 |
-| J3 | `ai_ladder_failure_table` | 对 `ModelFailure` 每个变体断言 `action()` 与 §11.3.4 一致；测试里用**穷尽 `match`**（新增变体不改测试就编译失败） | 变异：把 `ConnectionLost` 改成 `Degrade` → 红 |
+| J1 | `ai_ladder_local_unavailable_degrades_to_reflex` | classify 一条、R1 无结论、local 桩回 `unavailable/no_provider`、R2 有结论 → 恰好 3 行：`reflex ok=0 undecided`、`local ok=0 unavailable.no_provider`、`reflex ok=1 fallback_from=local proposal_id=<p>`；提议 `source = rule` | 桩改回成功 → 2 行、`source = local_brain`、无 `fallback_from` |
+| J2 | `ai_ladder_abort_` | `ConnectionLost` / `GenerationEnding` / `Cancelled` 各一：run `aborted`、0 条提议、之后没有 reflex 行、后续条目不再执行 | 同一位置换 `Timeout` → 降级并产出 reflex 提议 |
+| J2b | `ai_ladder_defer_` | `Busy` / `RateLimited` / `NotReady` 各一：当前与剩余条目 `deferred`、**没有** R2 行、模型桩总共只被调用 1 次 | 换 `Unavailable/request_rejected` → 本条降级到 R2，下一条目照常调用模型 |
+| J2c | `ai_ladder_budget_and_circuit` | (a) 预算 = 1 → 第二条目 `deferred`；(b) 第一条目 `no_provider` → 第二条目不再调用 local（桩计数 1），直接 R2 且 `fallback_from=local` | (b) 换 `timeout`（不熔断）→ 第二条目仍调用 local |
+| J3 | `ai_ladder_failure_table` | 对 `ModelFailure` 每个变体断言 `action()`/`opens_circuit()` 与 §11.3.4 一致；穷尽 `match`（新增变体不改测试就编译失败） | 变异：`GenerationEnding` 改成 `Degrade` → 红 |
 | J4 | `ai_ladder_executive_gate` | `plan()` 在 `{LocalOnly, RemoteAllowed} × {开, 关} × {port 有, 无}` 八格上，`Model(Executive)` 只在 (RemoteAllowed, 开, 有) 出现 | 变异：删掉 `settings.executive_enabled` 条件 → 红 |
-| J5 | `ai_ladder_served_tier_decides_source` | 请求 executive、桩回 `tier: local` → `source = local_brain`、`served_tier = local` | 桩回 `tier: remote`（开关开）→ `source = executive` |
-| J6 | `ai_ladder_privacy_tripwire` | 开关关、local 请求、桩回 `tier: remote` → 该步 `ok=0 privacy_tripwire`、结果被丢弃、降级 | 开关开 → 同一回复被采用 |
-| J7 | `ai_boundary` | `src/ai/**/*.rs` 每个文件 `forbidden_refs` 为空；检查器自身的正对照表全部触发 | 变异：在 `src/ai/mod.rs` 加 `use crate::store::Sin90Store;` → 红（PR body 记录） |
-| J8 | `ai_boundary_tables_unchanged` | §11.5 第 3 层：三个能力各跑一遍，非提议/调用/提议事件的表逐字节不变 | 随后人类 accept 一条 → 快照变化被检出 |
-| J9 | `ai_calls_link_integrity` | 一次 run 的所有行 `run_id` 相同；每条 AI 提议恰好一行 `ok=1 AND proposal_id = 它`；`ok=0` 的行 `error_kind` 非空 | 变异：`record_call` 不填 `proposal_id` → 红 |
-| J10 | `model_client_` | (a) `complete` 走 `call_with_timeout(125s)`（桩 transport 记录超时参数）；(b) `-32000 {kind: unavailable, retryable: false, cause: backend_config}` → `ClientError::Unavailable{false, BackendConfig}`；(c) cause 不在闭集 → `Other`；(d) `cancelled` → `Cancelled`；(e) `every_spec_error_kind_maps…` 计数 18 | (b) 的正对照：`retryable: true, cause: no_provider` 映射到另一值且 `is_retryable()` 为真 |
-| J10b | `settings_ai_` | `PUT /settings/ai` 自动化 key → 403 且无事件；人类 key → 200、`setting.changed` 恰好 1 条；未知字段 → 400 | 缺行时 `GET` 返回 `false`（缺省关的正对照：删掉缺省分支 → 红） |
+| J5 | `ai_ladder_served_tier_decides_source` | 请求 executive、桩回 `tier: local` → store 推导 `source = local_brain`、`served_tier = local` | 桩回 `tier: remote`（开关开）→ `source = executive` |
+| J6 | `ai_ladder_privacy_tripwire` | 计划时开关开、回复前用户关掉、桩回 `tier: remote` → 该步 `ok=0 privacy_tripwire`、结果丢弃、降级 | 开关保持开 → 同一回复被采用 |
+| J7 | `ai_boundary` | `src/ai/**/*.rs` 每个文件 `check_source(src, depth)` 为 `Ok`；检查器自身的 18 条正对照全部触发、干净样例通过 | 变异：在 `src/ai/mod.rs` 加 `use crate::{core::Sin90Op, http::Sin90State};` → 红（PR body 记录） |
+| J8 | `ai_boundary_tables_unchanged` | §11.5 第 3 层：三个能力各跑一遍，排除写死的三项后逐字节不变（`sin90_attention_*` 在比较范围内） | 随后人类 accept 一条 → 快照变化被检出；变异：在 `AiReadModel::week_tasks` 实现里调 `attention_apply_new_events` → 只读池报错 / J8 红 |
+| J9 | `ai_calls_link_integrity` | 一次 run 的所有行 `run_id` 相同；每条 AI 提议恰好一行 `ok=1 AND proposal_id = 它`；`ok=0` 的行 `error_kind` 非空 | 注入 `submit` 在插调用行后失败 → 提议行也不存在（同事务） |
+| J10 | `model_client_` | (a) `complete` 走 `call_with_timeout(125s)`、不带 `request_id`；(b) `-32000 {kind: unavailable, retryable: false, cause: backend_config}` → `ClientError::Unavailable{false, BackendConfig}`；(c) cause 不在闭集 → `Other`；(d) `cancelled` → `Cancelled`；(e) 计数 18；(f) `usage` 映射到 `ModelReply` | (b) 正对照：`retryable: true, cause: no_provider` → 另一值且 `is_retryable()` 为真 |
+| J10b | `settings_ai_` | `PUT /settings/ai` 自动化 key → 403 且无事件；人类 key → 200、`setting.changed` 恰好 1 条；未知字段 → 400 | 缺行时 `GET` 返回 `false`（删掉缺省分支 → 红） |
+| J10c | `manifest_official_is_local_only` | 解析正式 `domain-os.yml`：`kernel_capabilities` 含 `models`、`requires_models == []`、`model_access` 缺省或 `local_only`；不开 feature 编译时 `MODEL_ACCESS == LocalOnly` | 正式 yml 写入 `model_access: remote_allowed` → 红（硬约束的钉子） |
 
 **T5.2.1 classify**
 
@@ -830,125 +913,165 @@ CREATE TABLE sin90_settings (
 | J11 | `classify_stub_proposes_and_data_unchanged` | inbox 一条 + 两个 Direction，桩选 `d1` → 恰好 1 条 `pending` 提议，`ops == [AssignTaskDirection(t, D1)]`，`source = local_brain`；任务 `direction_id` 仍为 NULL；人类 accept → `/today` inbox 不再含 t，`task.direction_assigned` 恰好 1 条、payload 含 `area_id` | 自动化 key accept → 403，任务仍在 inbox |
 | J12 | `classify_rejects_invented_keys` | 桩回 `"d9"` / 一个真实 ULID / 多余字段 → 该步 `bad_output`，降级 | 桩回 `"d2"` → 采用 |
 | J13 | `classify_reflex_history_short_circuits` | 已有同标准化标题的已归类任务 → 提议 `source = rule`，模型桩**被调用即 panic** | 标题改一个字 → 模型被调用 |
-| J14 | `classify_dedup_only_valid_pending` | 第二次 run 跳过有有效挂起提议的条目 | 人经另一条提议先把它归类后（挂起提议过期）→ 不再被视为挂起；inbox 新条目照常处理 |
-| J15 | `assign_task_direction_validate_` / `_apply_` | §11.2.1 A1–A5 各一正一反（scratch `ctx::tests` 为原型）；批内 `[Assign(t,d1), Assign(t,d2)]` 拒；apply 层：提议挂起期间任务被归类 → accept 422、无事件、提议仍 `pending` | 未被抢先归类 → 200 |
-| J16 | `classify_remote_down_local_up` | `RemoteAllowed` + 开关开，桩：`complex` → `unavailable/no_provider`，`simple` → 成功 `tier: local` → 提议 `source = local_brain`；调用行 `executive ok=0`、`local ok=1 fallback_from=executive` | 本地桩也失败 → `source = rule` 或无提议，且 `local ok=0` 行存在 |
+| J14 | `classify_dedup_only_valid_pending` | 第二次 run 跳过有有效挂起提议的条目 | (a) 人经另一条提议先把它归类；(b) 把目标 Direction 转成 abandoned——两种情况下旧挂起提议都不再挡，条目被重新处理 |
+| J14b | `classify_task_ids_over_limit` | `task_ids` 21 个 → 400，不产生 run | 20 个 → 202 |
+| J15 | `assign_task_direction_validate_` / `_apply_` | §11.2.1 A1–A5 各一正一反（scratch `ctx::tests`）；批内 `[Assign(t,d1), Assign(t,d2)]` 拒；apply 层：挂起期间任务被归类 → accept 422、无事件、提议仍 `pending` | 未被抢先 → 200 |
+| J16 | `classify_remote_down_local_up` | `RemoteAllowed` + 开关开，桩：`complex` → `unavailable/no_provider`，`simple` → 成功 `tier: local` → `source = local_brain`；调用行 `executive ok=0`、`local ok=1 fallback_from=executive` | 本地桩也失败 → `source = rule` 或无提议，且 `local ok=0` 行存在 |
 
 **T5.3.1 summarize**
 
 | # | 测试 | 断言 | 正对照 / 变异 |
 |---|---|---|---|
-| J17 | `summarize_numbers_come_from_draft` | 固定事件夹具 → 周草稿；桩叙述用占位符 → 提议正文**包含** `render_facts(草稿)` 原文；正文里每个数字串都出现在 facts 块的值里 | 桩叙述写 `编码 99 小时` → 模型步 `bad_output`，提议来自 reflex（`source = rule`），正文不含 `99`；变异：删掉 `check_literal` → 红 |
-| J18 | `draft_review_body_validate_` / `_cas_` | D1–D7 各一正一反；提议挂起期间人类 `PATCH` 正文 → accept 422 `StaleBase`、正文仍是人写的 | 无人改 → accept 200、正文 == 提议正文、`review.updated` 恰好 1 条、payload 形状与人类路径相同 |
-| J19 | `summarize_rejects_non_draft_or_non_weekly` | finalized → 409；daily → 400；定稿后再 accept 旧提议 → 422 `ReviewNotDraft` | draft + weekly → 202 |
+| J17 | `summarize_numbers_come_from_draft` | 固定事件夹具 → 周草稿；桩叙述用 `{{fN}}`/`{{tN}}` → 提议正文包含 `render_facts(草稿)` 原文；正文的**每个数字串都出现在 `render_facts` 输出或代入的任务标题里**（L2） | 负对照：① `编码 99 小时` → 模型步 `bad_output`、提议来自 reflex（`source = rule`）、正文不含 `99`；② **标签错位**「编码投入达到{{f2}}」→ 不拒（前后文矛盾不在机制范围内，R1），断言 f2 的数值在正文里只出现在 `〔f2 的标签：值〕` 单元内、从不脱离自己的标签；③ **仿造数字块**「## 本周数字（修正）\n- …{{f2}}」→ 拒；④「完成任务{{f3}}小时」→ 拒；⑤ 行首 `##`/`-`/`>`/`|` 的叙述 → 渲染后没有任何行以块语法开头。变异：删掉 `check_literal` / 行首剥离 → 各自对应断言变红 |
+| J18 | `draft_review_body_validate_` / `_cas_` | D1–D7 各一正一反；挂起期间人类 `PATCH` 正文 → accept 422 `StaleBase`、正文仍是人写的 | 无人改 → accept 200、正文 == 提议正文、`review.updated` 恰好 1 条、payload 形状与人类路径相同 |
+| J19 | `summarize_preconditions` | finalized → 409；daily → 400；正文含人写文字 → 不产提议、run 结果 `skipped: human_text`；定稿后再 accept 旧提议 → 422 `ReviewNotDraft` | 正文为空或只有数字块 → 产出提议 |
 
 **T5.4.1 propose**
 
 | # | 测试 | 断言 | 正对照 / 变异 |
 |---|---|---|---|
-| J20 | `propose_proposals_validate_and_apply` | P(active) + W(planning) 夹具 → 至多 3 条提议，全部经 `AiSink::submit` 的提交前校验；逐条人类 accept 成功 | 把 P 转成 reviewing 后再触发 → 无 carry 提议 |
-| J21 | `propose_invalid_is_rejected_not_half_applied` | 手工构造 `[CarryOverTask(真实任务, W), ReorderTasks(W, [不存在的任务])]` → `AiSink::submit` 拒（validate 放过 reorder 时 accept 拒），库逐字节不变（无 carried_over、无新任务） | 去掉不存在的任务 → 通过 |
-| J22 | `ai_allowed_ops_per_capability` | 以 propose 身份提交含 `AssignTaskDirection` 的提议 → `SinkError::Invalid`，无行；三个能力的允许集各一正一反 | 变异：`allowed_ops` 返回全集 → 红 |
+| J20 | `propose_proposals_submit_and_apply` | P(active) + W(planning) 夹具 → 至多 3 条提议，全部通过提交前校验；逐条人类 accept 成功；`CreateTasks` 与 `CarryOverTask` 产生的 `task.created` payload 含 `direction_id` | 把 P 转成 reviewing 后再触发 → 无 carry 提议 |
+| J21 | `propose_invalid_rejected_at_submit` | 构造 `[ReorderTasks(W, [W 的真实任务, 不存在的任务])]` → `AiSink::submit` 返回 `SinkError::Invalid`；**库逐字节不变**（无提议行、无调用 `ok=1` 行、无事件、`sort_key` 未变）。同样断言：顺延一个已被顺延过的任务（撞 `idx_sin90_task_carried`）→ submit 拒 | 去掉不存在的任务 → submit 成功、仅新增提议行 + 事件行 + 调用行、`sort_key` 仍未变（试跑已回滚） |
+| J22 | `ai_allowed_ops_per_capability` | 以 propose 身份提交含 `AssignTaskDirection` 的草稿 → `SinkError::Invalid`，无行；三个能力的允许集各一正一反 | 变异：`allowed_ops` 返回全集 → 红 |
 
 **T5.5.1 真实挂载**
 
 | # | 判据 | 期望 | 正对照 |
 |---|---|---|---|
-| J23 | 断网 classify | 包 A（正式 manifest，`local_only`）：`OMLX_URL` 指本地 Python 桩、无远端 → classify 产出 `source = local_brain` 提议。包 B（测试 manifest，`remote_allowed` + 开关开）：`OLLAMA_URL` 指一个**被内核标成 Remote 且连不上**的地址（ME4-S2 §2.3：`http://[::ffff:127.0.0.1]:<关闭的端口>`）、`OMLX_URL` 指本地桩 → 仍产出 `source = local_brain` 提议，调用行 `served_tier = local` | 停掉本地桩 → 无 `local_brain` 提议，调用行出现 `unavailable.no_provider` |
-| J24 | 来源一致 | `SELECT count(*) FROM sin90_proposals p JOIN sin90_ai_calls c ON c.proposal_id = p.id AND c.ok = 1 WHERE p.source NOT IN ('local_brain','executive','rule') OR p.source != CASE WHEN c.engine = 'reflex' THEN 'rule' WHEN c.served_tier = 'remote' THEN 'executive' ELSE 'local_brain' END` = 0，且 AI run 期间产生的每条提议都能 join 到恰好一行 | 在库的副本里把一行 `source` 改掉 → 同一查询 = 1 |
-| J25 | AI 期间无直写 | 挂载模式跑 J8 的表快照（经 daemon 真实端口触发三个能力） | 同上一条的 accept 正对照。注：tasks.md 原句「直写路由调用数 0」在进程内 AI 下**恒真**（AI 不经 HTTP），不构成判据，故以表快照代替 |
-| J26 | 真 oMLX 冒烟 | `#[ignore]` 手动：`~/.omlx/models` 下的模型，三个能力各一次，记录 `model_id`、延迟、是否 `bad_output` | —— |
-
-另加一条 manifest 钉子（T5.1.1）：`manifest_declares_models_local_only`——解析 `domain-os.yml`：`kernel_capabilities` 含 `models`、`requires_models == []`、`model_access` 缺省或 `local_only`；Q1 拍板改为 `remote_allowed` 时这条测试**必须**跟着改（让产品决定在代码里留痕）。
+| J23 | 断网 classify | **包 A**（正式构建，`local_only`）：`OMLX_URL` 指本地 Python 桩、无远端 → classify 产出 `source = local_brain` 提议。**包 B**（`--features remote-allowed-manifest` 构建，安装 `domain-os.remote-allowed.yml`，开关开）：`OLLAMA_URL` 指一个**被内核标成 Remote 且连不上**的地址（ME4-S2 §2.3：`http://[::ffff:127.0.0.1]:<关闭的端口>`）、`OMLX_URL` 指本地桩 → 仍产出 `source = local_brain` 提议；调用表里**存在 `engine='executive'` 的行**（证明 executive 路径真的被走到，不是空转），产出行 `served_tier = local` | 停掉本地桩 → 无 `local_brain` 提议，出现 `unavailable.no_provider` 行 |
+| J23b | 编译期常量与随包 manifest 一致 | 每个被安装的包：`bin/sin90 print-model-access` 的输出 == 解析已安装 `domain-os.yml` 的 `model_access`（缺省按 `local_only`） | 用包 B 的二进制配包 A 的 yml → 断言失败 |
+| J24 | 来源一致 | `SELECT count(*) FROM sin90_proposals p JOIN sin90_ai_calls c ON c.proposal_id = p.id AND c.ok = 1 WHERE p.source NOT IN ('local_brain','executive','rule') OR p.source != CASE WHEN c.engine = 'reflex' THEN 'rule' WHEN c.served_tier = 'remote' THEN 'executive' ELSE 'local_brain' END` = 0，且 AI run 期间产生的每条提议都能 join 到恰好一行 | 在库的副本里改掉一行 `source` → 同一查询 = 1 |
+| J25 | AI 期间无直写 | 挂载模式经 daemon 真实端口触发三个能力，跑 J8 的表快照 | accept 正对照。注：tasks.md 原句「直写路由调用数 0」在进程内 AI 下恒真，不构成判据，故以表快照代替 |
+| J26 | 真 oMLX 冒烟 | `#[ignore]` 手动：`~/.omlx/models` 下的模型，三个能力各一次，记录 `model_id`、延迟、`bad_output` 率、classify 各置信度档的命中情况（给 Q8 定阈值） | —— |
 
 ### 11.8 自审
 
-- **两个 Op 的范围是否过窄**：`AssignTaskDirection` 只收 inbox、`DraftReviewBody` 只收 draft——都是故意的；放宽都应该以「加 CAS 字段」的方式做，而不是去掉前置条件（§2 #17 复审触发条件）。
-- **`ValidationCtx` 又加宽了**：推翻了 §3.3 自己写的「唯一一次」。代价在本 crate 内；T5.2.1 一次加齐三个方法，避免 T5.3.1 再加一次。
-- **提交前校验只给 AI 路径**：两条提交路径行为不同，是一处不对称（F-2 / R7）。选它是因为改 HTTP 路径会改变已测行为，而 M5 的目标只需要 AI 路径。
-- **「executive」被如实降格**：它不是「用远端模型」，而是「允许内核按 complex 路由」；`source` 按实际服务层级定。§11.3.2 写明了 `remote_allowed` 的代价，没有把用户开关写成隐私保证。
-- **数字保证的措辞**：§11.4.2 末尾的「准确说法」只声称机制做得到的部分。
-- **判据是否会空转**：J3 用穷尽 `match`、J7 带检查器正对照、J8/J25 有 accept 正对照、J13 用「被调用即 panic」的桩、J24 在篡改副本上变红——每条关键判据都有让它响的办法。
-- **scratch 覆盖了什么**：两个 Op 的 wire 形状与校验矩阵（含批内叠加）、引擎梯的计划与降级/中止/绊线/来源映射、run future 的 `Send`、classify 的 schema 与复核、summarize 的 facts 渲染与叙述复核、边界检查器。**没覆盖**：store 侧 `build_snapshot`/`apply_op` 的 SQL、HTTP 路由、adapter 的 `ClientError` 扩展——它们要改真实 crate，属于实现。
+- **两个 Op 的范围是否过窄**：`AssignTaskDirection` 只收 inbox、`DraftReviewBody` 只收 draft——故意的；放宽以「加 CAS 字段」的方式做（§2 #17 复审触发条件）。
+- **`ValidationCtx` 又加宽了**：推翻了 §3.3「唯一一次」；T5.2.1 一次加齐。
+- **提交前校验只给 AI 路径**（F-2 / R7）：不对称，但改 HTTP 路径会改变已测行为。v2 的试跑让 AI 路径的提交前校验与 accept **同一份代码**，而不是另写一个「近似校验」。
+- **试跑的代价**：每次 `submit` 在写锁下多执行一遍 `apply_op`；三个能力的提议都是个位数 op，代价可忽略；它换来的是 J21 从「两可」变成确定。
+- **「executive」被如实降格，且正式包里不可达**：§11.3.2 写明原因（内核只按 manifest 管隐私），没有把用户开关写成隐私保证。
+- **数字保证的措辞**：§11.4.2 末尾只声称机制做得到的部分，并点名了「单元前后文可以矛盾」这一条没挡住。
+- **判据是否会空转**：J3 穷尽 `match`；J7 带 18 条正对照；J8/J25 有 accept 正对照且排除清单写死；J13 用「被调用即 panic」的桩；J21 断言库逐字节不变；J23 断言 `engine='executive'` 行存在；J23b 反配二进制与 yml；J24 在篡改副本上变红。
+- **scratch 覆盖了什么**：两个 Op 的 wire 形状与校验矩阵（含批内叠加）；梯的计划、三种动作、熔断、预算、绊线（含途中关开关）、来源映射、产出行随 `Outcome` 返回；run future 的 `Send`；classify 的 schema 与复核；summarize 的原子单元、行首剥离、各负对照与 J17 数字串判法；syn 白名单检查器；sqlx SAVEPOINT 试跑。**没覆盖**：真实 `build_snapshot`/`apply_op` 的 SQL、HTTP 路由、adapter 的 `ClientError` 扩展、只读连接池——要改真实 crate，属于实现。
 
 ### 11.9 残余风险（接受，写明谁来盯）
 
 | # | 风险 | 为什么接受 / 缓解 |
 |---|---|---|
-| R1 | 叙述里的数量表达漏网：`近半`、`翻倍`、`seven`、`dozen`、罕见数词写法 | 数字块由程序生成是硬保证；叙述复核是启发式。J17 的负对照证明主要路径会响；真 oMLX 冒烟（J26）里人工看一遍叙述 |
-| R2 | 文本结构测试可被刻意绕过（在非 `ai/` 模块写一个包装再让 `ai/` 通过 trait 以外的方式拿到） | J8/J25 行为快照兜底；真正的编译期保证要拆 crate，留给 TS.1.1 评估 |
-| R3 | `remote_allowed` 包里，`local` 调用在本地不可用时可被内核送到远端 | 正式包 `local_only`（🟡 Q1）；绊线只能事后发现。根治需要 Agent24 给 `_a24/model/complete` 加一个**只能收窄**的逐次隐私字段——作为向 Agent24 的 followup 建议提出，本文不替它决定 |
+| R1 | 叙述的**前后文**可与数值单元矛盾（「编码投入达到〔领域「Business」投入：…〕」）；不在 `MEASURE` 表里的数量表达（「近半」「翻倍」「seven」「十来个人」）能漏过 | 数值本身永远带正确标签出现，矛盾对读者可见；数字块由程序生成是硬保证。J26 冒烟里人工看叙述 |
+| R2 | syn 白名单假设 `core`/`ai` 不再导出 store/http 的东西；宏展开后的代码不可见（只扫 token 里的 `a::b` 链） | `core` 零 I/O 是 §5.2 既有层规则；J8/J25 行为快照兜底；编译期保证要拆 crate（TS.1.1 评估） |
+| R3 | 测试包 B 的 `local` 调用在本地不可用时会被内核送到远端 | 只存在于测试包；正式包不声明 `remote_allowed`（J10c 钉住）。Agent24 侧「逐次只能收窄」followup 由统筹登记 |
 | R4 | summarize 的数字在提议挂起期间变旧 | 人重新触发；v1 不在 accept 时重算 |
-| R5 | 没有拒绝路由，过期提议永久 `pending`、列表越来越长 | 去重只看「仍有效」的挂起提议，过期的不挡新 run；拒绝路由见 🟡 Q6 |
-| R6 | 调用记录写失败只 `warn!`，「可追溯」尽力而为 | 与业务写同库同盘，写失败通常意味着提议也写不进去；J9 在正常路径上钉住完整性 |
-| R7 | HTTP `POST /proposals` 仍不做提交前校验（F-2），两条路径不对称 | 已登记，不在 M5 范围；accept 时的校验两条路径一致 |
-| R8 | 人类 `PATCH /reviews/{id}` 没有正文上限，AI 路径有 64 KiB | 不同入口不同上限；人类路径的上限另议 |
-| R9 | reorder 与 carry 分开批时顺延任务 `sort_key = 0` 与首位并列 | 显示顺序上的小瑕疵，不影响正确性 |
-| R10 | 本地模型不遵守 `json_schema` 时 classify/summarize/propose 的模型步总是 `bad_output` | 降级到 reflex，不丢功能；J26 冒烟暴露实际遵守率 |
-| R11 | run 状态只在内存里，重启后 `GET /ai/runs/{id}` 只剩调用记录 | 调用记录与提议都持久；run 只是观察窗口 |
-| R12 | 候选截断（classify 40 个 Direction、summarize 50 个标题）可能漏掉正确答案 | ⚖️ 值；方向超过 40 个的用户再调 |
+| R5 | 没有拒绝路由，过期提议永久 `pending` | 去重只看「仍有效」的挂起提议；拒绝路由见 🟡 Q6 |
+| R6 | 非产出步的调用记录写失败只 `warn!` | 产出行与提议同事务（M3），「每条提议有来源记录」是保证；失败行的缺失只影响降级统计 |
+| R7 | HTTP `POST /proposals` 不做提交前校验（F-2） | 已登记，不在 M5 范围；accept 时两条路径一致 |
+| R8 | 人类 `PATCH /reviews/{id}` 没有正文上限，AI 路径有 64 KiB | 不同入口不同上限；人类路径另议 |
+| R9 | reorder 与 carry 分开批时顺延任务 `sort_key = 0` 与首位并列 | 显示顺序小瑕疵 |
+| R10 | 本地模型不遵守 `json_schema` 时模型步总是 `bad_output` | 降级到 reflex，不丢功能；J26 暴露遵守率 |
+| R11 | run 状态只在内存 | 调用记录与提议持久；run 只是观察窗口 |
+| R12 | 候选截断（40 个 Direction、50 个标题）可能漏掉正确答案 | ⚖️ 值 |
+| R13 | 延后（Busy/RateLimited）后本 run 剩余条目都不处理，用户要再点一次 | 有意：弱规则不替代模型；`GET /ai/runs/{id}` 列出 `deferred` 条目 |
 
 ### 11.10 交给实现的接口清单（按 T5.x）
 
 **T5.1.1 引擎梯 + 调用记录**
-- `src/ai/mod.rs`、`src/ai/ports.rs`：`Capability`、`Engine`、`ServedTier`、`ModelAccess`、`AiSettings`、`Complexity`、`ModelRequest`、`ModelReply`、`UnavailableCause`、`ModelFailure{…}::action()/kind_str()`、`LadderAction`、`ModelPort`、`AiSink{submit(cap, p), record_call}`、`AiReadModel`（首批方法）、`AiCallRecord`、`SinkError`、`ReadError`。
-- `src/ai/ladder.rs`：`plan()`、`run_item()`、`source_for()`、`tripwire()`、`Outcome`。
-- `src/store/ai_port.rs`：`impl AiReadModel for Sin90Store`、`impl AiSink for Sin90Store`（`submit` = `allowed_ops` + `build_snapshot` + `validate` + 插入，一个 `BEGIN IMMEDIATE`）。
+- `src/ai/mod.rs`、`src/ai/ports.rs`：`Capability`、`Engine`、`ServedTier`、`ModelAccess`、`AiSettings`、`Complexity`、`ModelRequest`、`ModelReply`（含 usage）、`UnavailableCause`、`ModelFailure{…}::action()/kind_str()/opens_circuit()`、`LadderAction{Degrade, Defer, Abort}`、`ModelPort`、`ProposalDraft`、`AiSink{submit(cap, draft, rec), record_call, precheck}`、`SettingsRead`、`AiReadModel`（首批方法）、`AiCallRecord`、`SinkError`、`ReadError`。
+- `src/ai/ladder.rs`：`plan()`、`RunState`、`MAX_MODEL_CALLS_PER_RUN`、`RUN_DEADLINE_SECS`、`run_item()`、`source_for()`、`tripwire()`、`Outcome{Produced{value, engine, rec}, Nothing, Deferred, Aborted}`。
+- `src/store/ai_port.rs`：`impl AiReadModel for AiReader`（独立只读池）、`impl AiSink for Sin90Store`（allowed_ops → validate → SAVEPOINT 试跑 `apply_op` → ROLLBACK TO → 推导 source → 插提议/事件/调用行，一个 `BEGIN IMMEDIATE`）。
 - 迁移（max+1）：§11.6。
-- `src/adapter_agent24/clients/model.rs`：`ModelClient::new(&Arc<KernelClients>) -> Option<Self>`（前缀 `_a24/model/`）、`complete(&ModelRequest) -> Result<ModelReply, ClientError>`（`call_with_timeout(125s)`，不带 `request_id`）、`impl ModelPort for ModelClient`；`clients/error.rs`：`Unavailable{retryable, cause}`、`Cancelled`，`map_rpc_error` 与两个谓词、计数测试 17 → 18。
-- `domain-os.yml`：`kernel_capabilities` 加 `models`；`const MODEL_ACCESS`（`include_str!` 解析）。
-- HTTP：`GET|PUT /settings/ai`、`GET /ai/runs/{run_id}`；run 注册表（内存 LRU 64）；每能力单飞；进程内模型信号量 2。
-- 测试：J1–J10b、manifest 钉子。
+- `src/adapter_agent24/clients/model.rs`：`ModelClient::new(&Arc<KernelClients>) -> Option<Self>`（前缀 `_a24/model/`）、`complete(&ModelRequest) -> Result<ModelReply, ClientError>`（`call_with_timeout(125s)`，不带 `request_id`）、`impl ModelPort for ModelClient`；`clients/error.rs`：`Unavailable{retryable, cause}`、`Cancelled`，`map_rpc_error`、两个谓词、计数测试 17 → 18。
+- `domain-os.yml`：`kernel_capabilities` 加 `models`；新文件 `domain-os.remote-allowed.yml`（仅测试包 B）；cargo feature `remote-allowed-manifest`；`const MODEL_ACCESS`（`include_str!` 解析）；子命令 `sin90 print-model-access`。
+- HTTP：`GET|PUT /settings/ai`、`GET /ai/runs/{run_id}`；run 注册表（内存 LRU 64）；每能力单飞；进程内模型信号量 2；`submit` 成功后补发 `proposal.submitted`。
+- dev-dependency：`syn = { version = "2", features = ["full", "visit"] }`、`proc-macro2`。
+- 测试：J1–J10c。
 
 **T5.2.1 classify**
 - `Sin90Op::AssignTaskDirection`；给 `Sin90Op` 加 `#[serde(deny_unknown_fields)]`（F-1）。
 - `ValidationCtx` 一次加齐 `direction_status` / `task_direction` / `review_snap`；`Working` 加两张叠加表；`ProposalError` 八个新变体。
 - `DbSnapshot` / `build_snapshot` 载入；`apply_op` 分支（`require_task_week_open` + CAS UPDATE + `task.direction_assigned`）。
-- `src/ai/classify.rs`：`candidate_keys`、`schema`、`parse`、`normalize_title`、R1/R2；`AiReadModel::{inbox, direction_candidates, title_history, pending_targets}`。
-- `POST /ai/classify`。测试 J11–J16。
-- 给 T4.3.1 的注记：按 Direction/Area 统计完成任务要折叠 `task.direction_assigned`。
+- `src/ai/classify.rs`：`candidate_keys`、`schema`、`parse`、`normalize_title`、R1/R2；`AiReadModel::{inbox, direction_candidates, title_history}`。
+- `POST /ai/classify`（`task_ids` > 20 → 400）。测试 J11–J16。
+- tasks.md T5.2.1 的「`source = local_brain`」文字应同步为「`source` 由产出引擎决定（`local_brain`/`executive`/`rule`）」——在规划分支，由统筹改。
 
 **T5.3.1 summarize**（依赖 T4.3.1 的周草稿函数）
 - `Sin90Op::DraftReviewBody`、`MAX_REVIEW_BODY_BYTES`、`body_sha256`；`apply_op` 分支（`review.updated`，payload 同人类路径）。
-- `src/ai/summarize.rs`：`WeeklyDraft`（或直接用 T4.3.1 的类型）、`Fact`、`facts`、`render_facts`、`fill_narrative`、`compose_body`；`AiReadModel::{review, weekly_draft, done_titles}`。
+- `src/ai/summarize.rs`：`Fact`、`facts`、`render_unit`、`render_facts`、`fill_narrative(narr, facts, titles)`、`compose_body`、`is_program_only`、`digit_runs`、`MEASURE`；`AiReadModel::{review, weekly_draft, done_titles}`。
 - `POST /ai/summarize`。测试 J17–J19。
+- 给 T4.3.1：按 Direction/Area 统计完成任务时按 §11.2.1 的三步规则取归属。
 
 **T5.4.1 propose**
 - `src/ai/propose.rs`：reflex 排序与顺延规则、模型 schema 与复核（排列补全、键集）；`AiReadModel::{week_tasks, previous_open_week, rhythm_alloc}`。
+- `repo.rs` `CreateTasks`、`CarryOverTask` 分支的 `task.created` payload 加 `direction_id`（只加字段）。
 - `POST /ai/propose`。测试 J20–J22。
 
 **T5.5.1 验收**
-- `tests/agent24_mount_blackbox.rs`：包 A / 包 B（测试 manifest 变体）、Python 模型桩、J23–J25；J26 手动冒烟记录进 PR body。
+- `tests/agent24_mount_blackbox.rs`：包 A / 包 B（feature 构建 + 对应 yml）、Python 模型桩、J23–J25；J26 手动冒烟记录进 PR body。
 
-### 11.11 待用户拍板的产品问题（🟡；文中占位均为最保守取值，不是结论）
+### 11.11 产品问题
+
+**已由规格/技术约束决定（不再开放）**：
+
+| # | 问题 | 决定 | 依据 |
+|---|---|---|---|
+| Q1 | 正式包是否声明 `model_access: remote_allowed` | **不声明**（硬约束，§2 #26，J10c 钉住） | acceptance.md M5「不开远端时只用本地模型」：声明后内核不再保证 `simple` 调用留在本机（§11.3.2） |
+| Q2 | executive 用户开关默认值 | **关** | tasks.md T5.1.1「用户设置开启」+ 最严缺省；且正式包里 executive 不可达 |
+| Q5 | reflex 产出的 `source` | **`rule`** | tasks.md T5.5.1 的 SQL 已含 `rule`；DESIGN §M5 已同步（§6、§2 #23）；tasks.md T5.2.1 文字由统筹同步 |
+
+**仍留给用户拍板（🟡；文中占位均为最保守取值）**：
 
 | # | 问题 | 选项 | 文中占位 |
 |---|---|---|---|
-| Q1 | Sin90 正式包要不要声明 `model_access: remote_allowed`？ | (a) 不声明：executive 在正式包里不可达，本地调用由内核保证不出本机；(b) 声明：可以用远端，但**所有** AI 调用都失去内核的 LocalOnly 保证（§11.3.2）；(c) 先向 Agent24 提「逐次收窄」字段，落地后再声明 | (a) |
-| Q2 | executive 用户开关的默认值 | 关 / 开 | 关 |
 | Q3 | AI 的触发频率 / 是否自动触发 | 仅手动；`/capture` 之后自动 classify；复盘 Routine 到点（T4.3.2 建草稿后）自动 summarize；周进入 planning 时自动 propose；定时（如每日一次） | 仅手动 |
 | Q4 | 没有合适 Direction 时，classify 要不要提议**新建** Direction（需要解决批内前向引用） | 不要 / 要 | 不要（任务留在 inbox） |
-| Q5 | reflex 产出的提议记 `source = rule`，并据此改 §M5 验收原文（§2 #23） | 同意 / 坚持只允许 `local_brain`/`executive`（则 reflex 不产提议，只在 run 结果里给「建议」文本） | 同意 |
-| Q6 | 要不要在 M5 加 `POST /proposals/{id}/reject`（人主动拒掉 AI 提议） | M5 加 / 以后 | 以后 |
-| Q7 | 人已经写过的复盘草稿，summarize 能不能提议整体改写 | 能（CAS 防覆盖）/ 只在正文为空时 | 能 |
-| Q8 | classify 模型 `confidence = low` 时要不要仍给提议 | 不给 / 给（`rationale` 标注低置信） | 不给 |
+| Q6 | 要不要在 M5 加 `POST /proposals/{id}/reject` | M5 加 / 以后 | 以后 |
+| Q7 | summarize 能不能对**人写过**的草稿提议整体替换（`DraftReviewBody` 是整体替换，不是合并） | 只在正文为空或只有程序数字块时 / 任何草稿都可以（CAS 防并发覆盖，但人会在提议里看到自己的字被整体换掉） | 只在正文为空或只有程序数字块时（M6） |
+| Q8 | classify 模型 `confidence = low` 时要不要仍给提议 | 不给 / 给（`rationale` 标注低置信）/ 按阈值 | 不给。**评审给的技术输入**：小模型自报置信度的校准很差，`low/medium/high` 未必对应真实命中率；阈值应当用 J26 冒烟里各档的实际命中率来定，而不是先验拍一个 |
 
 ### 11.12 附录：scratch crate 与 `cargo` 记录
 
-路径：`/private/tmp/claude-502/-Users-jason-Dev-auraai-Agent24/977deb42-1aba-448f-95e7-5bae2dee6fd4/scratchpad/t501-check/`（`sin90 = { path = "<本 worktree>" }`，另依赖 `serde`/`serde_json`/`sha2`/`hex`/`thiserror`/`tokio`）。模块：`ops.rs`（§11.2 wire + F-1）、`ctx.rs`（§11.2.3 校验矩阵与叠加）、`ports.rs`（§11.3/§11.5 端口、梯、失败表、来源映射）、`classify.rs`、`summarize.rs`、`boundary.rs`。
+路径：`/private/tmp/claude-502/-Users-jason-Dev-auraai-Agent24/977deb42-1aba-448f-95e7-5bae2dee6fd4/scratchpad/t501-check/`（`sin90 = { path = "<本 worktree>" }`，另依赖 `serde`/`serde_json`/`sha2`/`hex`/`thiserror`/`tokio`/`syn`/`proc-macro2`/`sqlx`；target 在 crate 自己目录下）。模块：`ops.rs`（§11.2 wire + F-1）、`ctx.rs`（§11.2.3 校验矩阵与叠加）、`ports.rs`（§11.3/§11.5 端口、梯、三种动作、熔断、预算、绊线、来源推导）、`classify.rs`、`summarize.rs`（原子单元与负对照）、`boundary.rs`（syn 白名单）、`dryrun.rs`（SAVEPOINT 试跑）。评审的 `review-probe` crate 依赖 v1 的 `fill_narrative(narr, facts)` 两参签名，v2 改为三参（加任务标题），需要随之更新。
 
 ```
+$ cargo clippy --all-targets   # 无 warning
 $ cargo check --all-targets
-    Checking sin90 v0.5.0 (/Users/jason/Dev/auraai/sin90-F5.0)
-    Checking t501-check v0.0.0 (…/scratchpad/t501-check)
-    Finished `dev` profile [unoptimized + debuginfo] target(s)
+Checking t501-check v0.0.0 (…/scratchpad/t501-check)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.50s
 $ cargo test
-running 24 tests
-… ops::tests::existing_sin90op_silently_accepts_unknown_fields ... ok        (F-1 实测)
-… ctx::tests::draft_body_cas_chain_and_rejections ... ok
-… ports::tests::remote_down_local_up_is_local_brain ... ok
-… ports::tests::run_item_future_is_send ... ok
-… summarize::tests::literal_numbers_are_rejected_positive_control ... ok
-… boundary::tests::positive_controls_each_trip ... ok
-test result: ok. 24 passed; 0 failed
+test classify::tests::normalize ... ok
+test ctx::tests::overlay_sees_an_earlier_close_in_the_batch ... ok
+test ctx::tests::assign_positive_and_negative ... ok
+test ctx::tests::overlay_second_assign_of_same_task_rejected ... ok
+test classify::tests::schema_enum_lists_keys_plus_none ... ok
+test classify::tests::parse_accepts_known_key_and_rejects_invented_one ... ok
+test ops::tests::sha_of_empty_body_is_the_well_known_constant ... ok
+test ctx::tests::draft_body_cas_chain_and_rejections ... ok
+test ops::tests::existing_sin90op_silently_accepts_unknown_fields ... ok
+test ops::tests::new_ops_reject_unknown_fields ... ok
+test ops::tests::wire_shape_round_trips ... ok
+test ports::tests::bad_output_degrades ... ok
+test ports::tests::call_budget_defers ... ok
+test ports::tests::busy_defers_item_and_rest_of_run_without_r2 ... ok
+test ports::tests::executive_request_served_locally_is_local_brain ... ok
+test ports::tests::connection_lost_and_generation_ending_abort ... ok
+test ports::tests::failure_table_is_exhaustive ... ok
+test ports::tests::circuit_breaker_skips_engine_for_rest_of_run ... ok
+test ports::tests::plan_shapes ... ok
+test ports::tests::local_unavailable_degrades_to_reflex_and_row_is_atomic_with_proposal ... ok
+test ports::tests::remote_down_local_up_is_local_brain ... ok
+test ports::tests::switch_turned_off_mid_run_trips_remote_reply ... ok
+test summarize::tests::literal_numbers_are_rejected_positive_control ... ok
+test summarize::tests::facts_come_from_the_draft_verbatim ... ok
+test summarize::tests::a_value_never_appears_without_its_own_label ... ok
+test summarize::tests::every_digit_in_body_comes_from_facts_or_titles ... ok
+test summarize::tests::program_only_detection ... ok
+test summarize::tests::forged_facts_block_rejected_and_markdown_flattened ... ok
+test summarize::tests::measure_after_unit_rejected ... ok
+test summarize::tests::title_placeholder_renders_program_title ... ok
+test ports::tests::run_item_future_is_send ... ok
+test boundary::tests::clean_source_passes ... ok
+test boundary::tests::positive_controls_each_trip ... ok
+test dryrun::tests::invalid_reorder_rejected_at_submit_and_nothing_written ... ok
+test dryrun::tests::valid_reorder_inserts_pending_but_dry_run_leaves_no_trace ... ok
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 ```
