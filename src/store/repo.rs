@@ -169,14 +169,14 @@ fn row_to_proposal(r: &sqlx::sqlite::SqliteRow) -> Result<StoredProposal> {
 }
 
 // A unit-variant enum serializes to a JSON string; unwrap that to the wire text.
-fn to_wire<T: Serialize>(v: &T) -> Result<String> {
+pub(crate) fn to_wire<T: Serialize>(v: &T) -> Result<String> {
     match serde_json::to_value(v)? {
         serde_json::Value::String(s) => Ok(s),
         other => Ok(other.to_string()),
     }
 }
 
-fn from_wire<T: DeserializeOwned>(s: &str) -> Result<T> {
+pub(crate) fn from_wire<T: DeserializeOwned>(s: &str) -> Result<T> {
     Ok(serde_json::from_value(serde_json::Value::String(
         s.to_string(),
     ))?)
@@ -186,7 +186,7 @@ fn from_wire<T: DeserializeOwned>(s: &str) -> Result<T> {
 /// list (`list_tasks`, `today_view`'s three task queries) — introduced with
 /// `today_view` so a fourth near-identical `SELECT ... FROM sin90_tasks`
 /// projection didn't mean a fourth copy of this mapping.
-fn row_to_task(r: sqlx::sqlite::SqliteRow) -> Result<Task> {
+pub(crate) fn row_to_task(r: sqlx::sqlite::SqliteRow) -> Result<Task> {
     Ok(Task {
         id: r.get("id"),
         direction_id: r.get("direction_id"),
@@ -248,7 +248,7 @@ const ROUTINE_COLUMNS: &str = "id, area_id, direction_id, title, kind, cron, tz,
 /// Shared row→`Review` mapping (T4.1.1, design §2/§3.2/§4.1) for
 /// `create_review`/`get_review`/`list_reviews`/`update_review_body`/
 /// `finalize_review`, all of which `SELECT` the same full column list.
-fn row_to_review(r: sqlx::sqlite::SqliteRow) -> Result<Review> {
+pub(crate) fn row_to_review(r: sqlx::sqlite::SqliteRow) -> Result<Review> {
     Ok(Review {
         id: r.get("id"),
         kind: from_wire(&r.get::<String, _>("kind"))?,
@@ -262,7 +262,7 @@ fn row_to_review(r: sqlx::sqlite::SqliteRow) -> Result<Review> {
     })
 }
 
-const REVIEW_COLUMNS: &str =
+pub(crate) const REVIEW_COLUMNS: &str =
     "id, kind, status, week_id, period, body, body_ref, created_at, updated_at";
 
 /// L3 (T3.1.1 review): an `i64` column value read back as `u32` goes through
@@ -453,12 +453,12 @@ pub struct TodayView {
     pub fired_routines: Vec<Routine>,
 }
 
-type Tx<'a> = Transaction<'a, Sqlite>;
+pub(crate) type Tx<'a> = Transaction<'a, Sqlite>;
 
 // One low-level append; the fixed event-row shape is clearer as positional args
 // than a throwaway builder struct.
 #[allow(clippy::too_many_arguments)]
-async fn append_event(
+pub(crate) async fn append_event(
     tx: &mut Tx<'_>,
     entity: &str,
     entity_id: &str,
@@ -2793,7 +2793,7 @@ impl Sin90Store {
 /// `core::validate` stays pure. Widened (design §3.3) with `areas` and
 /// `task_parents` for the new `CreateArea`/`CreateTask` ops.
 #[derive(Default)]
-struct DbSnapshot {
+pub(crate) struct DbSnapshot {
     tasks: HashMap<String, TaskStatus>,
     task_parents: HashMap<String, Option<String>>,
     weeks: HashMap<String, WeekStatus>,
@@ -2819,7 +2819,7 @@ impl ValidationCtx for DbSnapshot {
     }
 }
 
-async fn build_snapshot(tx: &mut Tx<'_>, ops: &[Sin90Op]) -> Result<DbSnapshot> {
+pub(crate) async fn build_snapshot(tx: &mut Tx<'_>, ops: &[Sin90Op]) -> Result<DbSnapshot> {
     let mut snap = DbSnapshot::default();
     for op in ops {
         match op {
@@ -2919,7 +2919,11 @@ async fn require_directions_exist(tx: &mut Tx<'_>, allocations: &[Alloc]) -> Res
     Ok(())
 }
 
-async fn apply_op(tx: &mut Tx<'_>, op: &Sin90Op, event_ids: &mut Vec<String>) -> Result<()> {
+pub(crate) async fn apply_op(
+    tx: &mut Tx<'_>,
+    op: &Sin90Op,
+    event_ids: &mut Vec<String>,
+) -> Result<()> {
     let now = now_iso8601();
     match op {
         Sin90Op::CreateArea { title } => {

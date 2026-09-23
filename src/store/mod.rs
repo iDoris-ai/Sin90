@@ -12,11 +12,13 @@
 //! Agent24's own history, not something a fresh standalone package has. `open`
 //! and `open_memory` are unchanged.
 
+pub mod ai_port;
 pub mod attention;
 pub mod packs;
 pub mod repo;
 pub mod weekly_draft;
 
+pub use ai_port::AiReader;
 pub use attention::{AttentionRow, WeekAttention};
 pub use packs::{five_life_systems, SeedArea};
 pub use repo::{
@@ -88,6 +90,13 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 #[derive(Clone)]
 pub struct Sin90Store {
     pool: SqlitePool,
+    /// T5.1.1 (design §11.5 v2.1 M1): a SEPARATE small pool over the SAME
+    /// target as `pool`, every connection opened with
+    /// `pragma("query_only", "ON")` — a write attempted through this pool is
+    /// a SQLite `readonly` error, not a convention `ai::AiReadModel`'s
+    /// implementor has to remember to honor. Built once at open time (not
+    /// lazily per call) since building it needs an `await`.
+    ai_pool: SqlitePool,
     /// `Some(path.parent())` for [`Sin90Store::open`] (real deployments —
     /// both `Serve --data-dir` and the Agent24-module `A24_DATA_DIR`, per
     /// `main.rs`, always pass a `path` with a parent). `None` for
@@ -111,28 +120,50 @@ impl Sin90Store {
             .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect_with(options)
+            .connect_with(options.clone())
             .await?;
         sqlx::migrate!("./src/store/migrations").run(&pool).await?;
+        let ai_pool = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(options.pragma("query_only", "ON"))
+            .await?;
         Ok(Self {
             pool,
+            ai_pool,
             data_dir: path.parent().map(|p| p.to_path_buf()),
         })
     }
 
-    /// In-memory database for tests (single connection — each `:memory:` handle
-    /// is its own database). No `data_dir` — see the field's doc.
+    /// In-memory database for tests. T5.1.1 (design §11.5 v2.1 M1): a
+    /// per-instance NAMED shared-cache memory database
+    /// (`file:sin90-<ulid>?mode=memory&cache=shared`), not the old anonymous
+    /// `sqlite::memory:` — a second pool connecting to the same NAME now sees
+    /// the same data (needed for `ai_pool` above), which a second connection
+    /// to plain `sqlite::memory:` never could (each anonymous `:memory:`
+    /// handle is its own separate database). The single-writer-pool
+    /// discipline is unchanged (`max_connections(1)` here); a unique name per
+    /// call keeps concurrent test stores from colliding with each other. No
+    /// `data_dir` — see the field's doc.
     pub async fn open_memory() -> Result<Self> {
-        let options = SqliteConnectOptions::from_str("sqlite::memory:")?
+        let uri = format!(
+            "sqlite:file:sin90-{}?mode=memory&cache=shared",
+            crate::core::ulid()
+        );
+        let options = SqliteConnectOptions::from_str(&uri)?
             .busy_timeout(std::time::Duration::from_secs(5))
             .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
-            .connect_with(options)
+            .connect_with(options.clone())
             .await?;
         sqlx::migrate!("./src/store/migrations").run(&pool).await?;
+        let ai_pool = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(options.pragma("query_only", "ON"))
+            .await?;
         Ok(Self {
             pool,
+            ai_pool,
             data_dir: None,
         })
     }
@@ -152,6 +183,15 @@ impl Sin90Store {
 
     pub(crate) fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// T5.1.1 (design §11.5): `ai::ports::AiReadModel` handed to the ai
+    /// module — the ONLY way it can read `sin90.db`, and it cannot write
+    /// through it (see the `ai_pool` field doc). Cheap: `SqlitePool` is an
+    /// `Arc` internally, so this clones a handle, not a connection.
+    #[must_use]
+    pub fn ai_reader(&self) -> crate::store::ai_port::AiReader {
+        crate::store::ai_port::AiReader::new(self.ai_pool.clone())
     }
 }
 
