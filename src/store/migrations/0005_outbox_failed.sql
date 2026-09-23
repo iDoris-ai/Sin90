@@ -1,4 +1,4 @@
--- 0006 (T3.3.1, design DESIGN-LIFEOS.md §2 #15, §4.1; spec.md M3 "outbox";
+-- 0005 (T3.3.1, design DESIGN-LIFEOS.md §2 #15, §4.1; spec.md M3 "outbox";
 -- 错误处理): outbox status widens from `pending|done` to
 -- `pending|done|failed`. `sin90_outbox.status` has never carried a CHECK
 -- constraint (see 0001's comment above `CREATE TABLE sin90_outbox`), so the
@@ -23,6 +23,19 @@
 -- leaves every existing row's `id/kind/dedup_key/desired/status/created_at/
 -- done_at` untouched; `attempts` becomes 0 and the other three become NULL
 -- for pre-existing rows, matching "not yet retried, not failed".
+--
+-- NOTE (review, T3.3.1): this took the `0005` slot, not the `0006` spec.md
+-- pre-allocated for it. spec.md's numbering assumed T3.2.2's
+-- `0005_routine_fires.sql` would exist first, but T3.2.2 has not started —
+-- there is no `0005` file in this worktree yet. Leaving `0005` as a gap and
+-- filing this as `0006` would mean a later T3.2.2 branch fills the gap with
+-- a LOWER-numbered migration than one already shipped to users — sqlx
+-- applies migrations in filename order, so that file would run AFTER 0005's
+-- true chronological place, on top of a db that already has this task's
+-- changes. Taking the next free slot instead (`0005`) keeps the migration
+-- directory gap-free; T3.2.2's `routine_fires` migration takes whatever
+-- number is next free when it lands. `outbox_migrations_are_contiguous_no_gaps`
+-- (src/store/repo.rs, outbox_tests) guards this invariant going forward.
 
 ALTER TABLE sin90_outbox ADD COLUMN failure_kind TEXT NULL;
 ALTER TABLE sin90_outbox ADD COLUMN last_error TEXT NULL;

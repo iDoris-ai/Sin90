@@ -137,7 +137,7 @@ manifest 的 `impl_kind: out_of_process_provider` 必须**同时**带 `spawn: {c
 | 12 | 补 Event Log 抽象 | **已满足** | `sin90_events` append-only + 自包含 payload + 水位保证增量==全量重建，且有测试。**硬约束延续**：新增的 Area/Routine 必须同样产事件，重构不得退化成只存快照。 |
 | 13 | Domain Logic 不 import Agent24，只有 adapter 知道 | **采纳原则，改造形态** | 见 §4——物理分模块采纳；"standalone 与 Agent24 双轨部署"**拒绝**，它与 T11 验收标准打架。 |
 | 14 | M0-M11 里程碑表 | **改造** | GPT 的 M0（"数据模型+SQLite+Event"）内核早就有了，照它排会先把已有能力退化再补回来。重排见 §5。 |
-| 15 | outbox 状态扩为 `pending\|done\|failed`（T3.3.1） | **采纳** | `sin90_outbox` 原状态只有 `pending\|done`，表达不了"这条对账意图已经永久失败，不该再重试"。加 `failed` + `failure_kind`/`last_error`/`attempts`/`next_attempt_at` 四列（迁移 `0006_outbox_failed.sql`，纯加列，`status` 本来就没有 CHECK，见 §1.2）。错误分类（spec.md "错误处理"）：**永久**（`forbidden`/`quota_exceeded`/`invalid_params`）→ `failed`，在 `/today` 暴露，Routine 下次变更时重置为 `pending`；**可重试**（`rate_limited`/`busy`/`timeout`/断连/`not_ready`/`draining`）→ 退避后重试，`next_attempt_at` 记录何时可再试。对账落地（T3.3.2）不在本条范围。 |
+| 15 | outbox 状态扩为 `pending\|done\|failed`（T3.3.1） | **采纳** | `sin90_outbox` 原状态只有 `pending\|done`，表达不了"这条对账意图已经永久失败，不该再重试"。加 `failed` + `failure_kind`/`last_error`/`attempts`/`next_attempt_at` 四列（迁移 `0005_outbox_failed.sql`，纯加列，`status` 本来就没有 CHECK，见 §1.2；编号占 `0005` 而非 spec.md 原分配的 `0006`——T3.2.2 尚未开工，`0005_routine_fires.sql` 还不存在，留空洞会让 T3.2.2 之后落地一个编号更小却更晚出现的迁移，见迁移文件自身注释与 `outbox_migrations_are_contiguous_no_gaps` 测试）。错误分类（spec.md "错误处理"）：**永久**（`forbidden`/`quota_exceeded`/`invalid_params`）→ `failed`，在 `/today` 暴露，Routine 下次变更时重置为 `pending`；**可重试**（`rate_limited`/`busy`/`timeout`/断连/`not_ready`/`draining`）→ 退避后重试，`next_attempt_at` 记录何时可再试。对账落地（T3.3.2）不在本条范围。 |
 
 ### 2.1 一处名不副实，值得单独记一笔
 

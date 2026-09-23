@@ -3501,14 +3501,17 @@ mod outbox_tests {
 
     // ----- migrating an existing db leaves existing outbox rows alone ------
 
-    /// A `sin90.db` that only has migrations 0001-0004 applied (T3.2.2's
-    /// `0005_routine_fires.sql` does not exist in this worktree yet, so
-    /// 0004 IS "the old state" here) gets a `failed`-capable outbox after
-    /// migration 0006 runs, but every existing row's original columns
-    /// (including a `done` row's `done_at`) are untouched, and the four new
-    /// columns land at their "not yet retried" defaults.
+    /// A `sin90.db` that only has migrations 0001-0004 applied (T3.2.2
+    /// hasn't started, so there is no `routine_fires` migration in this
+    /// worktree yet — 0004 IS "the old state" here; this migration took the
+    /// `0005` slot instead of spec.md's originally-pre-allocated `0006`,
+    /// see this file's own header comment and DESIGN §4.1) gets a
+    /// `failed`-capable outbox after migration 0005 runs, but every
+    /// existing row's original columns (including a `done` row's
+    /// `done_at`) are untouched, and the four new columns land at their
+    /// "not yet retried" defaults.
     #[tokio::test]
-    async fn outbox_migration_0006_preserves_existing_rows() {
+    async fn outbox_migration_0005_preserves_existing_rows() {
         use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
         use std::str::FromStr;
 
@@ -3550,7 +3553,7 @@ mod outbox_tests {
         .await
         .unwrap();
 
-        let sql = std::fs::read_to_string("./src/store/migrations/0006_outbox_failed.sql").unwrap();
+        let sql = std::fs::read_to_string("./src/store/migrations/0005_outbox_failed.sql").unwrap();
         sqlx::raw_sql(&sql).execute(&pool).await.unwrap();
 
         let row = sqlx::query(
@@ -3577,5 +3580,43 @@ mod outbox_tests {
             .unwrap();
         assert_eq!(row2.get::<String, _>("status"), "done");
         assert_eq!(row2.get::<String, _>("done_at"), "2026-01-02T00:00:00Z");
+    }
+
+    // ----- migration directory has no numeric gaps --------------------------
+
+    /// Review follow-up (T3.3.1): `sqlx::migrate!` applies files in
+    /// version-number order, so a GAP in the numbering (e.g.
+    /// `0001,0002,0003,0004,0006` with no `0005`) is a live footgun — a
+    /// LATER change that fills the gap ships a migration numbered lower
+    /// than one that already shipped, so it applies AFTER its "true"
+    /// chronological place on any db that already upgraded past the gap
+    /// (exactly the mistake this task's own migration almost made — see
+    /// `0005_outbox_failed.sql`'s header comment). This asserts
+    /// `src/store/migrations/` has no such gap: version numbers, sorted,
+    /// are exactly `1..=N` for some `N` — same prefix convention
+    /// `sqlx::migrate!` itself parses (`NNNN_description.sql`).
+    #[tokio::test]
+    async fn outbox_migrations_are_contiguous_no_gaps() {
+        let mut versions: Vec<u32> = std::fs::read_dir("./src/store/migrations")
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".sql"))
+            .map(|name| {
+                let prefix = name.split('_').next().unwrap_or(&name).to_string();
+                prefix.parse::<u32>().unwrap_or_else(|e| {
+                    panic!("migration file {name:?} has no numeric prefix: {e}")
+                })
+            })
+            .collect();
+        versions.sort_unstable();
+
+        assert!(!versions.is_empty(), "no migration files found");
+        let expected: Vec<u32> = (1..=versions.len() as u32).collect();
+        assert_eq!(
+            versions, expected,
+            "migration version numbers must be contiguous starting at 1, no gaps \
+             (found {versions:?}) — a gap means a future migration filling it in \
+             would apply out of chronological order on an already-upgraded db"
+        );
     }
 }
