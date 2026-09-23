@@ -24,14 +24,14 @@
 
 ## M0' — 起跑前清账
 
-### T0.1 合并已批准的 #2 / #3 / #4  `READY`
+### T0.1 合并已批准的 #2 / #3 / #4  `IN_PROGRESS`
 - **优先级**：high
 - **目标**：三个已 APPROVED 的修复进 main。
 - **开发范围**：逐个核合并判据（exact-head approve + check 全绿；Sin90 暂无 CI 时以 PR body 的本地测试记录为准并在台账注明）→ `gh pr merge <n> --squash`；按 #2 → #3 → #4 顺序。
   若先合的导致后面冲突：rebase、推送、**等 clestons 复审**（旧 approve 失效），不自合。
 - **明确不做**：往已批准分支推任何「顺手」改动。
 - **验收命令**：`gh pr list -R iDoris-ai/Sin90 --state open --json number --jq '[.[].number]'` 不含 2/3/4；main 上全局前置全绿。
-- **证据**：
+- **证据**：2026-09-23 #2 已合并（`0949d37`，exact-head approve）、#3 已合并（`bd84e9a`）；#4 在 #3 合并后冲突 → rebase 解冲突后需 clestons 重新评审（旧 approve 不覆盖新 head）。
 
 ### T0.2 GitHub Actions CI  `BACKLOG`
 - **优先级**：high
