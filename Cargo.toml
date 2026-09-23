@@ -29,6 +29,15 @@ clap = { version = "4", features = ["derive"] }
 sha2 = "0.10"
 hex = "0.4"
 jiff = "0.2"
+# Exact-pinned (M6, T3.1.1 review): Sin90's `Routine.cron`/`tz` validation
+# (core::util::validate_cron/validate_tz) must use the SAME parser and the
+# SAME tz database as Agent24's kernel scheduler — a different `cron` minor
+# version can change ordinal semantics (H1 is exactly that class of bug) and
+# a different `chrono-tz` release ships a different IANA tzdata snapshot.
+# Bump these ONLY together with rust/crates/agent24-scheduler/Cargo.toml in
+# the Agent24 repo, in the same change.
+cron = "=0.15.0"
+chrono-tz = "=0.10.4"
 
 [features]
 test-hooks = []
@@ -40,4 +49,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
 futures = { version = "0.3", default-features = false, features = ["std"] }
 rustix = { version = "0.38", features = ["process"] }
+# Test-only: `core::util`'s cron-semantics tests (H1) construct a fixed
+# `DateTime<Tz>` and iterate a `cron::Schedule` to prove which weekday a
+# named specifier actually fires on. Not a runtime dependency — Sin90 never
+# computes a next-fire itself (the kernel scheduler does).
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
