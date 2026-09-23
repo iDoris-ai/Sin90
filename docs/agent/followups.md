@@ -12,8 +12,8 @@
 
 - [ ] SFU-8（B，需用户定）周复盘草稿的 `routines[].completed` 恒为 0 —— T4.3.1 · ScheduleBlock 没有 routine 关联，`routine.fired` 事件也不带 block/task 引用，事件回放无法把完成的 block 归到某个 Routine。需要决定关联方式（例如 fired 时自动建一个带 `routine_id` 的 ScheduleBlock，或 block 创建时可选 `routine_id`，均为数据模型改动，先进 DESIGN §2）。判据：完成一个由 Routine 产生的 block → 草稿 completed +1；正对照：普通 block 不计入
 
-- [ ] SFU-9（B）`Sin90Op` 枚举没有 `deny_unknown_fields`，带多余字段的 op 被静默接受 —— T5.0.1 设计 §11.1 F-1（scratch 已复现）· 判据：多一个未知字段的 op 提交 → 400；正对照：合法 op 接受
-- [ ] SFU-10（B）`submit_proposal` 提交时不跑 validate（只在 accept 时跑）—— T5.0.1 设计 §11.1 F-2 · 判据：提交结构非法的提议 → 422 且不落库；正对照：合法提议 202
+- [ ] SFU-9（B，PR 已开）`Sin90Op` 枚举没有 `deny_unknown_fields`，带多余字段的 op 被静默接受 —— T5.0.1 设计 §11.1 F-1（scratch 已复现）· 判据：多一个未知字段的 op 提交 → 400；正对照：合法 op 接受
+- [ ] SFU-10（B，PR 已开）`submit_proposal` 提交时不跑 validate（只在 accept 时跑）—— T5.0.1 设计 §11.1 F-2 · 判据：提交结构非法的提议 → 422 且不落库；正对照：合法提议 202
 - [ ] SFU-11（B）`ClientError` 不认内核的 `unavailable`（ME4 推理回调新增）与已有的 `cancelled`，都落到 Other —— T5.0.1 设计 · 判据：两个 kind 各映射到专门变体并有正确的重试分类；随 ME4 推理回调合并后处理
 
 ## T0.4 Codex 补审
