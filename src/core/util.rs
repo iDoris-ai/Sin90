@@ -157,6 +157,30 @@ pub fn validate_cron(expr: &str) -> Result<(), String> {
              ordinals, got {dow:?} in {expr:?}"
         ));
     }
+    // M4 (scheduler-callback design review, written into spec.md): when
+    // BOTH the day-of-month (field 2) and day-of-week (field 4) are
+    // restricted (neither is `*`), this `cron` crate ANDs them —
+    // `cron-0.15.0/src/schedule.rs:117-125` iterates candidate
+    // `day_of_month`s and then `continue`s past any that don't ALSO match
+    // `days_of_week`. POSIX cron ORs the same two fields in that situation
+    // (run on day-of-month 1 OR every Monday, whichever comes first) — the
+    // opposite semantics from the same string. `"0 7 1 * MON"` would read,
+    // under POSIX, as "7am on the 1st AND every Monday"; under this crate it
+    // silently becomes "7am on whichever Mondays happen to fall on the 1st"
+    // (i.e. almost never). Rather than pick a meaning, this validator
+    // refuses the ambiguous case outright: at least one of dom/dow must be
+    // `*`. (`validate_cron` does not special-case "dow names" here: this
+    // check runs on the raw field text, so a still-digit-bearing dow would
+    // already have been rejected above, and a `*` dow always passes.)
+    let dom = fields[2];
+    if dom != "*" && dow != "*" {
+        return Err(format!(
+            "day-of-month and day-of-week must not both be restricted (this \
+             cron crate ANDs them where POSIX ORs them — the same string \
+             would mean two different schedules); make one of them '*', \
+             got dom={dom:?} dow={dow:?} in {expr:?}"
+        ));
+    }
     let normalized = format!("0 {expr}");
     cron::Schedule::from_str(&normalized)
         .map_err(|e| format!("invalid cron expression {expr:?}: {e}"))?;
@@ -296,6 +320,20 @@ mod tests {
         // `name.to_lowercase()` in `ordinal_from_name`.
         assert!(validate_cron("0 7 * * mon-fri").is_ok());
         assert!(validate_cron("0 7 * * Sun,Sat").is_ok());
+    }
+
+    /// M4 (scheduler-callback design review): this `cron` crate ANDs a
+    /// restricted day-of-month with a restricted day-of-week
+    /// (`cron-0.15.0/src/schedule.rs:117-125`), where POSIX ORs them — the
+    /// same string means two different schedules depending on which
+    /// convention the reader has in mind, so both restricted at once is
+    /// rejected outright. Positive controls: either field alone restricted
+    /// (the other `*`) is accepted.
+    #[test]
+    fn routine_validate_cron_rejects_both_dom_and_dow_restricted() {
+        assert!(validate_cron("0 7 1 * MON").is_err());
+        assert!(validate_cron("0 7 1 * *").is_ok());
+        assert!(validate_cron("0 7 * * MON").is_ok());
     }
 
     /// H1's actual payoff: prove the accepted named form fires on the
