@@ -16,13 +16,17 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 
+use std::sync::Arc;
+
 use crate::ai::classify::{self, ClassifyInputError, ItemResult};
-use crate::ai::{AiSink, Capability, ModelAccess, NoModelPort, ProposalDraft};
+use crate::ai::{
+    AiCallRecord, AiSink, Capability, ModelAccess, NoModelPort, ProposalDraft, SinkError,
+};
 use crate::core::{ProposalStatus, Sin90Op, Task, TaskId};
 use crate::store::{Sin90Store, StoreError};
 
-use super::ai_runs::{AiRunItem, BusyGuard};
-use super::state::Sin90State;
+use super::ai_runs::{lock_registry, AiRunItem, BusyGuard};
+use super::state::{EventSink, Sin90State};
 use super::{error_response, parse};
 
 #[derive(Debug, Deserialize)]
@@ -37,6 +41,57 @@ struct ClassifyReq {
 /// M3) — starts at the normal cap and doubles until either enough targets
 /// are found or the inbox is exhausted.
 const AUTO_SELECT_MAX_PAGE: u32 = 2000;
+
+/// 2026-09-24 review (round 2, Medium #1): wraps a `Sin90Store` so a
+/// successful `submit` mirrors `proposal.submitted` IMMEDIATELY — right
+/// after that commit, inside `submit` itself — instead of the run collecting
+/// every `Proposed` outcome and emitting them all in a loop AFTER
+/// `run_classify` returns (design §11.4 公共's L1: "submit 成功后...补发",
+/// not "after the whole run finishes"). Without this, a run that panics
+/// partway through, or a process that exits mid-run, loses the mirror event
+/// for every proposal ALREADY durably committed to `sin90.db` before the
+/// crash — nothing downstream (e.g. a WS subscriber relying on the mirrored
+/// event) is ever told about it. `record_call`/`precheck` just delegate:
+/// only a produced (`Ok`) `submit` has anything to mirror. Lives here, not
+/// in `ai/`: it holds an `Arc<dyn EventSink>`, which `ai/` may never see
+/// (§11.5's boundary, unaffected — this type never appears under
+/// `src/ai/**`) — the `syn` whitelist checker (J7) stays green because
+/// nothing in `ai/classify.rs` changed; `run_classify` only knows it got
+/// handed "something that implements `AiSink`", same as before.
+/// `pub(crate)` (not private): exercised directly from `http::tests`
+/// (Medium #1's own regression test), which needs to compose it with a
+/// panic-injecting wrapper to prove emission happens per-`submit`, not
+/// batched at the end of a run.
+pub(crate) struct EmittingSink<'a> {
+    pub(crate) store: &'a Sin90Store,
+    pub(crate) sink: Arc<dyn EventSink>,
+}
+
+impl AiSink for EmittingSink<'_> {
+    async fn submit(
+        &self,
+        cap: Capability,
+        draft: ProposalDraft,
+        rec: AiCallRecord,
+    ) -> Result<(), SinkError> {
+        let id = draft.id.clone();
+        let result = AiSink::submit(self.store, cap, draft, rec).await;
+        if result.is_ok() {
+            let mut payload = serde_json::Map::new();
+            payload.insert("id".to_string(), serde_json::Value::String(id));
+            self.sink.emit("proposal.submitted", payload);
+        }
+        result
+    }
+
+    async fn record_call(&self, rec: AiCallRecord) -> Result<(), SinkError> {
+        AiSink::record_call(self.store, rec).await
+    }
+
+    async fn precheck(&self, cap: Capability, drafts: &[ProposalDraft]) -> Vec<bool> {
+        AiSink::precheck(self.store, cap, drafts).await
+    }
+}
 
 /// `POST /ai/classify {"task_ids"?: [...]}` → `202 {"run_id", "capability"}`;
 /// `409 {"code": "ai_busy", "run_id"}` if classify already has a run in
@@ -83,7 +138,10 @@ pub async fn trigger_classify(
 
     let run_id = format!("run-{}", crate::core::ulid());
     {
-        let mut reg = state.ai_runs.lock().unwrap_or_else(|p| p.into_inner());
+        // 2026-09-24 review (round 2, low): go through `lock_registry`
+        // (poison-recovering) instead of a bare `.lock().unwrap_or_else`
+        // duplicated at this call site.
+        let mut reg = lock_registry(&state.ai_runs);
         if let Some(existing) = reg.busy_run(Capability::Classify) {
             return (
                 StatusCode::CONFLICT,
@@ -115,24 +173,29 @@ pub async fn trigger_classify(
         };
 
         let model: Option<&NoModelPort> = None; // T5.1.2: no real adapter wired yet.
+                                                // H2 (design §11.4 公共's L1, round 2 fix): `EmittingSink` mirrors
+                                                // `proposal.submitted` IMMEDIATELY inside `submit`, one commit at a
+                                                // time — not batched into a loop AFTER the whole run finishes (the
+                                                // old shape here lost every already-committed proposal's event if
+                                                // the run panicked, or the process exited, before reaching this
+                                                // point).
+        let emitting = EmittingSink {
+            store,
+            sink: bg_state.sink.clone(),
+        };
         let outcomes = classify::run_classify(
             &rid,
             &targets,
+            // TODO(T5.1.2): hardcoded until the real `ModelPort` adapter and
+            // `domain-os.yml`'s `model_access` are wired up (see `ai::mod`'s
+            // "T5.1.2 接线" doc) — this trigger route cannot request
+            // `RemoteAllowed` today regardless of the installed manifest.
             ModelAccess::LocalOnly,
             model,
-            store,
+            &emitting,
             &reader,
         )
         .await;
-
-        // H2 (design §11.4 公共's L1): mirror `proposal.submitted` for every
-        // proposal the run actually produced — same shape `POST /proposals`
-        // itself emits, from the layer that holds the `EventSink`, not `ai/`.
-        for outcome in &outcomes {
-            if let ItemResult::Proposed(id) = &outcome.result {
-                bg_state.emit("proposal.submitted", json!({ "id": id }));
-            }
-        }
 
         let aborted = outcomes.iter().any(|o| o.result == ItemResult::Aborted);
         let mut items: Vec<AiRunItem> = skipped
@@ -164,15 +227,27 @@ fn item_result_str(r: &ItemResult) -> &'static str {
         ItemResult::Nothing => "nothing",
         ItemResult::Deferred => "deferred",
         ItemResult::Rejected => "rejected",
-        // Design's item-result vocabulary is `proposed|nothing|deferred|
-        // rejected|skipped` — an item that never ran because the run aborted
-        // maps to "skipped" (it was, from the item's point of view, skipped).
-        ItemResult::Aborted => "skipped",
+        // 2026-09-24 review (round 2, low): NOT "skipped" — design §11.4 公共's
+        // enumerated item-result vocabulary is `proposed|nothing|deferred|
+        // rejected|skipped`, and does not literally list "aborted", but
+        // conflating it with "skipped" (dedup's own word for "we didn't even
+        // try this one") erases a real distinction: this item DID get tried
+        // and the run died partway through, which is a different, more
+        // alarming outcome than "already had a valid pending proposal". If
+        // the design's value domain should stay closed to those five
+        // strings, "aborted" needs to be added to it explicitly — flagged
+        // back to the coordinator rather than silently picked here.
+        ItemResult::Aborted => "aborted",
     }
 }
 
 fn classify_input_error(e: ClassifyInputError) -> Response {
     match e {
+        ClassifyInputError::EmptyTaskIds => error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "task_ids was given but empty; omit it entirely to auto-select from the inbox",
+        ),
         ClassifyInputError::TooManyTaskIds => error_response(
             StatusCode::BAD_REQUEST,
             "invalid_request",
@@ -203,8 +278,13 @@ fn classify_input_error(e: ClassifyInputError) -> Response {
 /// inbox is exhausted (the OLD behavior fetched exactly the oldest 20 once,
 /// so a run could silently process fewer than 20 real targets whenever the
 /// front of the inbox happened to be mostly already-pending tasks, even with
-/// plenty of untouched ones further back).
-async fn auto_select_targets(store: &Sin90Store, reader: &crate::store::AiReader) -> Vec<Task> {
+/// plenty of untouched ones further back). `pub(crate)` (not private):
+/// exercised directly from `http::tests` (M3 round 2) without standing up a
+/// full background run.
+pub(crate) async fn auto_select_targets(
+    store: &Sin90Store,
+    reader: &crate::store::AiReader,
+) -> Vec<Task> {
     use crate::ai::AiReadModel;
     let mut page = classify::MAX_CLASSIFY_TASK_IDS as u32;
     loop {

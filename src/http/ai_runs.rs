@@ -65,9 +65,7 @@ impl RunRegistry {
     pub fn start(&mut self, cap: Capability, run_id: &str) {
         self.busy.insert(cap, run_id.to_string());
         if self.runs.len() >= MAX_TRACKED_RUNS {
-            if let Some(oldest) = self.order.pop_front() {
-                self.runs.remove(&oldest);
-            }
+            self.evict_one_non_running();
         }
         self.order.push_back(run_id.to_string());
         self.runs.insert(
@@ -79,6 +77,27 @@ impl RunRegistry {
                 items: Vec::new(),
             },
         );
+    }
+
+    /// 2026-09-24 review (round 2, low): eviction must never drop a run
+    /// that is STILL `"running"` — `GET /ai/runs/{id}` would otherwise
+    /// report `state: "unknown"` for a run that is, in fact, actively in
+    /// flight (and, for `classify`, still holding the single-flight slot).
+    /// Scans `order` (oldest first) for the first entry that is NOT running
+    /// and evicts that one instead of blindly popping the front; if EVERY
+    /// tracked entry happens to be running, this is a no-op for this call —
+    /// the log briefly holds more than [`MAX_TRACKED_RUNS`] entries rather
+    /// than lose a live one.
+    fn evict_one_non_running(&mut self) {
+        let idx = self
+            .order
+            .iter()
+            .position(|id| self.runs.get(id).is_none_or(|r| r.state != "running"));
+        if let Some(idx) = idx {
+            if let Some(id) = self.order.remove(idx) {
+                self.runs.remove(&id);
+            }
+        }
     }
 
     /// Releases `cap`'s single-flight slot and records the run's final
@@ -117,7 +136,7 @@ pub type SharedRunRegistry = Arc<Mutex<RunRegistry>>;
 /// because [`RunRegistry`]'s own methods have no partial-mutation window
 /// that could leave it in a torn state (`start`/`finish` are each a handful
 /// of infallible `HashMap`/`VecDeque` operations).
-fn lock_registry(registry: &SharedRunRegistry) -> MutexGuard<'_, RunRegistry> {
+pub(super) fn lock_registry(registry: &SharedRunRegistry) -> MutexGuard<'_, RunRegistry> {
     registry.lock().unwrap_or_else(|poisoned| {
         tracing::warn!("ai run registry mutex was poisoned by a prior panic; recovering");
         poisoned.into_inner()
@@ -203,12 +222,21 @@ pub async fn get_ai_run(
             "calls": calls,
         }))
         .into_response(),
-        None => Json(serde_json::json!({
-            "run_id": run_id,
-            "state": "unknown",
-            "items": [],
-            "calls": calls,
-        }))
-        .into_response(),
+        None => {
+            // 2026-09-24 review (round 2, low): the registry lost track of
+            // this run (evicted, or a process restart), but the DURABLE
+            // `sin90_ai_calls` rows may still say which capability it was —
+            // every row for one run shares `task_kind` (J9), so the first
+            // one (if any) tells us.
+            let capability = calls.first().map(|c| c.task_kind.clone());
+            Json(serde_json::json!({
+                "run_id": run_id,
+                "capability": capability,
+                "state": "unknown",
+                "items": [],
+                "calls": calls,
+            }))
+            .into_response()
+        }
     }
 }
