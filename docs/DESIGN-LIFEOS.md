@@ -4,7 +4,7 @@
 > 输入：[`LIFEOS-DESIGN-INPUT.md`](LIFEOS-DESIGN-INPUT.md)（2026-09-20 用户构想 + GPT 提议）
 > 核对对象：Agent24 主仓库 `rust/crates/agent24-sin90{,-store,-os}`（2026-09-20 实读源码，非文档转述）
 > 状态：本文冻结数据模型与 M0 范围；M1+ 只给方向，不冻结
-> 最后更新：2026-09-24（T5.0.1 §11 AI v1 设计补丁，草稿 v2 待第 2 轮评审；§1.3 / §2 #17–#26 / §3.3 / §4.1 / §6 M5 随之更新）
+> 最后更新：2026-09-24（T5.0.1 §11 AI v1 设计补丁，**设计已冻结 v2.1**（Tier 2 本地评审，记 Codex 债）；§1.3 / §2 #17–#26 / §3.3 / §4.1 / §6 M5 随之更新）
 
 > **2026-09-23 起，执行状态与 M3–M5 的任务拆分以 [`agent/tasks.md`](agent/tasks.md) 为准**（pilot 规划层，见 [`agent/roadmap.md`](agent/roadmap.md)）。
 > 本文仍是数据模型裁决的权威；下面的进度表是 2026-09-20 的快照，不再更新。
@@ -410,7 +410,7 @@ Rhythm 的路由（实体和状态机在，但不开 HTTP 面）、Week 路由�
 
 **交付**：三个能力，**只有三个**：`classify`（inbox 条目 → Area/Direction）、`summarize`（事件 → 复盘草稿）、`propose`（排期建议）。全部只产 `Sin90Proposal`，一条都不直写。
 **验收**：AI 产出的所有变更在 `sin90_proposals` 里都有 `source ∈ {local_brain, executive}` 的行；拔掉网络后 classify 仍可用（走 oMLX 本地脑）。
-**T5.0.1 设计补丁（§11，草稿 v2，待评审）对这段的两处收紧/改动**：
+**T5.0.1 设计补丁（§11，v2.1 已冻结）对这段的两处收紧/改动**：
 1. 「Area/Direction」落成**只指派 Direction**（Area 由 `direction.area_id` 派生）——Task 没有 `area_id` 列，inbox 的定义是 `direction_id IS NULL`，只给 Area 不会让任务离开 inbox（§2 #22）。
 2. 引擎梯最底层是**无模型的 reflex 规则**，它产出的提议 `source = rule`（而不是冒充 `local_brain`，§2 #23）。所以验收句改为：AI 模块产出的每条提议都有 `source ∈ {local_brain, executive, rule}`，且与产出它的那次 `sin90_ai_calls` 记录（引擎 + 实际服务层级）一致；「断网 classify 仍可用」= 远端不可达、本地可达时 classify 产出 `source = local_brain` 的提议（判据 J16/J23）。
 
@@ -485,16 +485,32 @@ Projection 层（tiny-world-builder 的 `world[x][z]` vs `cellMeshes` 那条思�
 
 ## 11. M5 设计补丁 —— AI v1：新 Op、引擎梯、三能力契约（T5.0.1）
 
-> **草稿 v2，待评审**（2026-09-24）。评审方：Codex 额度 2026-09-29 19:28 前耗尽，期间按 tasks.md T5.0.1 由**全新上下文的 Opus 子代理**做对抗评审（Critical/High/Medium/Low + file:line），评审记录逐轮追加在本节头部的表里，到 APPROVE 才改为「冻结」。
+> **设计已冻结（v2.1，2026-09-24）**。第 2 轮 REQUEST_CHANGES 只余 1 个 High（H1 残留），统筹裁定「修完即冻结、不再整轮送审、由统筹复核」；v2.1 折入该 High 与第 2 轮全部 M/L（见「v2 → v2.1 改动记录」）。
+> **全部轮次都是 Tier 2 本地评审**（全新上下文 Opus 子代理；Codex 额度 2026-09-29 19:28 前耗尽），记 **Codex 评审债**：额度恢复后请 Codex 补审，重点 ① §11.4.2 叙述复核的绕过面（Unicode 规范化、渲染端差异）；② §11.5 syn 白名单的绕过面（宏、`$tt` 拆路径、字符串形式路径）；③ §11.4 公共「SAVEPOINT 试跑」依赖的「`apply_op` 无非数据库副作用」不变式。
 >
 > | 轮次 | 评审方 | 结论 | C / H / M / L |
 > |---|---|---|---|
 > | 第 1 轮（v1，`2ffe621`） | 全新上下文 Opus 子代理（Tier 2，Codex 额度耗尽；验证 crate `scratchpad/review-probe/`，依赖 `t501-check`） | REQUEST_CHANGES（两个新 Op 的校验、`Working` 叠加、accept 时 CAS 成立） | 0 / 3 / 8 / 7 |
-> | 第 2 轮（v2） | —— | 待评审 | —— |
+> | 第 2 轮（v2，`6dd7f84`） | 全新上下文 Opus 子代理（Tier 2；验证 crate `scratchpad/review2-probe/`、`scratchpad/selfsuper/`）；H2、H3 CLOSED | REQUEST_CHANGES（余 H1 残留，修完即冻结） | 0 / 1 / 5 / 7 |
+| v2.1 | 统筹复核（不整轮送审） | —— | —— |
 >
 > 事实核对基线：本 worktree `docs/t5.0.1-ai-v1-design`（叠在 `feat/t4.2.1-body-ref` `7925c4d` 上）；类型化客户端在分支 `feat/t3.2.1-kernel-clients`（`db80b88`）；内核推理回调以 Agent24 `docs/design/ME4-S2-model-callback.md` **v3.1 冻结版**为准（本文引用不复述，§10）。
 > 文中每一段 Rust 签名都在 scratch crate `t501-check`（path 依赖本 worktree 的 `sin90`）里 `cargo check --all-targets` + `cargo test` + `cargo clippy --all-targets` 过，见 §11.12。
 > 标 ⚖️ 的数值是**选的**，不是推出来的。标 🟡 的是**待用户拍板的产品问题**（§11.11），文中给的是拍板前的**最保守占位**，不是结论。
+
+#### v2 → v2.1 改动记录（第 2 轮：REQUEST_CHANGES，0 C / 1 H / 5 M / 7 L，全部采纳）
+
+| 条 | 问题（评审原意，标「实测」的在 review2-probe 里跑过） | v2.1 改法 | 位置 |
+|---|---|---|---|
+| H1 残留 | 模型能手写 `〔标签：数值〕` 单元（`〔领域「Coding」投入：十八 小时〕`、`〔…：翻倍〕，〔完成任务数：全部〕`）；数词与量词间隔空格/零宽（`十八 小时`、`十八​小时`）、占位与量词间隔空格/零宽（`{{f3}} 小时`）、`本​周数字`/`本　周数字`、单独 `\r`（CommonMark 按行切、Rust `lines()` 不切）、任务标题可含 `\r` 与 Markdown 经 `{{tN}}` 注入——均实测通过 | ① 字面段出现 `〔〕「」` 直接拒（只有程序能产生它们）；② 检查前先拒控制字符、删 Unicode Cf 格式字符、把非换行空白压成一个空格，数词/占位与量词之间允许「可选一个空格」，「本周数字」在去掉全部空白后比较；③ 除 `\n` 外全部控制字符与 U+2028/2029 一律拒，按 `\n` 切行（不用 `lines()`）；代入的任务标题与数字块里的名称走 `sanitize_inline`（删控制与 Cf、压平空白与换行、转义行内 Markdown、`< > &` 换全角、`〔〕「」` 换成别的括号）；另补：`{{tN}}`/`{{fN}}` 的 N 只认无符号无前导零的 ASCII 数字（`{{t+1}}` 不再被解析）、大写数词（壹…萬）入表、叙述里 `<` `&` 换全角（HTML 块/实体不成形）；④ J17 补全部对应负对照，scratch `round2_bypasses_are_rejected` 25 条 | §11.4.2、J17 |
+| H2 文字 | 「`self`/`Self` 放行」让 `use self::super::super::store::Sin90Store;` 过检查 | 先剥掉开头的 `self` 再按 `super` 个数判断；scratch 加 `use` 与表达式两种写法的正对照 | §11.5、J7 |
+| H3 Low | 试跑依赖的不变式没写 | 写明不变式：**`apply_op` 永远只做数据库写，不做任何非数据库副作用**（文件、内核调用、事件外发都不在 `apply_op` 里；`finalize_review` 的 Markdown 写不是 Op），并由 J21b 的结构断言钉住 | §11.4 公共、J21b |
+| M1 | `read_only(true)` 在 `open_memory` 下不成立（另开池连到另一个空库；共享缓存配 `read_only(true)` 仍能写） | 读取器改为：与写连接**同一目标**的连接选项 + `pragma("query_only","ON")`；测试模式下 `open_memory` 改为**按实例命名的共享缓存内存库**（`file:sin90-<ULID>?mode=memory&cache=shared`），读取器池连同一个名字。scratch `readonly.rs` 实测：文件库（WAL）与共享缓存两种模式下读取器都读得到、写即 `readonly` 错；共享缓存下读取器遇到另一任务未提交的写事务会**等待**到其提交（不报错），同一任务持写事务时读会自锁——ai run 从不在持有 sink 事务时读（sink 方法是原子调用） | §11.5、J8 |
+| M2 | `is_program_only` 误判（数字块下人手写一行仍判为程序生成） | 改为与 `render_facts(当前草稿)` **逐字比较**（或正文为空）；旧数字块（数字已变）也算人写——保守 | §11.4.2、Q7 |
+| M3 | 汉字数词规则误杀「这一周」「一个」「一次」 | 提示词写明这些写法会被拒、改用不带数词的说法；J26 统计该规则引起的降级比例；scratch `known_false_positives_are_what_m3_says` 把误杀写成断言 | §11.4.2、J26 |
+| M4 | J7 与 ai 模块内 `#[cfg(test)] mod tests` 冲突 | 写死：**恰好** `#[cfg(test)]` 的条目跳过检查（单元测试可以用真实 store 建夹具）；`cfg(any(test, …))` 等其它 cfg 照常检查；scratch 有跳过与不跳过两条断言 | §11.5、J7 |
+| M5 | `std` 白名单过宽 | `std`/`core`/`alloc` 下拒 `fs`、`process`、`net`、`os` | §11.5、J7 |
+| L | `$a:tt` 拆路径、本地同名 `fn sqlx`；字符串形式路径（`deserialize_with = "crate::store::…"`）；行内链接 `[x](javascript:…)`；`{{t+1}}`；`still_valid_pending` 前后矛盾与 AiSink 代码块漏 `precheck`；每条预检都争写锁 | 前三条写进残余风险 R2/R14（链接由渲染端处理，写明渲染端契约）；`{{t+1}}` 修正解析；删掉 `AiReadModel` 注释里的 `still_valid_pending`，`AiSink` 代码块补 `precheck`；`precheck` 改为**批量**：每 run 一次 `BEGIN IMMEDIATE`，每条草稿一个 SAVEPOINT，最后整体 ROLLBACK | §11.5、§11.9 |
 
 #### v1 → v2 改动记录（第 1 轮：REQUEST_CHANGES，0 C / 3 H / 8 M / 7 L，全部采纳）
 
@@ -761,9 +777,11 @@ T5.1.1 对 `ClientError` 的配套改动（在 adapter 里）：加 `Unavailable
   2. `build_snapshot` → `validate`；
   3. **试跑**：开嵌套事务（sqlx 在已开事务的连接上 `begin()` 即发 `SAVEPOINT`），对每个 op 调**同一个** `apply_op`，然后**无条件** `ROLLBACK TO SAVEPOINT`——关系约束（`ReorderTasks` 引用的任务是否在该周、`require_task_week_open`、`idx_sin90_task_carried` 唯一索引、CAS UPDATE 的 `affected`）在这里全部真实地跑一遍，试跑里铸造的 ULID 与事件随回滚消失；
   4. 推导 `source`，`INSERT` 提议（`pending`）+ `proposal.submitted` 事件行 + `ok=1` 调用行；`COMMIT`。
+
+  **试跑依赖的不变式（v2.1）**：`apply_op` 永远只做 `sin90.db` 内的读写，**不做任何非数据库副作用**——不写文件、不调内核、不外发事件、不改进程内状态。今天成立（`repo.rs:2594` 起的每个分支都只有 SQL 与 `append_event`）；定稿写 Markdown 在 `finalize_review` 里，不是 Op；内核副作用走 outbox（apply 只写 outbox 行，随回滚一起消失）。将来任何 Op 若需要非数据库副作用，必须放到 apply 之后（outbox 或 http 层），不许进 `apply_op`。J21b 钉住。
   任一步失败 → `SinkError::Invalid`，整个事务回滚，**不写任何行**。scratch `dryrun.rs` 在 sqlx 0.8 + SQLite 上实测了「嵌套事务 = SAVEPOINT、回滚后外层照常插入、试跑不留痕、非法重排整体拒绝」。accept 时照旧 validate + apply（状态可能已变）。人类/自动化 key 的 `POST /proposals` 不变（F-2）。
   **镜像事件（L1）**：`submit` 成功后，http 组装层（持有 `EventSink` 的那一层，不是 `ai/`）补发 `emit("proposal.submitted", {"id"})`，与 `POST /proposals` 同形（`http/mod.rs:623-626`）。
-- **去重（L3）**：触发时跳过已有**仍然有效**挂起提议的目标。「仍然有效」= 现在对那条挂起提议重跑提交前校验的第 2–3 步能通过（只读快照 + 试跑后回滚，不写）。于是：任务已被归类、正文已被人改、目标 Direction 已 abandoned 的挂起提议都不再挡新 run——否则没有拒绝路由（Q6）时，一条过期提议会永久挡住它的目标。
+- **去重（L3）**：触发时跳过已有**仍然有效**挂起提议的目标。「仍然有效」= 现在对那条挂起提议重跑提交前校验的第 1–3 步能通过。由 `AiSink::precheck(cap, &[ProposalDraft]) -> Vec<bool>` **批量**完成：每个 run 开头调用一次，一个 `BEGIN IMMEDIATE`、每条草稿一个 SAVEPOINT（试跑后 ROLLBACK TO），最后 ROLLBACK 整个事务——一次 run 只争一次写锁，不改变任何行。于是：任务已被归类、正文已被人改、目标 Direction 已 abandoned 的挂起提议都不再挡新 run——否则没有拒绝路由（Q6）时，一条过期提议会永久挡住它的目标。
 
 #### 11.4.1 classify（T5.2.1）
 
@@ -781,19 +799,25 @@ T5.1.1 对 `ClientError` 的配套改动（在 adapter 里）：加 `Unavailable
 #### 11.4.2 summarize（T5.3.1）
 
 - **输入**：`review_id`，必须 `kind = weekly` 且 `status = draft`（否则 409；daily/rhythm 400 `unsupported_kind`）；周 = `period`。
-- **可改写条件（M6，🟡 Q7 拍板前占位）**：当前正文为空，**或**只由程序生成的数字块构成（scratch `is_program_only`：首个非空行是 `## … 本周数字`，其余非空行都是 `- 标签：值`）。否则不产提议，run 结果记 `skipped: human_text`——`DraftReviewBody` 是整体替换，人写过的字不应出现在「整体改写」提议里。
+- **可改写条件（M6/v2.1 M2，🟡 Q7 拍板前占位）**：当前正文为空，**或**与 `render_facts(当前草稿)` **逐字相等**（去尾部空白后比较，scratch `is_program_only(body, current_facts_md)`）。否则不产提议，run 结果记 `skipped: human_text`——`DraftReviewBody` 是整体替换，人写过的字不应出现在「整体改写」提议里。保守的代价：数字块下多出人手写的一行、或旧周数字块（数字已变）都会被当成人写，AI 不再覆盖它。
 - **数字来源**：`AiReadModel` 调 T4.3.1 的周草稿函数得到 `WeeklyDraft`（形状见 §11.1 第 13 条）；另取该周完成任务的标题（至多 50 条 ⚖️），只作为可引用的素材。
 - **「数字只来自草稿」的机制**（scratch `summarize.rs` 已 check + test）：
-  1. `facts(draft, title_of)` 把草稿每个数值变成 `Fact{key: "fN", label, value}`；`render_facts` 渲染「本周数字」块——**完全由程序生成**。
-  2. 模型只输出 `{"narrative": string ≤ 2000}`（`response_format` 同上，`max_tokens: 1024` ⚖️）。提示词给它 `[{key, label, value}]` 与 `[{key: "tN", title}]`，要求：不写任何数字；要引用一个数值就写 `{{fN}}`，要引用任务就写 `{{tN}}`。
-  3. `fill_narrative` 复核并渲染，以下任一即拒（`bad_output`，降级）：
-     - 占位之外的字面文本里有任何 `char::is_numeric()` 为真的字符（阿拉伯、全角、其它 Unicode 数字）；
-     - 汉字数词串（`〇零一二两三…百千万`）**紧跟 `MEASURE` 表里的量词**（小时、分钟、个、件、次、项、天、周、%、倍、成）；
-     - `{{fN}}` 之后紧跟 `MEASURE` 量词（「完成任务{{f3}}小时」——给一个数值单元换单位）；
-     - 未知占位、未闭合；叙述里出现「本周数字」字样（仿造数字块）。
-     通过后：`{{fN}}` **整体**渲染为 `〔标签：数值〕`——数值永远带着它自己的标签出现，模型只决定它放在哪句话里；`{{tN}}` 渲染为 `「任务标题」`；然后逐行剥掉行首 Markdown 块语法（井号、减号、星号、加号、大于号、竖线、反引号、波浪号、等号、下划线），空行分段——叙述只能是纯段落，造不出标题、列表、表格、引用、代码块。
+  1. `facts(draft, title_of)` 把草稿每个数值变成 `Fact{key: "fN", label, value}`，标签里的领域/方向/节律名先过 `sanitize_inline`；`render_facts` 渲染「本周数字」块——**完全由程序生成**。
+  2. 模型只输出 `{"narrative": string ≤ 2000}`（`response_format` 同上，`max_tokens: 1024` ⚖️）。提示词给它 `[{key, label, value}]` 与 `[{key: "tN", title}]`，并写明：不写任何数字（含汉字数词）；要引用数值只能写 `{{fN}}`，引用任务只能写 `{{tN}}`；不要自己写 `〔〕「」`；不要用标题、列表、表格、引用、HTML；**「这一周」「一个」「一次」这类「汉字数词 + 量词」的日常写法也会被拒，请换成不带数词的说法（「本周」「某个」「再次」）**（v2.1 M3——规则会误杀它们，J26 统计由此引起的降级比例）。
+  3. `fill_narrative` 按固定顺序处理（v2.1 H1）：
+     1. **拒控制字符**：除 `\n` 外任何控制字符（含单独的 `\r`、制表符）与 U+2028/U+2029 → 拒。原因：CommonMark 等渲染端把单独 `\r` 当换行，Rust `lines()` 不当——两边切行不一致就是绕过口。
+     2. **规范化**：删除 Unicode Cf 类格式字符（零宽空格、零宽连接符、方向控制、BOM 等，按 Unicode 15 的码位表），把每一段非换行空白（含全角空格）压成一个 ASCII 空格。之后所有检查都在规范化文本上做。
+     3. **拒**（`bad_output`，降级）：
+        - 占位之外的字面文本里有任何 `char::is_numeric()` 为真的字符（阿拉伯、全角、罗马数字 `Ⅻ` 等；`&frac12;` 这类实体因含数字也被拒）；
+        - 字面文本里出现 `〔` `〕` `「` `」`——这四个括号只能由程序渲染产生，模型手写即拒（封住「手写单元」）；
+        - 汉字数词串（`〇零一二两三…百千万亿`、大写 `壹…萬`）之后、隔**至多一个空格**紧跟 `MEASURE` 表里的量词（小时、分钟、个、件、次、项、天、周、%、倍、成）；
+        - `{{fN}}` 之后隔至多一个空格紧跟 `MEASURE` 量词（给数值单元换单位）；
+        - 占位键不是 `f`/`t` + 无符号、无前导零的 ASCII 数字（`{{t+1}}`、`{{t01}}`、`{{ f1 }}` 都拒），或编号不存在；未闭合；
+        - 去掉全部空白后含「本周数字」（仿造数字块）。
+     4. **渲染**：`{{fN}}` **整体**渲染为 `〔标签：数值〕`，数值永远带着自己的标签；`{{tN}}` 渲染为 `「sanitize_inline(标题)」`——任务标题是用户数据，可能含 `\r`、Markdown、HTML，`sanitize_inline` 删控制与 Cf、把包括换行在内的空白压成一个空格、给行内 Markdown 元字符加反斜杠、`< > &` 换全角、`〔〕「」` 换成 `［］『』`（标题里伪造的单元不再像单元）。
+     5. **压平**：按 `\n` 切行，每行剥掉行首块语法（井号、减号、星号、加号、大于号、竖线、反引号、波浪号、等号、下划线），`<` `&` 换全角（HTML 块与实体不成形），丢空行，段落间空一行——叙述只能是纯段落。
   4. 正文 = `compose_body(数字块, Some(叙述))`；reflex（兜底）= `compose_body(数字块, None)`。
-  结论的**准确说法**：正文里每个数字串都出现在程序渲染的数字块里，或出现在程序代入的任务标题里（J17 的判法）；叙述里的每个数值都以 `〔标签：数值〕` 单元出现，标签与数值来自同一条 `Fact`；叙述不含字面数字，也不含「汉字数词 + `MEASURE` 表里的量词」。**不**声称：模型写在单元前后的文字与单元一致（「编码投入达到〔领域「Business」投入：2 小时 0 分钟〕」能通过——矛盾是可见的，但没被阻止，R1）；也不声称模型无法表达数量（「近半」「翻倍」「seven」、不在表里的量词仍能漏过，R1）。
+  结论的**准确说法**：正文里每个数字串都出现在程序渲染的数字块里，或出现在程序代入的任务标题里（J17 的判法）；叙述里出现的每个 `〔…〕` 单元都由程序渲染、标签与数值来自同一条 `Fact`；叙述不含字面数字，不含「汉字数词 +（至多一个空格）+ `MEASURE` 表里的量词」，不含除 `\n` 外的控制字符与格式字符，不含块级 Markdown/HTML。**不**声称：模型写在单元前后的文字与单元一致（「编码投入达到〔领域「Business」投入：2 小时 0 分钟〕」能通过——矛盾可见但未被阻止，R1）；不声称模型无法表达数量（「近半」「翻倍」「seven」、不在表里的量词仍能漏过，R1）；行内链接 `[x](url)` 不在这里处理，由渲染端负责（R14）。
 - **比较并交换**：`base_body_sha256` = 触发时读到的正文摘要；新旧正文相同 → 不产提议（run 结果 `nothing`）。
 - **数字的时效**：数字冻结在提议生成时；人重新触发即可（R4）。
 
@@ -828,36 +852,42 @@ pub trait AiSink: Send + Sync {
         -> impl Future<Output = Result<(), SinkError>> + Send;
     /// 只写非产出的尝试
     fn record_call(&self, rec: AiCallRecord) -> impl Future<Output = Result<(), SinkError>> + Send;
+    /// 批量「挂起提议是否仍有效」：一个 BEGIN IMMEDIATE，每条一个 SAVEPOINT 试跑，最后整体 ROLLBACK
+    fn precheck(&self, cap: Capability, drafts: &[ProposalDraft]) -> impl Future<Output = Vec<bool>> + Send;
 }
 pub trait SettingsRead: Send + Sync {
     fn settings(&self) -> impl Future<Output = Result<AiSettings, ReadError>> + Send;
 }
-/// store 实现走独立的只读连接池（SqliteConnectOptions::read_only(true)）：写即报错
+/// store 实现走独立的读取器池：与写池同一目标的连接选项 + pragma("query_only","ON")：写即报错
 pub trait AiReadModel: SettingsRead {
     fn inbox(&self, limit: u32) -> impl Future<Output = Result<Vec<Task>, ReadError>> + Send;
     fn direction_candidates(&self, limit: u32) -> impl Future<Output = Result<Vec<DirectionCandidate>, ReadError>> + Send;
     fn title_history(&self, normalized: &str) -> impl Future<Output = Result<Vec<DirectionId>, ReadError>> + Send;
     fn review(&self, id: &str) -> impl Future<Output = Result<Option<Review>, ReadError>> + Send;
     fn week_tasks(&self, week_id: &WeekId) -> impl Future<Output = Result<Vec<Task>, ReadError>> + Send;
-    // T5.2.1/T5.3.1/T5.4.1 各自再加：still_valid_pending(cap)、weekly_draft(week)、done_titles(week)、
-    // previous_open_week(week)、rhythm_alloc()
+    // T5.3.1/T5.4.1 各自再加：weekly_draft(week)、done_titles(week)、previous_open_week(week)、rhythm_alloc()
+    // （「挂起提议是否仍有效」要试跑写，只能在 AiSink::precheck 上，不在这里）
 }
 ```
 
-`still_valid_pending` 需要「重跑提交前校验」，而试跑要写（再回滚）——只读池做不到。所以它不在 `AiReadModel` 上，而是 `AiSink` 的 store 实现内部在 `submit` 之前、由调用方经一个只返回布尔的方法 `AiSink::precheck(cap, &ProposalDraft) -> bool` 完成（同 `submit` 的第 1–3 步，最后 `ROLLBACK` 整个事务）。它不改变任何行，J8 覆盖。
+「挂起提议是否仍有效」要重跑提交前校验，而试跑要写（再回滚）——读取器池做不到，所以它只在 `AiSink::precheck` 上（批量，见 §11.4 公共「去重」），不在 `AiReadModel` 上。它不改变任何行，J8 覆盖。
+
+**读取器怎么建（v2.1 M1）**：`Sin90Store::ai_reader()` 用**与写池同一目标**的 `SqliteConnectOptions` 克隆加 `.pragma("query_only", "ON")` 建一个独立小池（2 连接 ⚖️）。`query_only` 对文件库与共享缓存内存库都拒写（`read_only(true)` 在共享缓存下挡不住，评审实测）。测试模式下 `Sin90Store::open_memory()` 改为按实例命名的共享缓存内存库 `file:sin90-<ULID>?mode=memory&cache=shared`（写池 1 连接），读取器连同一个名字，才能读到同一份数据；普通 `sqlite::memory:` 的第二个池会连到另一个空库。共享缓存是表级锁：读取器遇到另一任务未提交的写事务会等待（sqlx 的 unlock_notify）到其提交；同一任务在持有写事务时去读会自锁——ai run 不会这样做（sink 的方法都是自带事务的原子调用，run 不持有事务）。scratch `readonly.rs` 三条测试覆盖：文件 WAL 与共享缓存下「读得到、写即 `readonly` 错、写池照常写」，以及「读取器等另一任务提交后成功」。
 
 **依赖方向**：`ai/` 只 `use crate::core::*` 与 `crate::ai::*`；`store/ai_port.rs` 实现 `AiReadModel + AiSink`（store → `ai::ports`，后者只含 trait 与值类型）；`adapter_agent24/clients/model.rs` 实现 `ModelPort`；`http/` 组装三者、起后台 run、补发镜像事件。`ai/` 里的函数全部对三个 trait 泛型，**不出现具体类型**。
 
 **三层判据**：
 1. **syn 白名单结构测试** `ai_boundary`（J7，H2）：Sin90 加 dev-dependency `syn = { version = "2", features = ["full", "visit"] }`。测试遍历 `src/ai/**/*.rs`，按文件位置算模块深度（`ai/mod.rs` = 1，`ai/x.rs` = 2，内联 `mod` 再 +1），对每个文件 `check_source(src, depth)` 必须为 `Ok`（scratch `boundary.rs`）。规则：
    - 展开全部 use 树（分组、重命名、glob），访问所有表达式/类型/模式路径、宏路径，以及宏 token 流里的 `a::b` 链（`format!("{:?}", crate::store::X)` 也会被看见）；注释与字符串字面量由 syn 天然排除。
-   - 路径根是 `crate`/`sin90` → 第二段 ∈ {`core`, `ai`}；根是 `super` → 数出 `super` 个数 k，k 到达 crate 根时下一段 ∈ {`core`, `ai`}，超过 crate 根即拒；`self`/`Self` 放行。
+   - 路径根是 `crate`/`sin90` → 第二段 ∈ {`core`, `ai`}；根是 `super` → 数出 `super` 个数 k，k 到达 crate 根时下一段 ∈ {`core`, `ai`}，超过 crate 根即拒；根是 `self` 且后面跟 `super` → **先剥掉开头的 `self` 再按 `super` 规则判**（v2.1：`use self::super::super::store::…` 被拒）；其余 `self::…`/`Self::…` 在本模块内，放行。
+   - `std`/`core`/`alloc` 下的 `fs`、`process`、`net`、`os` 一律拒（v2.1 M5：ai 模块不直接碰文件、子进程、网络、平台接口，含 `std::os::unix::net`）。
    - use 路径的根只能是上面几种或外部 crate 白名单（`std core alloc serde serde_json thiserror tracing sha2 hex`）；带前导 `::` 的只能是外部 crate 白名单。
    - 非 use 的多段路径，根还可以是本文件的局部名（use 绑定的名字、本文件定义的条目、泛型参数）或 prelude/原始类型（`String::new`、`u32::MAX`）——这些名字本身已经过 use 检查或是本地定义。
    - `extern crate`、`#[path]`、`include!` 一律拒。
-   - 正对照 18 条（scratch `positive_controls_each_trip`），含评审的两种绕法：`use crate::{core::Sin90Op, http::Sin90State};` + `s.store.update_review_body(..)`；`let u = "http://x"; use crate::store::Sin90Store;`。
+   - **`#[cfg(test)]` 条目跳过检查**（v2.1 M4，写死）：属性**恰好**是 `#[cfg(test)]` 的条目（通常是 `mod tests`）不检查，单元测试可以用真实 store 建夹具；`#[cfg(any(test, …))]` 等其它 cfg 照常检查。备选「测试一律放 `tests/`」不采用——它会把 ai 内部私有函数的单元测试逼成公开接口。
+   - 正对照 29 条（scratch `positive_controls_each_trip`），含第 1 轮的两种绕法与第 2 轮的 `self::super::super::store`（use 与表达式）、`std::fs`/`std::process`/`std::net`/`std::os::unix::net`/`::std::fs`、`$crate::store`、`r#store`、`<crate::store::X as Clone>::clone`、`cfg(any(test, …))` 下的 store 引用；干净样例含 `self::super::ports`、`tracing::warn!`、`std::time`。第 1 轮的两种绕法：`use crate::{core::Sin90Op, http::Sin90State};` + `s.store.update_review_body(..)`；`let u = "http://x"; use crate::store::Sin90Store;`。
    白名单信任一个前提：`core` 与 `ai` 不再导出 store/http 的东西（`core` 零 I/O 依赖是 §5.2 的既有层规则）。
-2. **类型与连接层**：`ai/` 的一切写都只能经 `AiSink` 的方法；`AiReadModel` 的实现拿的是只读池，哪怕 store 侧有人在读路径里顺手调了 `attention_apply_new_events` 也会直接报错。
+2. **类型与连接层**：`ai/` 的一切写都只能经 `AiSink` 的方法；`AiReadModel` 的实现拿的是 `query_only` 读取器池，哪怕 store 侧有人在读路径里顺手调了 `attention_apply_new_events` 也会直接报错——文件模式与测试用的内存模式都成立（上文「读取器怎么建」）。
 3. **行为级表快照**（J8，M8）：在夹具库上用桩模型把三个能力各跑一遍，比较运行前后除以下**写死的三项**之外所有表的全部行，必须逐字节相同：`sin90_proposals`、`sin90_ai_calls`、`sin90_events WHERE entity = 'proposal'`。`sin90_attention_daily` / `sin90_attention_watermark` **不排除**：它们是派生投影，AI 读路径若去折叠它（读时写），J8 就应当变红——那是真回归。正对照：随后用人类 key accept 其中一条 → 快照必变。
 
 **为什么不拆 crate**：真正的编译期保证要把 `core` 与 `ai` 拆成独立 crate；今天 `core/store/http` 是一个 crate，拆分与 M5 无关，留给 TS.1.1 评估。v1 以「syn 白名单 + 只读池 + 行为快照」组合代替，并如实称为「结构测试」。
@@ -899,8 +929,8 @@ CREATE TABLE sin90_settings (
 | J4 | `ai_ladder_executive_gate` | `plan()` 在 `{LocalOnly, RemoteAllowed} × {开, 关} × {port 有, 无}` 八格上，`Model(Executive)` 只在 (RemoteAllowed, 开, 有) 出现 | 变异：删掉 `settings.executive_enabled` 条件 → 红 |
 | J5 | `ai_ladder_served_tier_decides_source` | 请求 executive、桩回 `tier: local` → store 推导 `source = local_brain`、`served_tier = local` | 桩回 `tier: remote`（开关开）→ `source = executive` |
 | J6 | `ai_ladder_privacy_tripwire` | 计划时开关开、回复前用户关掉、桩回 `tier: remote` → 该步 `ok=0 privacy_tripwire`、结果丢弃、降级 | 开关保持开 → 同一回复被采用 |
-| J7 | `ai_boundary` | `src/ai/**/*.rs` 每个文件 `check_source(src, depth)` 为 `Ok`；检查器自身的 18 条正对照全部触发、干净样例通过 | 变异：在 `src/ai/mod.rs` 加 `use crate::{core::Sin90Op, http::Sin90State};` → 红（PR body 记录） |
-| J8 | `ai_boundary_tables_unchanged` | §11.5 第 3 层：三个能力各跑一遍，排除写死的三项后逐字节不变（`sin90_attention_*` 在比较范围内） | 随后人类 accept 一条 → 快照变化被检出；变异：在 `AiReadModel::week_tasks` 实现里调 `attention_apply_new_events` → 只读池报错 / J8 红 |
+| J7 | `ai_boundary` | `src/ai/**/*.rs` 每个文件 `check_source(src, depth)` 为 `Ok`；检查器自身的 29 条正对照全部触发、干净样例通过；`#[cfg(test)] mod tests` 里引用 store 不触发，`#[cfg(any(test, …))]` 里引用 store 触发 | 变异：在 `src/ai/mod.rs` 加 `use crate::{core::Sin90Op, http::Sin90State};` → 红（PR body 记录） |
+| J8 | `ai_boundary_tables_unchanged` | §11.5 第 3 层：三个能力各跑一遍，排除写死的三项后逐字节不变（`sin90_attention_*` 在比较范围内） | 随后人类 accept 一条 → 快照变化被检出；变异：在 `AiReadModel::week_tasks` 实现里调 `attention_apply_new_events` → 读取器报 `readonly` 错 / J8 红——**测试跑在 `open_memory`（命名共享缓存）上，变异必须在该模式下触发**（v2.1 M1；scratch `readonly.rs` 证明 `query_only` 在该模式下拒写） |
 | J9 | `ai_calls_link_integrity` | 一次 run 的所有行 `run_id` 相同；每条 AI 提议恰好一行 `ok=1 AND proposal_id = 它`；`ok=0` 的行 `error_kind` 非空 | 注入 `submit` 在插调用行后失败 → 提议行也不存在（同事务） |
 | J10 | `model_client_` | (a) `complete` 走 `call_with_timeout(125s)`、不带 `request_id`；(b) `-32000 {kind: unavailable, retryable: false, cause: backend_config}` → `ClientError::Unavailable{false, BackendConfig}`；(c) cause 不在闭集 → `Other`；(d) `cancelled` → `Cancelled`；(e) 计数 18；(f) `usage` 映射到 `ModelReply` | (b) 正对照：`retryable: true, cause: no_provider` → 另一值且 `is_retryable()` 为真 |
 | J10b | `settings_ai_` | `PUT /settings/ai` 自动化 key → 403 且无事件；人类 key → 200、`setting.changed` 恰好 1 条；未知字段 → 400 | 缺行时 `GET` 返回 `false`（删掉缺省分支 → 红） |
@@ -922,9 +952,9 @@ CREATE TABLE sin90_settings (
 
 | # | 测试 | 断言 | 正对照 / 变异 |
 |---|---|---|---|
-| J17 | `summarize_numbers_come_from_draft` | 固定事件夹具 → 周草稿；桩叙述用 `{{fN}}`/`{{tN}}` → 提议正文包含 `render_facts(草稿)` 原文；正文的**每个数字串都出现在 `render_facts` 输出或代入的任务标题里**（L2） | 负对照：① `编码 99 小时` → 模型步 `bad_output`、提议来自 reflex（`source = rule`）、正文不含 `99`；② **标签错位**「编码投入达到{{f2}}」→ 不拒（前后文矛盾不在机制范围内，R1），断言 f2 的数值在正文里只出现在 `〔f2 的标签：值〕` 单元内、从不脱离自己的标签；③ **仿造数字块**「## 本周数字（修正）\n- …{{f2}}」→ 拒；④「完成任务{{f3}}小时」→ 拒；⑤ 行首 `##`/`-`/`>`/`|` 的叙述 → 渲染后没有任何行以块语法开头。变异：删掉 `check_literal` / 行首剥离 → 各自对应断言变红 |
+| J17 | `summarize_numbers_come_from_draft` | 固定事件夹具 → 周草稿；桩叙述用 `{{fN}}`/`{{tN}}` → 提议正文包含 `render_facts(草稿)` 原文；正文的**每个数字串都出现在 `render_facts` 输出或代入的任务标题里**（L2） | 负对照（每条都让模型步 `bad_output`、提议来自 reflex（`source = rule`），除非注明）：① `编码 99 小时`、全角 `９９`、`Ⅻ小时`、`&frac12;`；② **标签错位**「编码投入达到{{f2}}」→ 不拒（R1），断言 f2 的数值只出现在 `〔f2 的标签：值〕` 单元内；③ **仿造数字块**「## 本周数字（修正）…」、`本​周数字`（零宽）、`本　周数字`（全角空格）；④ **手写单元**「〔领域「Coding」投入：十八 小时〕」「〔…：翻倍〕，〔完成任务数：全部〕」「「Coding」很忙」；⑤ **量词绕过**「十八 小时」「十八​小时」「十八　小时」「拾捌小时」「{{f3}}小时」「{{f3}} 小时」「{{f3}}​小时」；⑥ **切行绕过**单独 `\r`、U+2028、U+2029；⑦ **占位键**`{{t+1}}`、`{{t01}}`、`{{ f1 }}`、`{{f99}}`；⑧ **标题注入**：标题含 `\r## 伪造标题`、`**加粗** [链接](…) <b>` 与 `〔假：十八小时〕` → 不拒，断言渲染结果单行、`#`/`*` 被转义、`<` 成全角、不含 `〔假`；⑨ 行首 `##`/`-`/`>`/`|`/`<h>` 的叙述 → 不拒，渲染后没有任何行以块语法或 `<` 开头。scratch `round2_bypasses_are_rejected`（25 条）+ `titles_are_sanitized_when_substituted` + `markdown_and_html_flattened`。变异：删掉 `RESERVED` 检查 / `normalize` / 控制字符检查 / `sanitize_inline` → 各自对应断言变红 |
 | J18 | `draft_review_body_validate_` / `_cas_` | D1–D7 各一正一反；挂起期间人类 `PATCH` 正文 → accept 422 `StaleBase`、正文仍是人写的 | 无人改 → accept 200、正文 == 提议正文、`review.updated` 恰好 1 条、payload 形状与人类路径相同 |
-| J19 | `summarize_preconditions` | finalized → 409；daily → 400；正文含人写文字 → 不产提议、run 结果 `skipped: human_text`；定稿后再 accept 旧提议 → 422 `ReviewNotDraft` | 正文为空或只有数字块 → 产出提议 |
+| J19 | `summarize_preconditions` | finalized → 409；daily → 400；正文含人写文字（含「数字块下多一行」、旧周数字块）→ 不产提议、run 结果 `skipped: human_text`；定稿后再 accept 旧提议 → 422 `ReviewNotDraft` | 正文为空、或与 `render_facts(当前草稿)` 逐字相等 → 产出提议 |
 
 **T5.4.1 propose**
 
@@ -932,6 +962,7 @@ CREATE TABLE sin90_settings (
 |---|---|---|---|
 | J20 | `propose_proposals_submit_and_apply` | P(active) + W(planning) 夹具 → 至多 3 条提议，全部通过提交前校验；逐条人类 accept 成功；`CreateTasks` 与 `CarryOverTask` 产生的 `task.created` payload 含 `direction_id` | 把 P 转成 reviewing 后再触发 → 无 carry 提议 |
 | J21 | `propose_invalid_rejected_at_submit` | 构造 `[ReorderTasks(W, [W 的真实任务, 不存在的任务])]` → `AiSink::submit` 返回 `SinkError::Invalid`；**库逐字节不变**（无提议行、无调用 `ok=1` 行、无事件、`sort_key` 未变）。同样断言：顺延一个已被顺延过的任务（撞 `idx_sin90_task_carried`）→ submit 拒 | 去掉不存在的任务 → submit 成功、仅新增提议行 + 事件行 + 调用行、`sort_key` 仍未变（试跑已回滚） |
+| J21b | `apply_op_has_no_non_db_side_effects` | 结构断言：用 syn 解析 `src/store/repo.rs` 中 `apply_op` 的函数体（与它调用的本文件辅助函数），所有路径的根都在白名单内——`sqlx`、`serde_json`、`crate::core` 类型、本文件的 `append_event`/`read_*`/`require_*`/`allocate_*`/`to_wire`/`from_wire`/`now_iso8601`/`ulid`；出现 `std::fs`、`tokio::fs`、`write_markdown_atomic`、任何 `adapter_agent24`/`http` 路径或 `emit` 即失败（写 `sin90_outbox` 行是数据库写，允许）；另一条行为断言：在临时 `data_dir` 下对每种 Op 调一次 `submit`（只试跑），目录内容前后一致 | 变异：在 `apply_op` 某分支里加一行 `std::fs::write` → 两条都红 |
 | J22 | `ai_allowed_ops_per_capability` | 以 propose 身份提交含 `AssignTaskDirection` 的草稿 → `SinkError::Invalid`，无行；三个能力的允许集各一正一反 | 变异：`allowed_ops` 返回全集 → 红 |
 
 **T5.5.1 真实挂载**
@@ -942,17 +973,18 @@ CREATE TABLE sin90_settings (
 | J23b | 编译期常量与随包 manifest 一致 | 每个被安装的包：`bin/sin90 print-model-access` 的输出 == 解析已安装 `domain-os.yml` 的 `model_access`（缺省按 `local_only`） | 用包 B 的二进制配包 A 的 yml → 断言失败 |
 | J24 | 来源一致 | `SELECT count(*) FROM sin90_proposals p JOIN sin90_ai_calls c ON c.proposal_id = p.id AND c.ok = 1 WHERE p.source NOT IN ('local_brain','executive','rule') OR p.source != CASE WHEN c.engine = 'reflex' THEN 'rule' WHEN c.served_tier = 'remote' THEN 'executive' ELSE 'local_brain' END` = 0，且 AI run 期间产生的每条提议都能 join 到恰好一行 | 在库的副本里改掉一行 `source` → 同一查询 = 1 |
 | J25 | AI 期间无直写 | 挂载模式经 daemon 真实端口触发三个能力，跑 J8 的表快照 | accept 正对照。注：tasks.md 原句「直写路由调用数 0」在进程内 AI 下恒真，不构成判据，故以表快照代替 |
-| J26 | 真 oMLX 冒烟 | `#[ignore]` 手动：`~/.omlx/models` 下的模型，三个能力各一次，记录 `model_id`、延迟、`bad_output` 率、classify 各置信度档的命中情况（给 Q8 定阈值） | —— |
+| J26 | 真 oMLX 冒烟 | `#[ignore]` 手动：`~/.omlx/models` 下的模型，三个能力各一次，记录 `model_id`、延迟、`bad_output` 率**及其按 `NarrativeError` 分类的构成**（尤其「汉字数词 + 量词」误杀引起的降级比例，v2.1 M3）、classify 各置信度档的命中情况（给 Q8 定阈值） | —— |
 
 ### 11.8 自审
 
 - **两个 Op 的范围是否过窄**：`AssignTaskDirection` 只收 inbox、`DraftReviewBody` 只收 draft——故意的；放宽以「加 CAS 字段」的方式做（§2 #17 复审触发条件）。
 - **`ValidationCtx` 又加宽了**：推翻了 §3.3「唯一一次」；T5.2.1 一次加齐。
 - **提交前校验只给 AI 路径**（F-2 / R7）：不对称，但改 HTTP 路径会改变已测行为。v2 的试跑让 AI 路径的提交前校验与 accept **同一份代码**，而不是另写一个「近似校验」。
+- **v2.1 的叙述复核是否又开了新口子**：规范化只删 Cf、压空白，不做 NFKC（NFKC 会把全角数字变半角——那本来就被 `is_numeric` 拒了，不需要；但也意味着兼容字符组合不被折叠，列入 Codex 补审）；`〔〕「」` 禁用让「手写单元」整类消失，而不是逐个补内容规则。
 - **试跑的代价**：每次 `submit` 在写锁下多执行一遍 `apply_op`；三个能力的提议都是个位数 op，代价可忽略；它换来的是 J21 从「两可」变成确定。
 - **「executive」被如实降格，且正式包里不可达**：§11.3.2 写明原因（内核只按 manifest 管隐私），没有把用户开关写成隐私保证。
 - **数字保证的措辞**：§11.4.2 末尾只声称机制做得到的部分，并点名了「单元前后文可以矛盾」这一条没挡住。
-- **判据是否会空转**：J3 穷尽 `match`；J7 带 18 条正对照；J8/J25 有 accept 正对照且排除清单写死；J13 用「被调用即 panic」的桩；J21 断言库逐字节不变；J23 断言 `engine='executive'` 行存在；J23b 反配二进制与 yml；J24 在篡改副本上变红。
+- **判据是否会空转**：J3 穷尽 `match`；J7 带 29 条正对照；J8/J25 有 accept 正对照且排除清单写死；J13 用「被调用即 panic」的桩；J21 断言库逐字节不变；J23 断言 `engine='executive'` 行存在；J23b 反配二进制与 yml；J24 在篡改副本上变红。
 - **scratch 覆盖了什么**：两个 Op 的 wire 形状与校验矩阵（含批内叠加）；梯的计划、三种动作、熔断、预算、绊线（含途中关开关）、来源映射、产出行随 `Outcome` 返回；run future 的 `Send`；classify 的 schema 与复核；summarize 的原子单元、行首剥离、各负对照与 J17 数字串判法；syn 白名单检查器；sqlx SAVEPOINT 试跑。**没覆盖**：真实 `build_snapshot`/`apply_op` 的 SQL、HTTP 路由、adapter 的 `ClientError` 扩展、只读连接池——要改真实 crate，属于实现。
 
 ### 11.9 残余风险（接受，写明谁来盯）
@@ -960,7 +992,7 @@ CREATE TABLE sin90_settings (
 | # | 风险 | 为什么接受 / 缓解 |
 |---|---|---|
 | R1 | 叙述的**前后文**可与数值单元矛盾（「编码投入达到〔领域「Business」投入：…〕」）；不在 `MEASURE` 表里的数量表达（「近半」「翻倍」「seven」「十来个人」）能漏过 | 数值本身永远带正确标签出现，矛盾对读者可见；数字块由程序生成是硬保证。J26 冒烟里人工看叙述 |
-| R2 | syn 白名单假设 `core`/`ai` 不再导出 store/http 的东西；宏展开后的代码不可见（只扫 token 里的 `a::b` 链） | `core` 零 I/O 是 §5.2 既有层规则；J8/J25 行为快照兜底；编译期保证要拆 crate（TS.1.1 评估） |
+| R2 | syn 白名单的已知盲区：`core`/`ai` 若再导出 store/http 的东西；宏展开后的代码不可见（只扫 token 里的 `a::b` 链），`macro_rules!` 用 `$a:tt`/`$m:ident` 把路径拆开拼接看不出来；本地定义一个同名 `fn sqlx` 后 `sqlx::…` 会被当成局部名放行；字符串形式的路径（`#[serde(deserialize_with = "crate::store::…")]`）不是语法路径，看不到 | `core` 零 I/O 是 §5.2 既有层规则；J8/J25 行为快照与只读读取器兜底（任何真写都会被发现）；编译期保证要拆 crate（TS.1.1 评估）；列入 Codex 补审重点 |
 | R3 | 测试包 B 的 `local` 调用在本地不可用时会被内核送到远端 | 只存在于测试包；正式包不声明 `remote_allowed`（J10c 钉住）。Agent24 侧「逐次只能收窄」followup 由统筹登记 |
 | R4 | summarize 的数字在提议挂起期间变旧 | 人重新触发；v1 不在 accept 时重算 |
 | R5 | 没有拒绝路由，过期提议永久 `pending` | 去重只看「仍有效」的挂起提议；拒绝路由见 🟡 Q6 |
@@ -972,19 +1004,21 @@ CREATE TABLE sin90_settings (
 | R11 | run 状态只在内存 | 调用记录与提议持久；run 只是观察窗口 |
 | R12 | 候选截断（40 个 Direction、50 个标题）可能漏掉正确答案 | ⚖️ 值 |
 | R13 | 延后（Busy/RateLimited）后本 run 剩余条目都不处理，用户要再点一次 | 有意：弱规则不替代模型；`GET /ai/runs/{id}` 列出 `deferred` 条目 |
+| R14 | 叙述与任务标题里的**行内**链接 `[x](javascript:…)`、自动链接不在 `fill_narrative` 里处理（任务标题里的 `[]()` 已被转义，模型叙述里的不转义） | 渲染端契约：任何渲染复盘正文的前端（Pet0、Web UI）必须用禁 raw HTML、只放行 `http`/`https` 链接的安全 Markdown 渲染；Sin90 的 `.md` 导出是纯文本文件，不执行 |
+| R15 | 「汉字数词 + 量词」规则误杀日常写法（「这一周」「一个」「一次」） | 提示词明示改写法；J26 统计误杀引起的降级比例，比例过高时再收窄规则（例如只对 `小时/分钟/%/倍` 生效） |
 
 ### 11.10 交给实现的接口清单（按 T5.x）
 
 **T5.1.1 引擎梯 + 调用记录**
 - `src/ai/mod.rs`、`src/ai/ports.rs`：`Capability`、`Engine`、`ServedTier`、`ModelAccess`、`AiSettings`、`Complexity`、`ModelRequest`、`ModelReply`（含 usage）、`UnavailableCause`、`ModelFailure{…}::action()/kind_str()/opens_circuit()`、`LadderAction{Degrade, Defer, Abort}`、`ModelPort`、`ProposalDraft`、`AiSink{submit(cap, draft, rec), record_call, precheck}`、`SettingsRead`、`AiReadModel`（首批方法）、`AiCallRecord`、`SinkError`、`ReadError`。
 - `src/ai/ladder.rs`：`plan()`、`RunState`、`MAX_MODEL_CALLS_PER_RUN`、`RUN_DEADLINE_SECS`、`run_item()`、`source_for()`、`tripwire()`、`Outcome{Produced{value, engine, rec}, Nothing, Deferred, Aborted}`。
-- `src/store/ai_port.rs`：`impl AiReadModel for AiReader`（独立只读池）、`impl AiSink for Sin90Store`（allowed_ops → validate → SAVEPOINT 试跑 `apply_op` → ROLLBACK TO → 推导 source → 插提议/事件/调用行，一个 `BEGIN IMMEDIATE`）。
+- `src/store/ai_port.rs`：`impl AiReadModel for AiReader`（`Sin90Store::ai_reader()`：同目标连接选项 + `pragma("query_only","ON")`；`open_memory()` 改为按实例命名的共享缓存内存库）、`AiSink::precheck`（批量，一个事务、每条一个 SAVEPOINT、整体 ROLLBACK）、`impl AiSink for Sin90Store`（allowed_ops → validate → SAVEPOINT 试跑 `apply_op` → ROLLBACK TO → 推导 source → 插提议/事件/调用行，一个 `BEGIN IMMEDIATE`）。
 - 迁移（max+1）：§11.6。
 - `src/adapter_agent24/clients/model.rs`：`ModelClient::new(&Arc<KernelClients>) -> Option<Self>`（前缀 `_a24/model/`）、`complete(&ModelRequest) -> Result<ModelReply, ClientError>`（`call_with_timeout(125s)`，不带 `request_id`）、`impl ModelPort for ModelClient`；`clients/error.rs`：`Unavailable{retryable, cause}`、`Cancelled`，`map_rpc_error`、两个谓词、计数测试 17 → 18。
 - `domain-os.yml`：`kernel_capabilities` 加 `models`；新文件 `domain-os.remote-allowed.yml`（仅测试包 B）；cargo feature `remote-allowed-manifest`；`const MODEL_ACCESS`（`include_str!` 解析）；子命令 `sin90 print-model-access`。
 - HTTP：`GET|PUT /settings/ai`、`GET /ai/runs/{run_id}`；run 注册表（内存 LRU 64）；每能力单飞；进程内模型信号量 2；`submit` 成功后补发 `proposal.submitted`。
 - dev-dependency：`syn = { version = "2", features = ["full", "visit"] }`、`proc-macro2`。
-- 测试：J1–J10c。
+- 测试：J1–J10c；`ai_boundary` 检查器（含 `self` 剥离、`STD_DENY`、`#[cfg(test)]` 跳过）。
 
 **T5.2.1 classify**
 - `Sin90Op::AssignTaskDirection`；给 `Sin90Op` 加 `#[serde(deny_unknown_fields)]`（F-1）。
@@ -996,13 +1030,14 @@ CREATE TABLE sin90_settings (
 
 **T5.3.1 summarize**（依赖 T4.3.1 的周草稿函数）
 - `Sin90Op::DraftReviewBody`、`MAX_REVIEW_BODY_BYTES`、`body_sha256`；`apply_op` 分支（`review.updated`，payload 同人类路径）。
-- `src/ai/summarize.rs`：`Fact`、`facts`、`render_unit`、`render_facts`、`fill_narrative(narr, facts, titles)`、`compose_body`、`is_program_only`、`digit_runs`、`MEASURE`；`AiReadModel::{review, weekly_draft, done_titles}`。
+- `src/ai/summarize.rs`：`Fact`、`facts`、`render_unit`、`render_facts`、`is_forbidden_control`、`is_format_char`（Cf 码位表）、`normalize`、`sanitize_inline`、`fill_narrative(narr, facts, titles)`、`compose_body`、`is_program_only(body, current_facts_md)`、`digit_runs`、`MEASURE`；`AiReadModel::{review, weekly_draft, done_titles}`。
 - `POST /ai/summarize`。测试 J17–J19。
 - 给 T4.3.1：按 Direction/Area 统计完成任务时按 §11.2.1 的三步规则取归属。
 
 **T5.4.1 propose**
 - `src/ai/propose.rs`：reflex 排序与顺延规则、模型 schema 与复核（排列补全、键集）；`AiReadModel::{week_tasks, previous_open_week, rhythm_alloc}`。
 - `repo.rs` `CreateTasks`、`CarryOverTask` 分支的 `task.created` payload 加 `direction_id`（只加字段）。
+- J21b（`apply_op` 无非数据库副作用）随 T5.4.1 落地——propose 是第一个依赖试跑拦截关系约束的能力。
 - `POST /ai/propose`。测试 J20–J22。
 
 **T5.5.1 验收**
@@ -1030,48 +1065,49 @@ CREATE TABLE sin90_settings (
 
 ### 11.12 附录：scratch crate 与 `cargo` 记录
 
-路径：`/private/tmp/claude-502/-Users-jason-Dev-auraai-Agent24/977deb42-1aba-448f-95e7-5bae2dee6fd4/scratchpad/t501-check/`（`sin90 = { path = "<本 worktree>" }`，另依赖 `serde`/`serde_json`/`sha2`/`hex`/`thiserror`/`tokio`/`syn`/`proc-macro2`/`sqlx`；target 在 crate 自己目录下）。模块：`ops.rs`（§11.2 wire + F-1）、`ctx.rs`（§11.2.3 校验矩阵与叠加）、`ports.rs`（§11.3/§11.5 端口、梯、三种动作、熔断、预算、绊线、来源推导）、`classify.rs`、`summarize.rs`（原子单元与负对照）、`boundary.rs`（syn 白名单）、`dryrun.rs`（SAVEPOINT 试跑）。评审的 `review-probe` crate 依赖 v1 的 `fill_narrative(narr, facts)` 两参签名，v2 改为三参（加任务标题），需要随之更新。
+路径：`/private/tmp/claude-502/-Users-jason-Dev-auraai-Agent24/977deb42-1aba-448f-95e7-5bae2dee6fd4/scratchpad/t501-check/`（`sin90 = { path = "<本 worktree>" }`，另依赖 `serde`/`serde_json`/`sha2`/`hex`/`thiserror`/`tokio`/`syn`/`proc-macro2`/`sqlx`；target 在 crate 自己目录下）。模块：`ops.rs`（§11.2 wire + F-1）、`ctx.rs`（§11.2.3 校验矩阵与叠加）、`ports.rs`（§11.3/§11.5 端口、梯、三种动作、熔断、预算、绊线、来源推导、批量 `precheck`）、`classify.rs`、`summarize.rs`（规范化、原子单元、标题清理、第 2 轮全部绕过的负对照）、`boundary.rs`（syn 白名单，含 `self` 剥离、`STD_DENY`、`cfg(test)` 跳过）、`dryrun.rs`（SAVEPOINT 试跑）、`readonly.rs`（`query_only` 读取器在文件 WAL 与命名共享缓存下的行为）。v2.1 改动的对外签名：`is_program_only(body, current_facts_md)` 由一参变两参、`AiSink::precheck` 改为批量——评审的 `review-probe`（v1 签名）与 `review2-probe` 中用到这两处的探针需要随之更新。
 
 ```
-$ cargo clippy --all-targets   # 无 warning
-$ cargo check --all-targets
-Checking t501-check v0.0.0 (…/scratchpad/t501-check)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.50s
+$ cargo clippy --all-targets   # 0 warning
 $ cargo test
 test classify::tests::normalize ... ok
-test ctx::tests::overlay_sees_an_earlier_close_in_the_batch ... ok
-test ctx::tests::assign_positive_and_negative ... ok
 test ctx::tests::overlay_second_assign_of_same_task_rejected ... ok
-test classify::tests::schema_enum_lists_keys_plus_none ... ok
+test ctx::tests::assign_positive_and_negative ... ok
+test ctx::tests::overlay_sees_an_earlier_close_in_the_batch ... ok
 test classify::tests::parse_accepts_known_key_and_rejects_invented_one ... ok
-test ops::tests::sha_of_empty_body_is_the_well_known_constant ... ok
+test classify::tests::schema_enum_lists_keys_plus_none ... ok
+test boundary::tests::cfg_test_items_are_skipped_exactly ... ok
 test ctx::tests::draft_body_cas_chain_and_rejections ... ok
 test ops::tests::existing_sin90op_silently_accepts_unknown_fields ... ok
 test ops::tests::new_ops_reject_unknown_fields ... ok
+test boundary::tests::clean_source_passes ... ok
+test ops::tests::sha_of_empty_body_is_the_well_known_constant ... ok
 test ops::tests::wire_shape_round_trips ... ok
 test ports::tests::bad_output_degrades ... ok
-test ports::tests::call_budget_defers ... ok
 test ports::tests::busy_defers_item_and_rest_of_run_without_r2 ... ok
-test ports::tests::executive_request_served_locally_is_local_brain ... ok
+test boundary::tests::positive_controls_each_trip ... ok
+test ports::tests::circuit_breaker_skips_engine_for_rest_of_run ... ok
+test ports::tests::call_budget_defers ... ok
 test ports::tests::connection_lost_and_generation_ending_abort ... ok
 test ports::tests::failure_table_is_exhaustive ... ok
-test ports::tests::circuit_breaker_skips_engine_for_rest_of_run ... ok
-test ports::tests::plan_shapes ... ok
 test ports::tests::local_unavailable_degrades_to_reflex_and_row_is_atomic_with_proposal ... ok
+test ports::tests::executive_request_served_locally_is_local_brain ... ok
+test ports::tests::plan_shapes ... ok
 test ports::tests::remote_down_local_up_is_local_brain ... ok
 test ports::tests::switch_turned_off_mid_run_trips_remote_reply ... ok
-test summarize::tests::literal_numbers_are_rejected_positive_control ... ok
-test summarize::tests::facts_come_from_the_draft_verbatim ... ok
-test summarize::tests::a_value_never_appears_without_its_own_label ... ok
-test summarize::tests::every_digit_in_body_comes_from_facts_or_titles ... ok
-test summarize::tests::program_only_detection ... ok
-test summarize::tests::forged_facts_block_rejected_and_markdown_flattened ... ok
-test summarize::tests::measure_after_unit_rejected ... ok
-test summarize::tests::title_placeholder_renders_program_title ... ok
 test ports::tests::run_item_future_is_send ... ok
-test boundary::tests::clean_source_passes ... ok
-test boundary::tests::positive_controls_each_trip ... ok
-test dryrun::tests::invalid_reorder_rejected_at_submit_and_nothing_written ... ok
+test summarize::tests::a_value_never_appears_without_its_own_label ... ok
+test summarize::tests::facts_come_from_the_draft_verbatim ... ok
+test summarize::tests::every_digit_in_body_comes_from_facts_or_titles ... ok
+test summarize::tests::markdown_and_html_flattened ... ok
+test summarize::tests::known_false_positives_are_what_m3_says ... ok
+test summarize::tests::program_only_is_exact_match_with_current_block ... ok
+test summarize::tests::titles_are_sanitized_when_substituted ... ok
+test summarize::tests::round2_bypasses_are_rejected ... ok
+test readonly::tests::memory_shared_cache_query_only ... ok
 test dryrun::tests::valid_reorder_inserts_pending_but_dry_run_leaves_no_trace ... ok
-test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test dryrun::tests::invalid_reorder_rejected_at_submit_and_nothing_written ... ok
+test readonly::tests::file_wal_query_only ... ok
+test readonly::tests::memory_reader_waits_for_other_tasks_dirty_tx_then_succeeds ... ok
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
 ```
