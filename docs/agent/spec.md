@@ -14,9 +14,9 @@ status TEXT NOT NULL CHECK(status IN ('active','paused','retired')), created_at 
 
 **cron 规则**：5 段；**星期字段只接受 `*` 与英文缩写（MON..SUN 及范围/列表），拒绝数字** —— Sin90 与内核共用的 cron 0.15 以 1=周日，与 POSIX（0/7=周日、1=周一）不同，数字会静默错一天；名字在两种语义下都无歧义。**日字段与星期字段不能同时非 `*`**：cron 0.15 对两者取 AND（`schedule.rs:117-125`），POSIX 取 OR，`0 7 1 * MON` 两边含义不同。`cron`/`chrono-tz` 版本与 Agent24 `agent24-scheduler` 精确同步。
 
-**迁移编号不预分配、不留空洞**：谁先写谁取当前 max+1；并行分支后合并的一方 rebase 时顺延（sqlx 按版本顺序应用，空洞会让后补的低号迁移乱序跑在已升级的用户库上）。有一条测试钉住编号连续。已用：0004 routines（T3.1.1）、0005 outbox_failed（T3.3.1）。事件：`routine.created|updated|paused|resumed|retired|fired`。
+**迁移编号不预分配、不留空洞**：谁先写谁取当前 max+1；并行分支后合并的一方 rebase 时顺延（sqlx 按版本顺序应用，空洞会让后补的低号迁移乱序跑在已升级的用户库上）。有一条测试钉住编号连续。已用：0004 routines（T3.1.1）、0005 outbox_failed（T3.3.1）、0006 routine_fires（T3.2.2）。事件：`routine.created|updated|paused|resumed|retired|fired`。
 
-**`sin90_routine_fires`**：`fire_id TEXT PK, routine_id TEXT NOT NULL FK, scheduled_for TEXT NOT NULL, received_at TEXT NOT NULL`。
+**`sin90_routine_fires`**（迁移 0006）：`fire_id TEXT PK, routine_id TEXT NOT NULL FK, scheduled_for TEXT NOT NULL, trigger TEXT NOT NULL CHECK(trigger IN ('tick','run_now')), received_at TEXT NOT NULL`（`trigger` 对齐内核 fired body，Agent24 设计 ME4-S1 §5.3）。
 
 **outbox**（表已存在：`id, kind, dedup_key, desired JSON, status pending|done, created_at, done_at`；**T3.3.1 迁移后**状态为 `pending|done|failed`，并加 `failure_kind, last_error, attempts, next_attempt_at`）：
 - `kind = scheduler.upsert | scheduler.delete | memory.remember`；`dedup_key` 同值只保留一条 pending（新期望覆盖）。
