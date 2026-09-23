@@ -264,6 +264,16 @@ pub struct ScheduleBlock {
 /// `week_id` is kept (unchanged column, still nullable) for wire/schema
 /// back-compat, but new code never sets it — `period` is now the sole
 /// identity axis.
+///
+/// New field (T4.2.1, design §2 #11/§4.2, migration 0008): `body_ref` is the
+/// ONE-WAY Markdown export path, RELATIVE TO `data_dir`
+/// (`reviews/<kind>/<period>.md`), written atomically by
+/// `store::repo::finalize_review` the moment a Review turns `finalized` — a
+/// `draft` Review always has `body_ref: None` (nothing exported yet). SQLite
+/// stays the source of truth: `body_ref` is a pointer for humans/tools that
+/// want the plain-text file, never a second place the API reads from — every
+/// read (`GET /reviews`, `GET /reviews/{id}`) answers from `body`, and a
+/// hand-edited `.md` file is never reflected back into this struct.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Review {
     pub id: ReviewId,
@@ -272,6 +282,7 @@ pub struct Review {
     pub week_id: Option<WeekId>,
     pub period: String,
     pub body: String,
+    pub body_ref: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

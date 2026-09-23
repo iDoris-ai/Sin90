@@ -133,7 +133,7 @@ manifest 的 `impl_kind: out_of_process_provider` 必须**同时**带 `spawn: {c
 | 8 | Rhythm 细分 `ReviewCycle` | **拒绝** | 复盘周期 = `Routine{kind: review}` + 已有的 `Review` 实体。第三个对象没有新增表达力。 |
 | 9 | Rhythm 细分 `Reminder` | **拒绝** | 提醒是内核 `agent24-scheduler` 的职责。Sin90 只在 `Routine` 上声明触发规则（cron 表达式），经 `sin90_outbox` 幂等对账落到内核。自建 Reminder 实体 = 重写内核已有的调度器。 |
 | 10 | Proposal 语义收紧（AI 不直接改状态） | **已满足（但有一处名不副实，见下）** | `sin90_proposals` + CAS 幂等 + 纯函数 validate + 单事务 apply 全都在。语义不改，只随新实体扩 `Sin90Op` 变体。 |
-| 11 | Hybrid SQLite/Markdown 存储 | **改造** | 采纳"SQLite 是 operational source of truth"，但收紧 Markdown 的角色：**单向、由行持有指针**（`reviews.body_ref` 指向文件），不做双写、不做双向同步。双向同步是这类系统最大的坑，且没有任何一条 M0-M4 的需求要它。M0 不引入 Markdown。 |
+| 11 | Hybrid SQLite/Markdown 存储 | **改造 → T4.2.1 已实现** | 采纳"SQLite 是 operational source of truth"，但收紧 Markdown 的角色：**单向、由行持有指针**（`reviews.body_ref` 指向文件），不做双写、不做双向同步。双向同步是这类系统最大的坑，且没有任何一条 M0-M4 的需求要它。M0 不引入 Markdown。`body_ref` 是**相对 `data_dir` 的路径**（`reviews/<kind>/<period>.md`，见 §4.2），`POST /reviews/{id}/finalize` 时原子写（同目录临时文件 + fsync + rename），先写文件、后提交 DB 事务；`GET /reviews*` 永远读 `body` 列，从不读文件（迁移 `0008_review_body_ref.sql`）。 |
 | 12 | 补 Event Log 抽象 | **已满足** | `sin90_events` append-only + 自包含 payload + 水位保证增量==全量重建，且有测试。**硬约束延续**：新增的 Area/Routine 必须同样产事件，重构不得退化成只存快照。 |
 | 13 | Domain Logic 不 import Agent24，只有 adapter 知道 | **采纳原则，改造形态** | 见 §4——物理分模块采纳；"standalone 与 Agent24 双轨部署"**拒绝**，它与 T11 验收标准打架。 |
 | 14 | M0-M11 里程碑表 | **改造** | GPT 的 M0（"数据模型+SQLite+Event"）内核早就有了，照它排会先把已有能力退化再补回来。重排见 §5。 |
@@ -216,7 +216,7 @@ CreateTask   { title, direction_id?, parent_task_id?, kind?, energy?, est_minute
 | `sin90_events` | `entity` 值域扩 `area` / `routine`；schema 不变 | 值域扩展 |
 | `sin90_outbox`（T3.3.1） | `status` 值域扩 `pending\|done\|failed`（无 CHECK，代码约束）；+ `failure_kind TEXT NULL`、`last_error TEXT NULL`、`attempts INTEGER NOT NULL DEFAULT 0`、`next_attempt_at TEXT NULL` | 加列 |
 | `sin90_routine_fires`（T3.2.2） | `fire_id PK, routine_id FK, scheduled_for, trigger CHECK(tick\|run_now), received_at` —— 按 `fire_id` 去重内核的至少一次 fired 投递 | **新** |
-| `sin90_reviews`（T4.1.1） | + `period TEXT NOT NULL`（`daily=YYYY-MM-DD` / `weekly=YYYY-Www` / `rhythm=<rhythm_id>`），+ `UNIQUE(kind, period)`（`sin90_reviews_kind_period_uq`）；`week_id` 列保留（旧列不删）但新代码不再写它——`period` 取代它成为 Review 的唯一身份轴。`body_ref` 不在本条范围（T4.2.1）。迁移 `0007_review_period.sql`：本表在此之前从未被任何代码写入过（无 `INSERT INTO sin90_reviews`），所以回填在实际存量库上不可达；仍防御性实现——有 `week_id` 且指向真实 Week 的行回填该周 `iso_week`，其余回填 `'legacy-' || id`（`id` 是主键，不会与唯一约束冲突）。 | 加列 |
+| `sin90_reviews`（T4.1.1 + T4.2.1） | + `period TEXT NOT NULL`（`daily=YYYY-MM-DD` / `weekly=YYYY-Www` / `rhythm=<rhythm_id>`），+ `UNIQUE(kind, period)`（`sin90_reviews_kind_period_uq`）；`week_id` 列保留（旧列不删）但新代码不再写它——`period` 取代它成为 Review 的唯一身份轴。迁移 `0007_review_period.sql`：本表在此之前从未被任何代码写入过（无 `INSERT INTO sin90_reviews`），所以回填在实际存量库上不可达；仍防御性实现——有 `week_id` 且指向真实 Week 的行回填该周 `iso_week`，其余回填 `'legacy-' || id`（`id` 是主键，不会与唯一约束冲突）。+ `body_ref TEXT NULL`（T4.2.1，迁移 `0008_review_body_ref.sql`，纯 `ALTER TABLE ... ADD COLUMN`，既有行读回 `NULL`）——定稿（`draft → finalized`）时写入，值是**相对 `data_dir` 的路径** `reviews/<kind>/<period>.md`（见 §4.2）；草稿始终 `NULL`。 | 加列 |
 | 其余 7 张 | 不变 | 旧 |
 
 **不做的事**：不重建表、不改现有列类型、不动 `sin90_attention_*` 的水位语义。用户的 `sin90.db` 靠迁移升级，不靠重建（Agent24 §4.3 既有硬约束）。
@@ -225,7 +225,8 @@ CreateTask   { title, direction_id?, parent_task_id?, kind?, energy?, est_minute
 
 | 用途 | 落法 |
 |---|---|
-| 复盘正文、年度总结、人生原则、研究笔记、AI Report | `~/.agent24/os/sin90/notes/<yyyy>/<id>.md`，由 `sin90_reviews.body_ref` 单向指向 |
+| 复盘正文（T4.2.1 已实现） | `<data_dir>/reviews/<kind>/<period>.md`（`data_dir` = `sin90.db` 所在目录，standalone `--data-dir` 与挂载模式的 `A24_DATA_DIR` 都一样），`sin90_reviews.body_ref` 存**相对 `data_dir` 的路径**（即 `reviews/<kind>/<period>.md`），单向指向，只在 `finalize` 时写一次；旧的 `~/.agent24/os/sin90/notes/<yyyy>/<id>.md` 路径是本节早期草稿，未落地，以此表为准。 |
+| 年度总结、人生原则、研究笔记、AI Report | 尚未设计（M4 之后），路径与落法留待各自的 task 定稿时再补 |
 | 结构化数据（Area/Direction/Task/…） | **永不落 Markdown** |
 
 规则三条：
