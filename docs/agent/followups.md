@@ -10,6 +10,8 @@
 
 - [ ] SFU-7（B）SIGTERM 与 on_fatal 统一成一条优雅关闭路径 —— T3.2.0 第 2 轮评审 N-M5 · 现状：on_fatal 直接 `exit(70)`、SIGTERM 也无优雅处理；进行中的 HTTP 请求被重置（已提交但未响应的非幂等 POST 可能被客户端重试）、已提交事务对应的镜像事件丢失（SQLite 原子性不受影响）。做法：on_fatal 与 SIGTERM 都只触发一个 CancellationToken，`axum::serve(...).with_graceful_shutdown` 排空 ≤2s 再退出（< 内核 EXIT_SETTLE 100ms + STOP_GRACE 3s）。判据：排空期间在途请求完成；超时后仍退出
 
+- [ ] SFU-8（B，需用户定）周复盘草稿的 `routines[].completed` 恒为 0 —— T4.3.1 · ScheduleBlock 没有 routine 关联，`routine.fired` 事件也不带 block/task 引用，事件回放无法把完成的 block 归到某个 Routine。需要决定关联方式（例如 fired 时自动建一个带 `routine_id` 的 ScheduleBlock，或 block 创建时可选 `routine_id`，均为数据模型改动，先进 DESIGN §2）。判据：完成一个由 Routine 产生的 block → 草稿 completed +1；正对照：普通 block 不计入
+
 ## T0.4 Codex 补审
 
 （T0.4 执行时逐 commit 记录：结论 / 修复 PR / 转 followup）
