@@ -255,6 +255,91 @@ fn iso_weeks_in_year(year: u32) -> u32 {
     }
 }
 
+/// Days since the Unix epoch (1970-01-01) for a Gregorian civil date —
+/// Howard Hinnant's `days_from_civil`, the exact inverse of the
+/// `civil_from_days` arithmetic [`iso8601_at`] uses above (same era/century
+/// decomposition), reimplemented on signed `i64` so it stays correct for
+/// dates before 1970 (`iso8601_at` can't: it derives `days` from a `u64`
+/// seconds count).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 }.div_euclid(400);
+    let yoe = y - era * 400; // [0, 399]
+    let mp = if m > 2 { m - 3 } else { m + 9 }; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
+/// The exact inverse of [`days_from_civil`] — `(year, month, day)` for a
+/// given day count since the Unix epoch. Same algorithm [`iso8601_at`]
+/// inlines for its `u64`-seconds path, extracted here so week-boundary math
+/// can call it directly on signed day counts (a week can start before 1970
+/// in principle, though `canonical_iso_week` in practice only ever hands
+/// this recent years).
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+/// ISO weekday for a day count since the Unix epoch: `1 = Monday .. 7 =
+/// Sunday` (ISO-8601's own numbering — NOT the `cron` crate's `1 = Sunday`
+/// convention [`validate_cron`]'s doc warns about; those are two unrelated
+/// numbering schemes and this function has nothing to do with cron). The
+/// epoch (`days = 0`, 1970-01-01) was a Thursday, so `(days + 3).rem_euclid(7)
+/// + 1` lands on `4`.
+fn iso_weekday(days: i64) -> i64 {
+    (days + 3).rem_euclid(7) + 1
+}
+
+/// `[start, end)` bounds for an ISO-8601 week (`YYYY-Www`), as the same
+/// fixed-width `YYYY-MM-DDThh:mm:ssZ` UTC strings [`now_iso8601`] stamps
+/// events with — so callers can pass them straight into a lexical `at >= ?
+/// AND at < ?` range compare, the same shape [`Sin90Store::attention`]
+/// already uses for a start/end window. `start` is the week's Monday at
+/// `00:00:00Z`; `end` is the FOLLOWING Monday at `00:00:00Z` (so Sunday
+/// `23:59:59Z` of the week itself falls inside the window and the next
+/// Monday's `00:00:00Z` does not — a block completed exactly at that instant
+/// belongs to the NEXT week).
+///
+/// ISO-8601's own week rule (not a Sin90 invention): week 1 of a year is the
+/// week containing that year's first Thursday, equivalently the week
+/// containing January 4th. Every other week is `week1_monday + (n-1)*7`
+/// days. `None` if `iso_week` doesn't parse as `YYYY-Www`
+/// ([`canonical_iso_week`]).
+///
+/// No timezone conversion: Sin90 stamps every event `at` in UTC only (there
+/// is no per-user timezone setting anywhere in this codebase today — a
+/// `Routine.tz` is per-routine scheduling metadata, not a viewer's clock),
+/// so "the week" here is the UTC calendar week, matching the only clock
+/// events are ever written against.
+pub fn iso_week_bounds(iso_week: &str) -> Option<(String, String)> {
+    let canon = canonical_iso_week(iso_week)?;
+    let year: i64 = canon[0..4].parse().ok()?;
+    let week: i64 = canon[6..8].parse().ok()?;
+
+    let jan4 = days_from_civil(year, 1, 4);
+    let week1_monday = jan4 - (iso_weekday(jan4) - 1);
+    let start_days = week1_monday + (week - 1) * 7;
+    let end_days = start_days + 7;
+
+    let (sy, sm, sd) = civil_from_days(start_days);
+    let (ey, em, ed) = civil_from_days(end_days);
+    Some((
+        format!("{sy:04}-{sm:02}-{sd:02}T00:00:00Z"),
+        format!("{ey:04}-{em:02}-{ed:02}T00:00:00Z"),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,5 +535,55 @@ mod tests {
         for bad in ["", "Not/AZone", "GMT+8", "UTC+8", "shanghai"] {
             assert!(validate_tz(bad).is_err(), "{bad:?} must be rejected");
         }
+    }
+
+    /// T4.3.1: `iso_week_bounds` against dates independently verified via
+    /// Python's `datetime.date.fromisocalendar` (not derived from this
+    /// code): `2026-W39` is `2026-09-21 .. 2026-09-28`, `2026-W01` starts
+    /// `2025-12-29` (a week can start in the PREVIOUS calendar year — the
+    /// case that makes a naive "Jan 1 = week 1" implementation wrong), and
+    /// `2025-W52` is the week right before it.
+    #[test]
+    fn iso_week_bounds_matches_independently_verified_dates() {
+        let (start, end) = iso_week_bounds("2026-W39").unwrap();
+        assert_eq!(start, "2026-09-21T00:00:00Z");
+        assert_eq!(end, "2026-09-28T00:00:00Z");
+
+        let (start, end) = iso_week_bounds("2026-W01").unwrap();
+        assert_eq!(
+            start, "2025-12-29T00:00:00Z",
+            "2026-W01 starts in the previous calendar year"
+        );
+        assert_eq!(end, "2026-01-05T00:00:00Z");
+
+        let (start, end) = iso_week_bounds("2025-W52").unwrap();
+        assert_eq!(start, "2025-12-22T00:00:00Z");
+        assert_eq!(
+            end, "2025-12-29T00:00:00Z",
+            "2025-W52's end must be exactly 2026-W01's start — adjacent weeks tile with no gap or overlap"
+        );
+    }
+
+    #[test]
+    fn iso_week_bounds_accepts_lowercase_w_and_rejects_garbage() {
+        assert_eq!(
+            iso_week_bounds("2026-w39"),
+            iso_week_bounds("2026-W39"),
+            "lowercase w must canonicalize the same as uppercase"
+        );
+        for bad in ["2026-W99", "2026-W00", "garbage", "2026-39", ""] {
+            assert!(iso_week_bounds(bad).is_none(), "{bad:?} must be rejected");
+        }
+    }
+
+    /// Every emitted timestamp ([`now_iso8601`]'s shape) must satisfy
+    /// `is_fixed_iso8601` so `at >= start AND at < end` compares correctly —
+    /// pins that `iso_week_bounds`' own output is the same fixed width, not
+    /// just eyeballed in the assertions above.
+    #[test]
+    fn iso_week_bounds_output_is_fixed_width_iso8601() {
+        let (start, end) = iso_week_bounds("2026-W39").unwrap();
+        assert!(is_fixed_iso8601(&start), "{start}");
+        assert!(is_fixed_iso8601(&end), "{end}");
     }
 }

@@ -163,7 +163,8 @@ pub fn router(state: Sin90State, mounted: bool) -> axum::Router {
         .route("/routines/{id}/transition", post(transition_routine))
         .route("/reviews", post(create_review).get(list_reviews))
         .route("/reviews/{id}", get(get_review).patch(update_review))
-        .route("/reviews/{id}/finalize", post(finalize_review));
+        .route("/reviews/{id}/finalize", post(finalize_review))
+        .route("/review/weekly/draft", get(weekly_review_draft));
     if mounted {
         r = r.route("/_a24/scheduler/fired", post(scheduler_fired));
     }
@@ -1118,6 +1119,29 @@ async fn finalize_review(
             );
             Json(review).into_response()
         }
+        Err(e) => map_err(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct WeeklyDraftQuery {
+    week: String,
+}
+
+/// `GET /review/weekly/draft?week=YYYY-Www` (T4.3.1, spec.md M4) — a read,
+/// no actor gate, same posture as every other `GET` in this file
+/// (`/attention`, `/weeks/{id}/attention`, `/events`). Emits no event: this
+/// route computes a number, it doesn't write anything (mirrors `/attention`
+/// and `/weeks/{id}/attention`, neither of which emits either). All the
+/// real work — including the `week` format check — is
+/// `Sin90Store::weekly_draft`'s (`StoreError::Invalid` -> 400 via `map_err`,
+/// same as `POST /reviews`' `period` validation).
+async fn weekly_review_draft(
+    State(state): State<Sin90State>,
+    Query(q): Query<WeeklyDraftQuery>,
+) -> Response {
+    match state.store.weekly_draft(&q.week).await {
+        Ok(draft) => Json(draft).into_response(),
         Err(e) => map_err(e),
     }
 }

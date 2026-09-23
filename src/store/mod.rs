@@ -15,6 +15,7 @@
 pub mod attention;
 pub mod packs;
 pub mod repo;
+pub mod weekly_draft;
 
 pub use attention::{AttentionRow, WeekAttention};
 pub use packs::{five_life_systems, SeedArea};
@@ -22,6 +23,7 @@ pub use repo::{
     AppliedProposal, ApplyOutcome, EventRow, ReviewUpdate, RoutineFireOutcome, RoutineUpdate,
     StoredProposal, TodayView,
 };
+pub use weekly_draft::{AreaMinutes, DirectionMinutes, RoutineDraftRow, WeeklyDraft};
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
@@ -346,6 +348,65 @@ pub mod test_hooks {
         .bind(&now)
         .execute(store.pool())
         .await?;
+        Ok(())
+    }
+
+    // ----- T4.3.1 weekly draft test scaffolding ----------------------------
+
+    /// Backdate the MOST RECENT `sin90_events` row for `(entity, entity_id)`
+    /// via raw SQL — the only way a test can put a `block.transitioned`,
+    /// `task.transitioned`, or `routine.fired` event on a controlled day
+    /// (production code always stamps `now_iso8601()`; mirrors
+    /// `set_task_created_at`/`set_routine_fire_received_at` above, but on
+    /// the event log itself rather than a materialized row).
+    pub async fn set_last_event_at(
+        store: &Sin90Store,
+        entity: &str,
+        entity_id: &str,
+        at: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE sin90_events SET at = ?
+             WHERE seq = (
+                 SELECT MAX(seq) FROM sin90_events WHERE entity = ? AND entity_id = ?
+             )",
+        )
+        .bind(at)
+        .bind(entity)
+        .bind(entity_id)
+        .execute(store.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Rewrite a `sin90_schedule_blocks.planned_minutes` directly via raw
+    /// SQL, bypassing `transition_block`/its event entirely — `weekly_draft`
+    /// negative control (T4.3.1): the draft must not move when this mutable
+    /// table changes, since it never reads it (mirrors `rename_direction`
+    /// above, applied to a different table/column).
+    pub async fn set_block_planned_minutes_direct(
+        store: &Sin90Store,
+        id: &str,
+        minutes: i64,
+    ) -> Result<()> {
+        sqlx::query("UPDATE sin90_schedule_blocks SET planned_minutes = ? WHERE id = ?")
+            .bind(minutes)
+            .bind(id)
+            .execute(store.pool())
+            .await?;
+        Ok(())
+    }
+
+    /// Rewrite a `sin90_tasks.status` directly via raw SQL, bypassing
+    /// `transition_task`/its event entirely — the other half of the
+    /// `weekly_draft` negative control: `tasks_done` must not move when this
+    /// mutable table changes.
+    pub async fn set_task_status_direct(store: &Sin90Store, id: &str, status: &str) -> Result<()> {
+        sqlx::query("UPDATE sin90_tasks SET status = ? WHERE id = ?")
+            .bind(status)
+            .bind(id)
+            .execute(store.pool())
+            .await?;
         Ok(())
     }
 }

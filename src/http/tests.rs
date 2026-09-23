@@ -3451,6 +3451,122 @@ mod review {
     }
 }
 
+// ---- T4.3.1: GET /review/weekly/draft ---------------------------------------
+
+mod weekly_draft {
+    use super::*;
+    use crate::store::test_hooks;
+
+    #[tokio::test]
+    async fn weekly_draft_route_rejects_invalid_week_with_400() {
+        let (app, _sink) = test_app().await;
+        let resp = app
+            .oneshot(get_req("/review/weekly/draft?week=not-a-week"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A read, no actor gate — same posture as `/attention`/`/events` (T4.1.1
+    /// review routes are the only ones this file requires human keys on).
+    /// Positive control lives in `weekly_draft_route_wires_to_store_replay`
+    /// below, which also hits this route with no auth header and expects
+    /// 200.
+    #[tokio::test]
+    async fn weekly_draft_route_needs_no_actor_key() {
+        let (app, _sink) = test_app().await;
+        let resp = app
+            .oneshot(get_req("/review/weekly/draft?week=2026-W39"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// End-to-end: real HTTP requests build an Area -> Direction -> completed
+    /// ScheduleBlock, the completion event is backdated into a controlled
+    /// week (`test_hooks::set_last_event_at`, same technique
+    /// `store::weekly_draft`'s own tests use), and the route's JSON reflects
+    /// exactly that — pinning the route is correctly wired to
+    /// `Sin90Store::weekly_draft`, not re-testing its arithmetic (that's
+    /// `store::weekly_draft`'s job).
+    #[tokio::test]
+    async fn weekly_draft_route_wires_to_store_replay() {
+        let (app, _sink, store) = test_app_with_store().await;
+
+        let area = body_json(
+            app.clone()
+                .oneshot(human_req("POST", "/areas", json!({"title": "Work"})))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let area_id = area["id"].as_str().unwrap().to_string();
+
+        let direction = body_json(
+            app.clone()
+                .oneshot(human_req(
+                    "POST",
+                    "/directions",
+                    json!({
+                        "title": "Coding", "target_window": "this-quarter",
+                        "area_id": area_id,
+                    }),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let direction_id = direction["id"].as_str().unwrap().to_string();
+
+        let block = body_json(
+            app.clone()
+                .oneshot(human_req(
+                    "POST",
+                    "/schedule-blocks",
+                    json!({"direction_id": direction_id, "planned_minutes": 90}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let block_id = block["id"].as_str().unwrap().to_string();
+
+        for to in ["started", "completed"] {
+            let resp = app
+                .clone()
+                .oneshot(human_req(
+                    "PATCH",
+                    &format!("/schedule-blocks/{block_id}"),
+                    json!({"to": to}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        test_hooks::set_last_event_at(&store, "block", &block_id, "2026-09-24T10:00:00Z")
+            .await
+            .unwrap();
+
+        let draft = body_json(
+            app.oneshot(get_req("/review/weekly/draft?week=2026-W39"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(draft["week"], "2026-W39");
+        assert_eq!(
+            draft["by_area"],
+            json!([{"area_id": area_id, "minutes": 90}])
+        );
+        assert_eq!(
+            draft["by_direction"],
+            json!([{"direction_id": direction_id, "minutes": 90}])
+        );
+        assert_eq!(draft["tasks_done"], 0);
+        assert_eq!(draft["routines"], json!([]));
+    }
+}
+
 // ---- T3.2.2: POST /_a24/scheduler/fired -------------------------------------
 
 mod fired {
