@@ -33,6 +33,6 @@ pub use types::{
     WeekId, WeekStatus,
 };
 pub use util::{
-    canonical_iso_date, canonical_iso_week, is_fixed_iso8601, iso_week_bounds, local_day_start_utc,
-    now_iso8601, ulid, validate_cron, validate_tz,
+    canonical_iso_date, canonical_iso_week, is_fixed_iso8601, iso_week_bounds, iso_week_of,
+    local_day_start_utc, now_iso8601, ulid, validate_cron, validate_tz,
 };

@@ -37,7 +37,7 @@ use crate::core::{
     RoutinePatch, RoutineStatus, ScheduleBlockStatus, Sin90Proposal, TaskKind, TaskStatus,
     WeekStatus,
 };
-use crate::store::{RoutineFireOutcome, StoreError};
+use crate::store::{AutoReviewCreated, RoutineFireOutcome, StoreError};
 
 pub use actor::{Actor, ActorKeys};
 pub use state::{EventSink, NullEventSink, Sin90State};
@@ -1032,7 +1032,7 @@ async fn create_review(
                 "review.created",
                 serde_json::json!({
                     "id": review.id, "kind": review.kind, "period": review.period,
-                    "status": review.status,
+                    "status": review.status, "source": "human",
                 }),
             );
             (StatusCode::CREATED, Json(review)).into_response()
@@ -1185,9 +1185,17 @@ fn require_fire_id(headers: &HeaderMap) -> std::result::Result<&str, Response> {
 /// contract (Agent24 design doc §4.1) both require it: the kernel treats any
 /// non-2xx as a failed delivery and retries, and none of
 /// [`RoutineFireOutcome`]'s variants are an actual delivery failure (see that
-/// type's doc). The handler itself does no slow work — `record_routine_fire`
-/// is the one query round-trip, then this returns; nothing here calls out to
-/// the kernel or blocks on anything else.
+/// type's doc). The handler itself does no slow work — it calls
+/// `record_routine_fire` once and returns; nothing here calls out to the
+/// kernel, the AI ladder, or blocks on anything else. (T4.3.2:
+/// `record_routine_fire` itself now does a HANDFUL of extra local SQLite
+/// reads — never more than one extra connection checkout plus a few
+/// indexed queries — when the fired Routine is `kind: review`, to precompute
+/// and maybe insert a weekly draft Review; see that method's own doc for
+/// exactly why and its explicit non-goal of doing so INSIDE its write
+/// transaction. Still no network call, no AI call, no blocking wait on
+/// anything outside this process — "fast" here means "no slow work", not
+/// "exactly one query".)
 async fn scheduler_fired(
     State(state): State<Sin90State>,
     headers: HeaderMap,
@@ -1216,7 +1224,10 @@ async fn scheduler_fired(
         .record_routine_fire(&fire_id, &req.key, &req.scheduled_for, req.trigger)
         .await
     {
-        Ok(RoutineFireOutcome::Recorded { routine_id }) => {
+        Ok(RoutineFireOutcome::Recorded {
+            routine_id,
+            auto_review,
+        }) => {
             // Mirror the SAME fields the store's own internal `routine.fired`
             // event carries (design convention every other direct-write
             // handler above follows) — only on a REAL new record, never on a
@@ -1229,9 +1240,26 @@ async fn scheduler_fired(
                     "scheduled_for": req.scheduled_for, "trigger": req.trigger,
                 }),
             );
+            // T4.3.2: this fire ALSO auto-created a weekly draft Review —
+            // mirror `review.created` for it too, same shape `create_review`
+            // mirrors on the human path (`"source": "human"` there vs.
+            // `"routine"` here is the only difference).
+            let review_created = auto_review.as_ref().map(|r| r.review_id.clone());
+            if let Some(AutoReviewCreated { review_id, period }) = &auto_review {
+                state.emit(
+                    "review.created",
+                    serde_json::json!({
+                        "id": review_id, "kind": "weekly", "period": period,
+                        "status": "draft", "source": "routine",
+                    }),
+                );
+            }
             (
                 StatusCode::OK,
-                Json(serde_json::json!({ "status": "recorded", "routine_id": routine_id })),
+                Json(serde_json::json!({
+                    "status": "recorded", "routine_id": routine_id,
+                    "review_created": review_created,
+                })),
             )
                 .into_response()
         }

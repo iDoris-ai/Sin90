@@ -340,6 +340,47 @@ pub fn iso_week_bounds(iso_week: &str) -> Option<(String, String)> {
     ))
 }
 
+/// The ISO-8601 week label (`YYYY-Www`) that a fixed-width UTC timestamp
+/// (`YYYY-MM-DDThh:mm:ssZ`, [`now_iso8601`]'s shape) falls in — the inverse
+/// of [`iso_week_bounds`]: for any `at` this accepts, `iso_week_bounds(&
+/// iso_week_of(at).unwrap()).unwrap()` is a `[start, end)` window with
+/// `start <= at < end`. `None` if `at` isn't fixed-width ISO-8601
+/// ([`is_fixed_iso8601`]) or its date part isn't a real calendar date (same
+/// rigor [`canonical_iso_date`] applies — a nonsense `2026-13-40` does not
+/// silently produce some week label).
+///
+/// T4.3.2 (spec.md M4 "review Routine 到点自动建草稿"): used to turn a
+/// fired `Routine{kind:review}`'s `scheduled_for` into the ISO week whose
+/// draft it should ensure exists. No timezone conversion, same posture
+/// [`iso_week_bounds`]'s doc states: Sin90 only ever stamps UTC.
+pub fn iso_week_of(at: &str) -> Option<String> {
+    if !is_fixed_iso8601(at) {
+        return None;
+    }
+    let year: u32 = at[0..4].parse().ok()?;
+    let month: u32 = at[5..7].parse().ok()?;
+    let day: u32 = at[8..10].parse().ok()?;
+    if year < 1000 || month == 0 || month > 12 || day == 0 || day > days_in_month(year, month) {
+        return None;
+    }
+
+    let days = days_from_civil(year as i64, month as i64, day as i64);
+    let wd = iso_weekday(days); // 1=Mon..7=Sun
+    let monday = days - (wd - 1);
+    // ISO-8601: a week belongs to the Gregorian year containing its Thursday
+    // (equivalently, the year whose Jan 4th falls in this same week) — this
+    // is what lets `2026-W01` legitimately start on 2025-12-29
+    // (`iso_week_bounds_matches_independently_verified_dates` pins that
+    // example for the inverse direction).
+    let thursday = monday + 3;
+    let (iso_year, _, _) = civil_from_days(thursday);
+
+    let jan4 = days_from_civil(iso_year, 1, 4);
+    let week1_monday = jan4 - (iso_weekday(jan4) - 1);
+    let week = (monday - week1_monday) / 7 + 1;
+    Some(format!("{iso_year:04}-W{week:02}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,5 +626,69 @@ mod tests {
         let (start, end) = iso_week_bounds("2026-W39").unwrap();
         assert!(is_fixed_iso8601(&start), "{start}");
         assert!(is_fixed_iso8601(&end), "{end}");
+    }
+
+    /// T4.3.2: `iso_week_of` is the exact inverse of `iso_week_bounds` — the
+    /// `start` instant of every week's `[start, end)` window maps back to
+    /// that same week's label, and the `end` instant (exclusive) maps to
+    /// the FOLLOWING week's label, not this one.
+    #[test]
+    fn iso_week_of_is_the_inverse_of_iso_week_bounds() {
+        for week in ["2026-W39", "2026-W01", "2025-W52", "2020-W53"] {
+            let (start, end_exclusive) = iso_week_bounds(week).unwrap();
+            assert_eq!(
+                iso_week_of(&start).as_deref(),
+                Some(week),
+                "start of {week} must map back to {week}"
+            );
+            let next_week = iso_week_of(&end_exclusive).unwrap();
+            assert_ne!(
+                next_week, week,
+                "the exclusive end of {week} must belong to the NEXT week"
+            );
+            // And that next week's own bounds must start exactly there —
+            // adjacent weeks tile with no gap or overlap.
+            let (next_start, _) = iso_week_bounds(&next_week).unwrap();
+            assert_eq!(next_start, end_exclusive);
+        }
+    }
+
+    /// The concrete case T4.3.1's own fixture already hand-verified
+    /// independently (module doc there): 2026-W39 = 2026-09-21 .. 2026-09-28.
+    #[test]
+    fn iso_week_of_matches_independently_verified_dates() {
+        assert_eq!(
+            iso_week_of("2026-09-21T00:00:00Z").as_deref(),
+            Some("2026-W39"),
+            "Monday 00:00:00Z is inside the week"
+        );
+        assert_eq!(
+            iso_week_of("2026-09-27T23:59:59Z").as_deref(),
+            Some("2026-W39"),
+            "Sunday 23:59:59Z is still inside the week"
+        );
+        assert_eq!(
+            iso_week_of("2026-09-28T00:00:00Z").as_deref(),
+            Some("2026-W40"),
+            "next Monday 00:00:00Z belongs to the NEXT week"
+        );
+        assert_eq!(
+            iso_week_of("2025-12-29T00:00:00Z").as_deref(),
+            Some("2026-W01"),
+            "a week can start in the previous calendar year"
+        );
+    }
+
+    #[test]
+    fn iso_week_of_rejects_malformed_or_nonsense_timestamps() {
+        for bad in [
+            "garbage",
+            "2026-09-24",           // not fixed-width (missing time)
+            "2026-13-01T00:00:00Z", // month 13
+            "2026-02-30T00:00:00Z", // Feb 30 doesn't exist
+            "",
+        ] {
+            assert!(iso_week_of(bad).is_none(), "{bad:?} must be rejected");
+        }
     }
 }

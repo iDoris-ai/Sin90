@@ -3822,4 +3822,97 @@ mod fired {
             .collect();
         assert!(ids.contains(&id.as_str()), "{ids:?}");
     }
+
+    // ---- T4.3.2: review Routine fired -> mirrors review.created too -----------
+
+    async fn create_review_routine_id(app: &axum::Router) -> String {
+        let created = body_json(
+            app.clone()
+                .oneshot(human_req(
+                    "POST",
+                    "/routines",
+                    json!({
+                        "title": "Weekly review", "kind": "review",
+                        "cron": "0 18 * * SUN",
+                    }),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        created["id"].as_str().unwrap().to_string()
+    }
+
+    /// The HTTP-layer half of T4.3.2: a `review`-kind Routine's fire must
+    /// mirror BOTH `routine.fired` AND `review.created` to `EventSink` — the
+    /// store-level `review_routine_*` tests (`store::repo::review_routine_tests`)
+    /// already pin the store's own internal event/row; this pins the second
+    /// mirror this handler is responsible for adding, with `source: "routine"`.
+    #[tokio::test]
+    async fn fired_review_routine_mirrors_review_created_with_source_routine() {
+        let (app, sink, _store) = test_app_mounted().await;
+        let id = create_review_routine_id(&app).await;
+
+        let resp = app
+            .oneshot(fired_req(
+                "/_a24/scheduler/fired",
+                Some("fire-review-1"),
+                fired_body(&format!("routine.{id}"), "tick"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert!(
+            body["review_created"].is_string(),
+            "response must surface the auto-created review's id: {body}"
+        );
+
+        let events = sink.0.lock().unwrap();
+        assert!(
+            events.iter().any(|(k, _)| k == "routine.fired"),
+            "must still mirror routine.fired: {events:?}"
+        );
+        let (_, payload) = events
+            .iter()
+            .find(|(k, _)| k == "review.created")
+            .unwrap_or_else(|| panic!("must mirror review.created: {events:?}"));
+        assert_eq!(payload["source"], "routine");
+        assert_eq!(payload["kind"], "weekly");
+        assert_eq!(payload["status"], "draft");
+    }
+
+    /// Positive control: a duplicate `fire_id` retry must mirror
+    /// `review.created` exactly ONCE, not once per delivery attempt.
+    #[tokio::test]
+    async fn fired_review_routine_duplicate_fire_id_mirrors_review_created_once() {
+        let (app, sink, _store) = test_app_mounted().await;
+        let id = create_review_routine_id(&app).await;
+        let key = format!("routine.{id}");
+
+        for _ in 0..2 {
+            let resp = app
+                .clone()
+                .oneshot(fired_req(
+                    "/_a24/scheduler/fired",
+                    Some("fire-review-dup"),
+                    fired_body(&key, "tick"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        let created_count = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| k == "review.created")
+            .count();
+        assert_eq!(
+            created_count, 1,
+            "duplicate fire_id must not re-mirror review.created"
+        );
+    }
 }
