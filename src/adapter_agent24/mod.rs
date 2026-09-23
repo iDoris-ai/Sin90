@@ -15,15 +15,14 @@ use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::BufReader;
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
 use crate::http::EventSink;
 
-/// NDJSON frame bound (design/`docs/STATUS.md`: matches Agent24's
-/// `agent24_os_proto::frame::MAX_FRAME_BYTES`).
-const MAX_FRAME_BYTES: usize = 1024 * 1024;
+mod frame;
+
 /// Upper bound on one callback round trip (reconnect, or write + read the
 /// reply). A kernel that accepts but never answers must not wedge the event
 /// worker — and with it every later event — forever.
@@ -52,8 +51,8 @@ pub enum AdapterError {
     HandshakeRefused(String),
     #[error("handshake response id mismatch: sent {sent}, got {got}")]
     IdMismatch { sent: String, got: String },
-    #[error("callback frame exceeds {MAX_FRAME_BYTES} bytes")]
-    FrameTooLong,
+    #[error(transparent)]
+    Frame(#[from] frame::FrameError),
 }
 
 /// The four environment variables the kernel spawns an out-of-process module
@@ -185,8 +184,8 @@ impl CallbackChannel {
         // otherwise be read as the answer to the next request.
         let reader = conn.as_mut().expect("just ensured Some above");
         let round_trip = async {
-            write_frame(reader.get_mut(), &req).await?;
-            read_frame(reader).await
+            frame::write_frame(reader.get_mut(), &req).await?;
+            frame::read_frame(reader).await
         };
         let line = match tokio::time::timeout(self.io_timeout, round_trip).await {
             Ok(Ok(line)) => line,
@@ -244,9 +243,9 @@ async fn connect_and_initialize(
             "capabilities": ["events"],
         }
     });
-    write_frame(reader.get_mut(), &req).await?;
+    frame::write_frame(reader.get_mut(), &req).await?;
 
-    let line = read_frame(&mut reader).await?;
+    let line = frame::read_frame(&mut reader).await?;
     let resp: Value = serde_json::from_slice(&line)?;
     let got_id = resp["id"].as_str().unwrap_or_default().to_string();
     if got_id != id {
@@ -328,35 +327,6 @@ impl EventSink for KernelEventSink {
     }
 }
 
-async fn write_frame(stream: &mut UnixStream, value: &Value) -> Result<(), AdapterError> {
-    let mut bytes = serde_json::to_vec(value)?;
-    bytes.push(b'\n');
-    stream.write_all(&bytes).await?;
-    stream.flush().await?;
-    Ok(())
-}
-
-/// Read one NDJSON line, bounded (mirrors Agent24's `frame::read_frame`
-/// contract: refuse an over-long line rather than buffer it unbounded).
-async fn read_frame(reader: &mut BufReader<UnixStream>) -> Result<Vec<u8>, AdapterError> {
-    let mut buf = Vec::new();
-    let mut limited = tokio::io::AsyncReadExt::take(reader, (MAX_FRAME_BYTES + 1) as u64);
-    let n = limited.read_until(b'\n', &mut buf).await?;
-    if n == 0 {
-        return Err(AdapterError::Io(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "callback socket closed",
-        )));
-    }
-    if buf.len() > MAX_FRAME_BYTES {
-        return Err(AdapterError::FrameTooLong);
-    }
-    if buf.last() == Some(&b'\n') {
-        buf.pop();
-    }
-    Ok(buf)
-}
-
 /// Build a `tokio::net::UnixListener` from the kernel-bound `A24_LISTEN_FD`.
 ///
 /// Agent24's `agent24-os-proto::launch::LaunchSpec::listener` is a
@@ -383,6 +353,7 @@ pub fn listener_from_fd(fd: i32) -> std::io::Result<tokio::net::UnixListener> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
     #[test]
     fn manifest_digest_is_sha256_prefixed_hex() {
