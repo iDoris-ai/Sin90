@@ -33,8 +33,9 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::core::{
-    Alloc, AreaStatus, Energy, FireTrigger, NewRoutine, RoutinePatch, RoutineStatus,
-    ScheduleBlockStatus, Sin90Proposal, TaskKind, TaskStatus, WeekStatus,
+    Alloc, AreaStatus, Energy, FireTrigger, NewReview, NewRoutine, ReviewKind, ReviewPatch,
+    RoutinePatch, RoutineStatus, ScheduleBlockStatus, Sin90Proposal, TaskKind, TaskStatus,
+    WeekStatus,
 };
 use crate::store::{RoutineFireOutcome, StoreError};
 
@@ -159,7 +160,10 @@ pub fn router(state: Sin90State, mounted: bool) -> axum::Router {
         .route("/today", get(today))
         .route("/routines", post(create_routine).get(list_routines))
         .route("/routines/{id}", get(get_routine).patch(update_routine))
-        .route("/routines/{id}/transition", post(transition_routine));
+        .route("/routines/{id}/transition", post(transition_routine))
+        .route("/reviews", post(create_review).get(list_reviews))
+        .route("/reviews/{id}", get(get_review).patch(update_review))
+        .route("/reviews/{id}/finalize", post(finalize_review));
     if mounted {
         r = r.route("/_a24/scheduler/fired", post(scheduler_fired));
     }
@@ -283,6 +287,12 @@ struct RoutineListQuery {
 #[serde(deny_unknown_fields)]
 struct RoutineTransitionReq {
     to: RoutineStatus,
+}
+
+#[derive(Deserialize)]
+struct ReviewListQuery {
+    kind: Option<ReviewKind>,
+    period: Option<String>,
 }
 
 /// `POST /_a24/scheduler/fired` body (T3.2.2). Field set and names match the
@@ -983,6 +993,130 @@ async fn transition_routine(
             };
             state.emit(kind, serde_json::json!({ "routine_id": routine.id }));
             Json(routine).into_response()
+        }
+        Err(e) => map_err(e),
+    }
+}
+
+// ---- Review handlers (new, M4, design §2/§3.2/§4.1, T4.1.1) ----------------
+//
+// `create`/`update`/`finalize` are direct writes, human-gated, same
+// convention as Area/Task/Week/Routine above (no `Sin90Op::CreateReview`
+// proposal variant — same reasoning the Routine section doc above gives).
+// `GET /reviews` and `GET /reviews/{id}` are reads, no gate. Every
+// successful write also mirrors to `EventSink`, one-for-one with the
+// store's own internal `sin90_events` row (same "two audiences, two
+// writes" split every other direct-write handler above follows) — a no-op
+// `PATCH` writes neither (`update_review_body`'s doc).
+
+/// `POST /reviews` — body deserializes straight into [`NewReview`]
+/// (`deny_unknown_fields`). `kind`/`period` validation (format, plus a
+/// `rhythm` period's existence check) and the `UNIQUE(kind, period)` 409 all
+/// happen in `store::repo::create_review`.
+async fn create_review(
+    State(state): State<Sin90State>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(r) = state.require_human(&headers) {
+        return r;
+    }
+    let req: NewReview = match parse(&body, "review") {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    match state.store.create_review(&req).await {
+        Ok(review) => {
+            state.emit(
+                "review.created",
+                serde_json::json!({
+                    "id": review.id, "kind": review.kind, "period": review.period,
+                    "status": review.status,
+                }),
+            );
+            (StatusCode::CREATED, Json(review)).into_response()
+        }
+        Err(e) => map_err(e),
+    }
+}
+
+/// `GET /reviews?kind=&period=` — a read, no gate, same posture as
+/// `GET /routines`.
+async fn list_reviews(
+    State(state): State<Sin90State>,
+    Query(q): Query<ReviewListQuery>,
+) -> Response {
+    match state.store.list_reviews(q.kind, q.period.as_deref()).await {
+        Ok(v) => Json(serde_json::json!({ "reviews": v })).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
+/// `GET /reviews/{id}` — a read, no gate. Unknown id -> 404 via `map_err`.
+async fn get_review(State(state): State<Sin90State>, AxPath(id): AxPath<String>) -> Response {
+    match state.store.get_review(&id).await {
+        Ok(r) => Json(r).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
+/// `PATCH /reviews/{id}` — body deserializes into [`ReviewPatch`] (a single
+/// required `body` field — see that type's doc for why this isn't a
+/// double-`Option` shape like `RoutinePatch`). A `finalized` Review rejects
+/// any patch with `StoreError::Conflict` -> 409
+/// (`store::repo::update_review_body`'s doc).
+///
+/// Mirrors `review.updated` to `EventSink` — but ONLY when
+/// [`crate::store::ReviewUpdate::changed`] is `true` (same no-op-means-no-
+/// mirror rule `update_routine` follows above): re-stating the current body
+/// writes no internal `sin90_events` row either, so the mirror stays silent
+/// too.
+async fn update_review(
+    State(state): State<Sin90State>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    body: Bytes,
+) -> Response {
+    if let Err(r) = state.require_human(&headers) {
+        return r;
+    }
+    let patch: ReviewPatch = match parse(&body, "review patch") {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    match state.store.update_review_body(&id, &patch.body).await {
+        Ok(outcome) => {
+            if outcome.changed {
+                state.emit(
+                    "review.updated",
+                    serde_json::json!({ "review_id": outcome.review.id, "body": outcome.review.body }),
+                );
+            }
+            Json(outcome.review).into_response()
+        }
+        Err(e) => map_err(e),
+    }
+}
+
+/// `POST /reviews/{id}/finalize` — `draft -> finalized` (design §3.2, the
+/// only legal edge); finalizing an already-`finalized` Review comes back as
+/// `StoreError::Transition` -> 409, same convention `PATCH
+/// /routines/{id}/transition` above uses.
+async fn finalize_review(
+    State(state): State<Sin90State>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+) -> Response {
+    if let Err(r) = state.require_human(&headers) {
+        return r;
+    }
+    match state.store.finalize_review(&id).await {
+        Ok(review) => {
+            state.emit(
+                "review.finalized",
+                serde_json::json!({ "review_id": review.id }),
+            );
+            Json(review).into_response()
         }
         Err(e) => map_err(e),
     }
