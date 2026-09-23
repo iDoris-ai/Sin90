@@ -33,7 +33,7 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::core::{
-    AreaStatus, Energy, ScheduleBlockStatus, Sin90Proposal, TaskKind, TaskStatus, WeekStatus,
+    Alloc, AreaStatus, Energy, ScheduleBlockStatus, Sin90Proposal, TaskKind, TaskStatus, WeekStatus,
 };
 use crate::store::StoreError;
 
@@ -134,6 +134,8 @@ pub fn router(state: Sin90State) -> axum::Router {
         .route("/weeks", post(create_week).get(list_weeks))
         .route("/weeks/{id}", patch(transition_week))
         .route("/weeks/{id}/attention", get(week_attention))
+        .route("/rhythms", post(create_rhythm).get(list_rhythms))
+        .route("/rhythms/{id}", get(get_rhythm))
         .route("/proposals", post(submit_proposal).get(list_proposals))
         .route("/proposals/{id}", get(get_proposal))
         .route("/proposals/{id}/accept", post(accept_proposal))
@@ -235,6 +237,12 @@ struct WeekTransitionReq {
 #[serde(deny_unknown_fields)]
 struct CaptureReq {
     text: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewRhythmReq {
+    allocations: Vec<Alloc>,
 }
 
 #[derive(Deserialize)]
@@ -537,6 +545,52 @@ async fn transition_week(
 async fn week_attention(State(state): State<Sin90State>, AxPath(id): AxPath<String>) -> Response {
     match state.store.week_attention(&id).await {
         Ok(a) => Json(a).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
+// ---- Rhythm handlers (new, design M3/T3.4.1) --------------------------------
+
+/// `POST /rhythms` (spec.md "Rhythm 路由") — direct write, human gate, same
+/// convention as `create_area`/`create_direction`/`create_week`. Adjusting an
+/// existing Rhythm does NOT go through here: that stays behind the proposal
+/// gate (`POST /proposals` submitting `AdjustRhythm`, then human
+/// `POST /proposals/{id}/accept`) — this route only ever creates, and the
+/// store layer enforces it (no direct-write adjust method exists).
+async fn create_rhythm(
+    State(state): State<Sin90State>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(r) = state.require_human(&headers) {
+        return r;
+    }
+    let req: NewRhythmReq = match parse(&body, "rhythm") {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    match state.store.create_rhythm(&req.allocations).await {
+        Ok(rh) => {
+            state.emit(
+                "rhythm.created",
+                serde_json::json!({ "id": rh.id, "allocations": rh.allocations }),
+            );
+            (StatusCode::CREATED, Json(rh)).into_response()
+        }
+        Err(e) => map_err(e),
+    }
+}
+
+async fn list_rhythms(State(state): State<Sin90State>) -> Response {
+    match state.store.list_rhythms().await {
+        Ok(v) => Json(serde_json::json!({ "rhythms": v })).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
+async fn get_rhythm(State(state): State<Sin90State>, AxPath(id): AxPath<String>) -> Response {
+    match state.store.get_rhythm(&id).await {
+        Ok(r) => Json(r).into_response(),
         Err(e) => map_err(e),
     }
 }
