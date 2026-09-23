@@ -8,6 +8,8 @@
 - [ ] SFU-4（C）adapter 注释「min == max == 1」与 `PROTOCOL_MAX = 1000` 不符 —— `adapter_agent24/mod.rs:28-32` · MS 迁 SDK 时一并消失
 - [ ] SFU-5（B）提议没有 `rejected` 的入口（无路由、无 store 函数）—— Explore 2026-09-23 · 加 reject 路由（require_human）后关闭
 
+- [ ] SFU-7（B）SIGTERM 与 on_fatal 统一成一条优雅关闭路径 —— T3.2.0 第 2 轮评审 N-M5 · 现状：on_fatal 直接 `exit(70)`、SIGTERM 也无优雅处理；进行中的 HTTP 请求被重置（已提交但未响应的非幂等 POST 可能被客户端重试）、已提交事务对应的镜像事件丢失（SQLite 原子性不受影响）。做法：on_fatal 与 SIGTERM 都只触发一个 CancellationToken，`axum::serve(...).with_graceful_shutdown` 排空 ≤2s 再退出（< 内核 EXIT_SETTLE 100ms + STOP_GRACE 3s）。判据：排空期间在途请求完成；超时后仍退出
+
 ## T0.4 Codex 补审
 
 （T0.4 执行时逐 commit 记录：结论 / 修复 PR / 转 followup）
