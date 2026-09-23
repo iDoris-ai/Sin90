@@ -57,27 +57,33 @@
 //!   [`classify::normalize_title`]（§11.4.1 R1 的正式算法），并在 SQL 里
 //!   过滤掉归属已终结（achieved/abandoned）Direction 的历史任务；不再维护
 //!   一份自己的近似版本。
-//! - **classify 能力本身**：T5.2.1b（本分支）交付了 [`classify`] 模块
-//!   （`normalize_title`、R1/R2、模型 request/schema/parse、
+//! - **classify 能力本身**：T5.2.1b 交付了 [`classify`] 模块（
+//!   `normalize_title`、R1/R2、模型 request/schema/parse、
 //!   `classify_one`/`run_classify` 驱动、`select_targets` 输入校验）。
-//!   **仍未做，留给上一层的 T5.2.1（http）分支**：`POST /ai/classify` +
-//!   `GET /ai/runs/{run_id}` 这两条 HTTP 路由、进程内 run 注册表（内存
-//!   LRU 64）、每能力单飞——本分支没有 `src/http/**` 的改动，
-//!   `ai::classify::run_classify` 今天只能从测试或未来的 HTTP 层直接调用。
-//!   `summarize`/`propose`（T5.3.1/T5.4.1）也不在这里——`ai::ladder::run_item`
-//!   这个共享的引擎梯核心已经是它们也要调用的东西，但组装它们各自的候选
-//!   读取/prompt/复核/`ProposalDraft` 还没有对应的
+//!   ~~仍未做，留给上一层的 T5.2.1（http）分支~~ **T5.2.1（顶层）已关闭**：
+//!   `POST /ai/classify` + `GET /ai/runs/{run_id}` 这两条 HTTP 路由、进程内
+//!   run 注册表（内存 LRU 64 近似、`BusyGuard` 保证 panic 时也释放槽位）、
+//!   每能力单飞都已落地（`src/http/ai_classify.rs` + `src/http/ai_runs.rs`）。
+//!   `src/http/ai_classify.rs` 里 `model: Option<&NoModelPort>` 与
+//!   `ModelAccess::LocalOnly` 目前都是硬编码——没有真实 `ModelPort` 适配器
+//!   可传、也没有 `domain-os.yml` 的 `model_access` 可读，这两处都留了
+//!   `TODO(T5.1.2)` 注释，等真实内核客户端接上后才能从硬编码变成真正的
+//!   运行时值。`summarize`/`propose`（T5.3.1/T5.4.1）仍不在这里——
+//!   `ai::ladder::run_item` 这个共享的引擎梯核心已经是它们也要调用的东西，
+//!   但组装它们各自的候选读取/prompt/复核/`ProposalDraft` 还没有对应的
 //!   `src/ai/{summarize,propose}.rs`；进程内模型调用信号量 2（§11.4 公共）
-//!   也还没有实现——`NoModelPort`（见 [`ports::NoModelPort`]）目前只在测试
-//!   里被用作"没有真实模型"的占位类型参数，还没有真正的 HTTP 触发路径把
-//!   它接上。
+//!   也还没有实现——现在没有真实并发模型调用需要限流，`model` 参数在
+//!   `POST /ai/classify` 的触发路径上恒为 `None`。
 //!
-//! What this module does NOT contain: `summarize`/`propose` (T5.3.1/T5.4.1),
-//! the HTTP trigger routes for `classify` (the next task up the stack), and
-//! the real `_a24/model/complete` adapter (`ModelPort` here is implemented
-//! only by test fakes and `NoModelPort` — the kernel-callback client lives
-//! on a separate branch, `feat/t3.2.1-kernel-clients`, not yet merged here).
-//! See "T5.1.2 接线" above for the full, itemized handoff list.
+//! What this module does NOT contain: `summarize`/`propose` (T5.3.1/T5.4.1)
+//! and the real `_a24/model/complete` adapter (`ModelPort` here is
+//! implemented only by test fakes and `NoModelPort` — the kernel-callback
+//! client lives on a separate branch, `feat/t3.2.1-kernel-clients`, not yet
+//! merged here). The HTTP trigger routes for `classify` themselves ARE
+//! delivered (see above) — this bullet used to say otherwise when this doc
+//! was written for the T5.2.1b layer alone; updated at the top of the stack
+//! where that claim stopped being true. See "T5.1.2 接线" above for the
+//! full, itemized handoff list.
 //!
 //! # 已知限制（2026-09-24 评审，接受，不在本轮改）
 //!

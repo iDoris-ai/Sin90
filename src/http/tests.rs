@@ -4396,6 +4396,66 @@ mod ai_classify {
         );
     }
 
+    /// L2 (2026-09-24 review, round 3): the negative control
+    /// `emitting_sink_emits_immediately_...` above was missing — a `submit`
+    /// that FAILS its dry run (the task is already classified, so
+    /// `AssignTaskDirection`'s A3 rejects it) must return `Err` AND must NOT
+    /// emit `proposal.submitted` at all. Mutation target: change
+    /// `EmittingSink::submit`'s `if result.is_ok()` to `if true` and this
+    /// goes red (an event gets recorded for a failed submit).
+    #[tokio::test]
+    async fn emitting_sink_does_not_emit_when_submit_fails_its_dry_run() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let direction = store
+            .create_direction("Work", "2026-Q4", None)
+            .await
+            .unwrap();
+        // Already classified — ANY `AssignTaskDirection` targeting it fails
+        // A3 ("not in inbox") during `submit`'s dry-run `validate`.
+        let task = store
+            .create_task(
+                "Already classified",
+                Some(&direction.id),
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let recording = RecordingSink::default();
+        let emitting = crate::http::ai_classify::EmittingSink {
+            store: &store,
+            sink: std::sync::Arc::new(recording.clone()),
+        };
+        let draft = crate::ai::ProposalDraft {
+            id: "p-conflict".into(),
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task.id.clone(),
+                direction_id: direction.id.clone(),
+            }],
+            rationale: None,
+        };
+        let result = crate::ai::AiSink::submit(
+            &emitting,
+            Capability::Classify,
+            draft,
+            call_rec("call-conflict"),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "submit must fail its dry run: the task is already classified (A3)"
+        );
+
+        let events = recording.0.lock().unwrap();
+        assert!(
+            events.is_empty(),
+            "a failed submit must not emit proposal.submitted: {events:?}"
+        );
+    }
+
     // ---- J14: dedup skips/reprocesses (2026-09-24 review) ----------------
 
     fn call_rec(id: &str) -> crate::ai::AiCallRecord {

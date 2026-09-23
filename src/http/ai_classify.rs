@@ -172,13 +172,15 @@ pub async fn trigger_classify(
             }
         };
 
-        let model: Option<&NoModelPort> = None; // T5.1.2: no real adapter wired yet.
-                                                // H2 (design §11.4 公共's L1, round 2 fix): `EmittingSink` mirrors
-                                                // `proposal.submitted` IMMEDIATELY inside `submit`, one commit at a
-                                                // time — not batched into a loop AFTER the whole run finishes (the
-                                                // old shape here lost every already-committed proposal's event if
-                                                // the run panicked, or the process exited, before reaching this
-                                                // point).
+        // TODO(T5.1.2): hardcoded `None` until the real `ModelPort` adapter
+        // (`src/adapter_agent24/clients/model.rs`) is wired up.
+        let model: Option<&NoModelPort> = None;
+        // H2 (design §11.4 公共's L1, round 2 fix): `EmittingSink` mirrors
+        // `proposal.submitted` IMMEDIATELY inside `submit`, one commit at a
+        // time — not batched into a loop AFTER the whole run finishes (the
+        // old shape here lost every already-committed proposal's event if
+        // the run panicked, or the process exited, before reaching this
+        // point).
         let emitting = EmittingSink {
             store,
             sink: bg_state.sink.clone(),
@@ -227,16 +229,16 @@ fn item_result_str(r: &ItemResult) -> &'static str {
         ItemResult::Nothing => "nothing",
         ItemResult::Deferred => "deferred",
         ItemResult::Rejected => "rejected",
-        // 2026-09-24 review (round 2, low): NOT "skipped" — design §11.4 公共's
-        // enumerated item-result vocabulary is `proposed|nothing|deferred|
-        // rejected|skipped`, and does not literally list "aborted", but
-        // conflating it with "skipped" (dedup's own word for "we didn't even
-        // try this one") erases a real distinction: this item DID get tried
-        // and the run died partway through, which is a different, more
-        // alarming outcome than "already had a valid pending proposal". If
-        // the design's value domain should stay closed to those five
-        // strings, "aborted" needs to be added to it explicitly — flagged
-        // back to the coordinator rather than silently picked here.
+        // 2026-09-24 review (round 2, low; design updated round 3, commit
+        // 86fc700): NOT "skipped" — conflating it with "skipped" (dedup's
+        // own word for "we didn't even try this one") would have erased a
+        // real distinction: this item DID get tried and the run died
+        // partway through, a different, more alarming outcome than "already
+        // had a valid pending proposal". Design §11.4 公共's `result` value
+        // domain now explicitly includes `aborted` alongside
+        // `proposed|nothing|deferred|rejected|skipped` — this is no longer
+        // an out-of-domain value flagged for the coordinator's attention,
+        // it is the documented one.
         ItemResult::Aborted => "aborted",
     }
 }
@@ -368,4 +370,25 @@ pub(crate) async fn dedup_targets(
         .map(|t| t.id.clone())
         .collect();
     Ok((kept, skipped))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// L3 (2026-09-24 review, round 3): pins `item_result_str`'s wire
+    /// vocabulary directly, including `Aborted => "aborted"` (design §11.4
+    /// 公共's `result` domain, updated in commit 86fc700 to include it
+    /// alongside `proposed|nothing|deferred|rejected|skipped`).
+    #[test]
+    fn item_result_str_covers_every_variant() {
+        assert_eq!(
+            item_result_str(&ItemResult::Proposed("p1".to_string())),
+            "proposed"
+        );
+        assert_eq!(item_result_str(&ItemResult::Nothing), "nothing");
+        assert_eq!(item_result_str(&ItemResult::Deferred), "deferred");
+        assert_eq!(item_result_str(&ItemResult::Rejected), "rejected");
+        assert_eq!(item_result_str(&ItemResult::Aborted), "aborted");
+    }
 }
