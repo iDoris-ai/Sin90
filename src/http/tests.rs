@@ -41,7 +41,24 @@ async fn test_app() -> (axum::Router, RecordingSink) {
 /// test (`today_view`'s carry-over rule) that needs to reach past the HTTP
 /// surface via `store::test_hooks` to backdate a row's `created_at`, which no
 /// route exposes (nor should one: `created_at` is server-assigned, always).
+///
+/// `router(.., mounted: false)` — every test in this file except the
+/// `fired` module below exercises ordinary business routes that behave
+/// identically mounted or not, so this is the "standalone" shape (also the
+/// one `fired`'s own 404 test needs as its subject).
 async fn test_app_with_store() -> (axum::Router, RecordingSink, Sin90Store) {
+    test_app_with_store_mode(false).await
+}
+
+/// T3.2.2: same harness as [`test_app_with_store`], but built with
+/// `mounted: true` — the only shape `POST /_a24/scheduler/fired` is
+/// registered under (`router()`'s doc, architecture.md #4). Used only by the
+/// `fired` test module below.
+async fn test_app_mounted() -> (axum::Router, RecordingSink, Sin90Store) {
+    test_app_with_store_mode(true).await
+}
+
+async fn test_app_with_store_mode(mounted: bool) -> (axum::Router, RecordingSink, Sin90Store) {
     let store = Sin90Store::open_memory().await.unwrap();
     let sink = RecordingSink::default();
     let state = Sin90State::new(
@@ -52,7 +69,7 @@ async fn test_app_with_store() -> (axum::Router, RecordingSink, Sin90Store) {
             automation: AUTOMATION.into(),
         },
     );
-    (router(state), sink, store)
+    (router(state, mounted), sink, store)
 }
 
 fn automation_req(method: &str, uri: &str, body: Value) -> Request<Body> {
@@ -81,6 +98,21 @@ fn get_req(uri: &str) -> Request<Body> {
         .uri(uri)
         .body(Body::empty())
         .unwrap()
+}
+
+/// A `POST /_a24/scheduler/fired` request (T3.2.2). `fire_id: None` omits
+/// `X-A24-Fire-Id` entirely — the 400 test's own subject. No actor-key
+/// header: this route is not gated by `x-sin90-actor-key` (its trust comes
+/// from the mount boundary, `router()`'s doc).
+fn fired_req(uri: &str, fire_id: Option<&str>, body: Value) -> Request<Body> {
+    let mut b = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(id) = fire_id {
+        b = b.header("x-a24-fire-id", id);
+    }
+    b.body(Body::from(body.to_string())).unwrap()
 }
 
 async fn body_json(resp: axum::response::Response) -> Value {
@@ -3001,5 +3033,262 @@ mod routine {
         assert_eq!(new_events.len(), 1, "{new_events:?}");
         assert_eq!(new_events[0].0, "routine.retired");
         assert_eq!(new_events[0].1["routine_id"], json!(id));
+    }
+}
+
+// ---- T3.2.2: POST /_a24/scheduler/fired -------------------------------------
+
+mod fired {
+    use super::*;
+
+    fn fired_body(key: &str, trigger: &str) -> Value {
+        json!({
+            "key": key,
+            "scheduled_for": "2026-09-24T07:00:00Z",
+            "fired_at": "2026-09-24T07:00:05Z",
+            "trigger": trigger,
+        })
+    }
+
+    async fn create_routine_id(app: &axum::Router) -> String {
+        let created = body_json(
+            app.clone()
+                .oneshot(human_req(
+                    "POST",
+                    "/routines",
+                    json!({
+                        "title": "Morning run", "kind": "exercise",
+                        "cron": "0 7 * * MON,WED,FRI",
+                    }),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        created["id"].as_str().unwrap().to_string()
+    }
+
+    // ---- required header ---------------------------------------------------
+
+    #[tokio::test]
+    async fn fired_missing_fire_id_header_is_400() {
+        let (app, _sink, _store) = test_app_mounted().await;
+        let id = create_routine_id(&app).await;
+        let resp = app
+            .oneshot(fired_req(
+                "/_a24/scheduler/fired",
+                None,
+                fired_body(&format!("routine.{id}"), "tick"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ---- unknown body field --------------------------------------------------
+
+    #[tokio::test]
+    async fn fired_unknown_body_field_is_400() {
+        let (app, _sink, _store) = test_app_mounted().await;
+        let id = create_routine_id(&app).await;
+        let mut body = fired_body(&format!("routine.{id}"), "tick");
+        body["nope"] = json!(1);
+        let resp = app
+            .oneshot(fired_req(
+                "/_a24/scheduler/fired",
+                Some("fire-bad-field"),
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ---- standalone -> 404; positive control: mounted -> 2xx -----------------
+
+    #[tokio::test]
+    async fn fired_route_is_404_standalone_positive_control_mounted_2xx() {
+        let (standalone_app, _sink, _store) = test_app_with_store().await; // mounted = false
+        let resp = standalone_app
+            .oneshot(fired_req(
+                "/_a24/scheduler/fired",
+                Some("fire-standalone"),
+                fired_body("routine.does-not-matter", "tick"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // Positive control: the SAME kind of request against a mounted
+        // router (route actually registered, and the key resolves) succeeds.
+        let (mounted_app, _msink, _mstore) = test_app_mounted().await;
+        let mounted_id = create_routine_id(&mounted_app).await;
+        let resp = mounted_app
+            .oneshot(fired_req(
+                "/_a24/scheduler/fired",
+                Some("fire-mounted"),
+                fired_body(&format!("routine.{mounted_id}"), "tick"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ---- duplicate fire_id: idempotent, one event; distinct fire_id: two -----
+
+    #[tokio::test]
+    async fn fired_duplicate_fire_id_one_event_positive_control_distinct_fire_id_two_events() {
+        let (app, sink, _store) = test_app_mounted().await;
+        let id = create_routine_id(&app).await;
+        let key = format!("routine.{id}");
+
+        let resp1 = app
+            .clone()
+            .oneshot(fired_req(
+                "/_a24/scheduler/fired",
+                Some("fire-x"),
+                fired_body(&key, "tick"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp1.status(), StatusCode::OK);
+        let resp2 = app
+            .clone()
+            .oneshot(fired_req(
+                "/_a24/scheduler/fired",
+                Some("fire-x"),
+                fired_body(&key, "tick"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp2.status(),
+            StatusCode::OK,
+            "kernel retry must still be 2xx"
+        );
+
+        let fired_events_after_dup: usize = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| k == "routine.fired")
+            .count();
+        assert_eq!(
+            fired_events_after_dup, 1,
+            "same fire_id sent twice must mirror exactly one routine.fired event"
+        );
+
+        // Positive control: a DIFFERENT fire_id for the same routine is a
+        // real second due slot, not a retry — it DOES add a second event.
+        let resp3 = app
+            .oneshot(fired_req(
+                "/_a24/scheduler/fired",
+                Some("fire-y"),
+                fired_body(&key, "tick"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp3.status(), StatusCode::OK);
+        let fired_events_after_distinct: usize = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| k == "routine.fired")
+            .count();
+        assert_eq!(
+            fired_events_after_distinct, 2,
+            "a distinct fire_id must add a new event"
+        );
+    }
+
+    // ---- unknown key: 200, no row, no event -----------------------------------
+
+    #[tokio::test]
+    async fn fired_unknown_key_is_200_and_writes_no_event() {
+        let (app, sink, store) = test_app_mounted().await;
+        let events_before = sink.0.lock().unwrap().len();
+        let resp = app
+            .oneshot(fired_req(
+                "/_a24/scheduler/fired",
+                Some("fire-unknown-key"),
+                fired_body("routine.does-not-exist", "tick"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            sink.0.lock().unwrap().len(),
+            events_before,
+            "unknown key must not mirror any event"
+        );
+        assert_eq!(
+            crate::store::test_hooks::routine_fire_count(&store, "does-not-exist")
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    // ---- retired routine: 200, no event ---------------------------------------
+
+    #[tokio::test]
+    async fn fired_retired_routine_is_200_and_writes_no_event() {
+        let (app, sink, _store) = test_app_mounted().await;
+        let id = create_routine_id(&app).await;
+        let resp = app
+            .clone()
+            .oneshot(human_req(
+                "POST",
+                &format!("/routines/{id}/transition"),
+                json!({"to": "retired"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let events_before = sink.0.lock().unwrap().len();
+        let resp = app
+            .oneshot(fired_req(
+                "/_a24/scheduler/fired",
+                Some("fire-after-retire"),
+                fired_body(&format!("routine.{id}"), "tick"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            sink.0.lock().unwrap().len(),
+            events_before,
+            "a retired routine's fire must not mirror any event"
+        );
+    }
+
+    // ---- /today surfaces today's fired routines --------------------------------
+
+    #[tokio::test]
+    async fn fired_today_routine_appears_in_today_view() {
+        let (app, _sink, _store) = test_app_mounted().await;
+        let id = create_routine_id(&app).await;
+        let resp = app
+            .clone()
+            .oneshot(fired_req(
+                "/_a24/scheduler/fired",
+                Some("fire-today-http"),
+                fired_body(&format!("routine.{id}"), "tick"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let today = body_json(app.oneshot(get_req("/today")).await.unwrap()).await;
+        let ids: Vec<&str> = today["fired_routines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&id.as_str()), "{ids:?}");
     }
 }

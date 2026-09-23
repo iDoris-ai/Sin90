@@ -77,7 +77,10 @@ async fn run_standalone(
     let state = Sin90State::new(store, Arc::new(NullEventSink), keys);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     tracing::info!(port, "sin90: standalone listening");
-    axum::serve(listener, router(state)).await?;
+    // `mounted = false`: standalone has no Agent24 proxy in front of it to
+    // strip client-forged `X-A24-*` headers, so `POST /_a24/scheduler/fired`
+    // must not exist here at all (router()'s doc, T3.2.2, architecture.md #4).
+    axum::serve(listener, router(state, false)).await?;
     Ok(())
 }
 
@@ -143,10 +146,13 @@ async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
     // `route_namespace == "/api/v1/{name}"` at manifest validation
     // (`agent24-domain`), so hardcoding it here can never drift from what
     // `domain-os.yml` declares without the kernel refusing to mount at all.
-    // `router(state)` itself stays un-nested — `run_standalone` and every
+    // `router(state, ..)` itself stays un-nested — `run_standalone` and every
     // existing test call it directly at bare paths, and both are legitimate:
     // Sin90 served on its own vs. Sin90 served behind Agent24's proxy.
-    let mounted = axum::Router::new().nest("/api/v1/sin90", router(state));
-    axum::serve(listener, mounted).await?;
+    // `mounted = true`: this IS behind Agent24's kernel proxy, which is what
+    // makes `POST /_a24/scheduler/fired` (T3.2.2) trustworthy here — see
+    // router()'s doc and architecture.md #4.
+    let mounted_router = axum::Router::new().nest("/api/v1/sin90", router(state, true));
+    axum::serve(listener, mounted_router).await?;
     Ok(())
 }

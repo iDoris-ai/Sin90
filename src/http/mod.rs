@@ -33,10 +33,10 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::core::{
-    Alloc, AreaStatus, Energy, NewRoutine, RoutinePatch, RoutineStatus, ScheduleBlockStatus,
-    Sin90Proposal, TaskKind, TaskStatus, WeekStatus,
+    Alloc, AreaStatus, Energy, FireTrigger, NewRoutine, RoutinePatch, RoutineStatus,
+    ScheduleBlockStatus, Sin90Proposal, TaskKind, TaskStatus, WeekStatus,
 };
-use crate::store::StoreError;
+use crate::store::{RoutineFireOutcome, StoreError};
 
 pub use actor::{Actor, ActorKeys};
 pub use state::{EventSink, NullEventSink, Sin90State};
@@ -123,8 +123,20 @@ fn parse<T: for<'de> Deserialize<'de>>(
 /// Build the router. `state.actor_keys` gates direct writes (design §7.1);
 /// `state.sink` is where emitted events go (design §5.2 — Sin90 does not know
 /// who is on the other end of it).
-pub fn router(state: Sin90State) -> axum::Router {
-    axum::Router::new()
+///
+/// `mounted` — T3.2.2, architecture.md #4 — is true only when this router
+/// will be served behind Agent24's kernel proxy (`main.rs`'s
+/// `run_as_agent24_module`, nested under `/api/v1/sin90`). `POST
+/// /_a24/scheduler/fired` is registered ONLY in that case: the route's
+/// trustworthiness comes entirely from the kernel proxy stripping any
+/// client-forged `X-A24-*` headers before a request reaches here — the
+/// `--standalone`/`serve` path (`main.rs`'s `run_standalone`) has no such
+/// proxy in front of it, so a client could forge `X-A24-Fire-Id` directly.
+/// Not registering the route there at all (404, not "route exists but
+/// rejects") is the guard; a caller that got past a real Agent24 proxy is
+/// the only one who can ever reach the handler.
+pub fn router(state: Sin90State, mounted: bool) -> axum::Router {
+    let mut r = axum::Router::new()
         .route("/areas", post(create_area).get(list_areas))
         .route("/areas/{id}", patch(transition_area))
         .route("/directions", post(create_direction).get(list_directions))
@@ -147,8 +159,11 @@ pub fn router(state: Sin90State) -> axum::Router {
         .route("/today", get(today))
         .route("/routines", post(create_routine).get(list_routines))
         .route("/routines/{id}", get(get_routine).patch(update_routine))
-        .route("/routines/{id}/transition", post(transition_routine))
-        .with_state(state)
+        .route("/routines/{id}/transition", post(transition_routine));
+    if mounted {
+        r = r.route("/_a24/scheduler/fired", post(scheduler_fired));
+    }
+    r.with_state(state)
 }
 
 // ---- request/query bodies (deny_unknown_fields: reject model typos loudly) --
@@ -268,6 +283,26 @@ struct RoutineListQuery {
 #[serde(deny_unknown_fields)]
 struct RoutineTransitionReq {
     to: RoutineStatus,
+}
+
+/// `POST /_a24/scheduler/fired` body (T3.2.2). Field set and names match the
+/// kernel's `FiredBody` exactly (Agent24 design doc
+/// `ME4-S1-scheduler-callback.md` §5.3: `{key, trigger, scheduled_for,
+/// fired_at}`) — `deny_unknown_fields` so a kernel-side field this module
+/// doesn't know about yet fails loudly rather than being silently dropped.
+/// `fired_at` is not persisted (spec.md M3's `sin90_routine_fires` has no
+/// such column — only `received_at`, this module's OWN receive timestamp,
+/// matters for `/today`'s day-boundary rule) but is still validated as a
+/// fixed-width ISO-8601 timestamp below, same as `scheduled_for`, so a
+/// malformed body fails fast as a 400 rather than being stored opaquely and
+/// discovered wrong later.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FiredReq {
+    key: String,
+    scheduled_for: String,
+    fired_at: String,
+    trigger: FireTrigger,
 }
 
 // ---- Area handlers (new) ----------------------------------------------------
@@ -948,6 +983,123 @@ async fn transition_routine(
             };
             state.emit(kind, serde_json::json!({ "routine_id": routine.id }));
             Json(routine).into_response()
+        }
+        Err(e) => map_err(e),
+    }
+}
+
+// ---- fired receipt (new, T3.2.2, design §2 #16) -----------------------------
+//
+// `POST /_a24/scheduler/fired` — the kernel scheduler's at-least-once
+// delivery landing point (spec.md M3 "fired"; architecture.md #4). Only
+// registered when `router(.., mounted: true)` — see that function's doc for
+// why. No actor-key gate: this route's authenticity comes from the mount
+// boundary itself (the kernel proxy strips client-forged `X-A24-*` headers),
+// not from `x-sin90-actor-key` — the kernel is not "human" or "automation"
+// in that sense.
+//
+// `fired_at` (part of the body, see `FiredReq`) is today ONLY format-checked
+// (fixed-width ISO-8601) and then discarded — it is not persisted anywhere
+// (no column, not in the mirrored `routine.fired` event). If a later task
+// needs it (e.g. review/audit wanting to know when the kernel actually sent
+// a delivery, not just the `scheduled_for` slot or this module's own
+// `received_at`), that is new work, not something already wired up here.
+
+/// `X-A24-Fire-Id` (T3.2.2, spec.md M3): required on every fired delivery —
+/// missing it is a 400, not a silently-accepted request, since without it
+/// there is nothing to dedup a kernel retry against.
+#[allow(clippy::result_large_err)]
+fn require_fire_id(headers: &HeaderMap) -> std::result::Result<&str, Response> {
+    headers
+        .get("x-a24-fire-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "missing required header X-A24-Fire-Id",
+            )
+        })
+}
+
+/// Every outcome below answers 2xx — spec.md M3 and the kernel's delivery
+/// contract (Agent24 design doc §4.1) both require it: the kernel treats any
+/// non-2xx as a failed delivery and retries, and none of
+/// [`RoutineFireOutcome`]'s variants are an actual delivery failure (see that
+/// type's doc). The handler itself does no slow work — `record_routine_fire`
+/// is the one query round-trip, then this returns; nothing here calls out to
+/// the kernel or blocks on anything else.
+async fn scheduler_fired(
+    State(state): State<Sin90State>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let fire_id = match require_fire_id(&headers) {
+        Ok(id) => id.to_string(),
+        Err(r) => return r,
+    };
+    let req: FiredReq = match parse(&body, "fired") {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    if !crate::core::is_fixed_iso8601(&req.scheduled_for)
+        || !crate::core::is_fixed_iso8601(&req.fired_at)
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "scheduled_for and fired_at must be fixed-width ISO-8601 (YYYY-MM-DDThh:mm:ssZ)",
+        );
+    }
+
+    match state
+        .store
+        .record_routine_fire(&fire_id, &req.key, &req.scheduled_for, req.trigger)
+        .await
+    {
+        Ok(RoutineFireOutcome::Recorded { routine_id }) => {
+            // Mirror the SAME fields the store's own internal `routine.fired`
+            // event carries (design convention every other direct-write
+            // handler above follows) — only on a REAL new record, never on a
+            // duplicate, matching `update_routine`'s "no internal event -> no
+            // mirrored event" rule.
+            state.emit(
+                "routine.fired",
+                serde_json::json!({
+                    "routine_id": routine_id, "fire_id": fire_id,
+                    "scheduled_for": req.scheduled_for, "trigger": req.trigger,
+                }),
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "status": "recorded", "routine_id": routine_id })),
+            )
+                .into_response()
+        }
+        Ok(RoutineFireOutcome::Duplicate { routine_id }) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "duplicate", "routine_id": routine_id })),
+        )
+            .into_response(),
+        Ok(RoutineFireOutcome::UnknownKey) => {
+            // Not an error the kernel should retry over — this module's own
+            // bookkeeping drift (T3.3.2's reconciler is where orphans get
+            // cleaned up, not here; see design §16/architecture.md #4).
+            tracing::warn!(key = %req.key, fire_id = %fire_id, "sin90: fired for unknown key (orphan — reconciler will handle it)");
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "status": "unknown_key" })),
+            )
+                .into_response()
+        }
+        Ok(RoutineFireOutcome::RoutineRetired { routine_id }) => {
+            tracing::warn!(routine_id = %routine_id, fire_id = %fire_id, "sin90: fired for a retired routine (orphan — reconciler will handle it)");
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "status": "routine_retired", "routine_id": routine_id })),
+            )
+                .into_response()
         }
         Err(e) => map_err(e),
     }
