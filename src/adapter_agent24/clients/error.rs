@@ -241,15 +241,6 @@ impl ClientError {
 /// The one place `transport::TransportError` becomes a [`ClientError`] —
 /// every typed client (`scheduler`/`memory`/`approval`) routes through this,
 /// so the merge decision (L-6) and the kind mapping live in exactly one spot.
-///
-/// T3.2.1a (this branch, stacked below `feat/t3.2.1b-scheduler-client`): no
-/// typed client exists yet in THIS commit to call it outside this file's own
-/// `#[cfg(test)]` module — `SchedulerClient` lands in the next branch of the
-/// stack and calls this on every request. `#[cfg_attr(not(test), ...)]`
-/// (not a bare `#[allow(dead_code)]`, matching `transport.rs`'s own existing
-/// convention for "no production caller as of this commit") keeps the lint
-/// live for the test build, where it already has callers.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn map_transport_error(err: TransportError) -> ClientError {
     // Computed before the match moves `err` into the `Rpc(info)` arm —
     // unused by that arm (it builds its own message from `info` instead via
@@ -276,10 +267,6 @@ pub(crate) fn map_transport_error(err: TransportError) -> ClientError {
 /// `.unwrap_or(true)`-style guessing on a present-but-unexpected-type value;
 /// anything other than a literal JSON `false` falls through to the ordinary
 /// `Timeout` classification.
-///
-/// Same T3.2.1a note as [`map_transport_error`]'s doc: no caller outside
-/// this file's own tests until `feat/t3.2.1b-scheduler-client` lands.
-#[cfg_attr(not(test), allow(dead_code))]
 fn request_id_explicitly_not_in_flight(info: &RpcErrorInfo) -> bool {
     info.raw
         .get("data")
@@ -297,10 +284,6 @@ fn request_id_explicitly_not_in_flight(info: &RpcErrorInfo) -> bool {
 /// `map_memory_error` takes (Agent24 `os_memory_page.rs`). See the module
 /// docs for which of the 17 real SPEC kinds get their own variant and which
 /// fall through on purpose.
-///
-/// Same T3.2.1a note as [`map_transport_error`]'s doc: no caller outside
-/// this file's own tests until `feat/t3.2.1b-scheduler-client` lands.
-#[cfg_attr(not(test), allow(dead_code))]
 fn map_rpc_error(info: &RpcErrorInfo) -> ClientError {
     if info.code == -32602 {
         return ClientError::InvalidParams(info.to_string());
