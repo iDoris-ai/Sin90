@@ -82,11 +82,11 @@
 - **优先级**：high
 - **目标**：替换今天「一个 mutex 包住整个写请求—读响应往返」的串行 `CallbackChannel`（`adapter_agent24/mod.rs:85-101`），为并发的调度/记忆/模型调用铺路。
 - **开发范围**：单 writer + 后台 reader + `id → oneshot` 分发；在途上限 64（与内核 `MAX_IN_FLIGHT_PER_CONNECTION` 一致）；调用方取消 → 发 JSON-RPC **notification** `$/cancelRequest`（params `{id}`，notification 本身不带 id；方法名以 `agent24-os-proto/src/rpc.rs:94-95` 的 `CANCEL_METHOD` 为准）并释放槽位；
-  断连重连后**原子替换 `Offer.provides`**（今天重连把新 Offer 丢掉，`mod.rs:143-151`）；`KernelClients` 独立持有 channel，不再挂在 EventSink 上（今天 `main.rs:91-95` 只有 events 被 offer 时才保留 channel）。
+  **回调连接断了就结束这一代**（内核合约 D1：一代一条连接、不许重连，见 architecture 第 5 条）：transport 判定死亡 → 关闭连接、在途调用得到「结果不确定」错误（不自动重试）→ 进程以非零码退出，由 supervisor 重启；删除现有重连逻辑；`KernelClients` 独立持有 channel，不再挂在 EventSink 上（今天 `main.rs:91-95` 只有 events 被 offer 时才保留 channel）。
 - **明确不做**：新的业务客户端（T3.2.1）。
 - **依赖**：T0.1
 - **验收命令**：`cargo test transport_`（假 socket）：两个并发调用乱序返回各自拿到正确结果；第 65 个在途调用排队/拒绝按设计；取消后槽位释放且写出的取消帧逐字节等于 `{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":…}}`（精确 wire 测试）；
-  重连后 Offer 缩减 → 对应客户端变 `None`；只 offer scheduler、不 offer events 时 channel 仍被保留（正对照：都不 offer → 无 channel）。变异：reader 按到达顺序而非 id 分发 → 变红。
+  连接死亡 → 在途调用在有界时间内拿到错误、之后的新调用立即失败、进程退出路径被触发（测试里用可注入的退出回调代替真正 exit）；只 offer scheduler、不 offer events 时 channel 仍被保留（正对照：都不 offer → 无 channel）。变异：reader 按到达顺序而非 id 分发 → 变红。
 - **证据**：
 
 ### T3.2.1 握手声明 + 类型化内核客户端  `BACKLOG`
@@ -96,7 +96,7 @@
   错误 kind 映射成 Sin90 的错误类型（forbidden / rate_limited / busy / quota_exceeded / invalid_params / timeout / 其它）。
 - **明确不做**：业务调用方；SDK（MS 再换）；真实挂载验收（T3.2.3）。
 - **依赖**：T3.2.0；Agent24 `ME4-1.1.1`（线格式冻结）
-- **验收命令**：`cargo test adapter_agent24::clients`（假 socket 回放成功 / forbidden / rate_limited / 断连重连）。
+- **验收命令**：`cargo test adapter_agent24::clients`（假 socket 回放成功 / forbidden / rate_limited / 连接死亡 → 结果不确定错误）。
 - **证据**：
 
 ### T3.2.3 真实挂载下的 Offer 验收  `BACKLOG`
