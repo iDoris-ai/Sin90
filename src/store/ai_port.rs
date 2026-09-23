@@ -20,8 +20,8 @@
 use sqlx::{Acquire, Row, SqlitePool};
 
 use crate::ai::ports::{
-    AiCallRecord, AiReadModel, AiSettings, AiSink, Capability, DirectionCandidate, ProposalDraft,
-    ReadError, SettingsRead, SinkError,
+    AiCallRecord, AiReadModel, AiSettings, AiSink, Capability, DirectionCandidate, Engine,
+    ProposalDraft, ReadError, SettingsRead, SinkError,
 };
 use crate::ai::source_for;
 use crate::core::{
@@ -223,6 +223,35 @@ fn allowed_ops(cap: Capability, ops: &[Sin90Op]) -> Result<(), SinkError> {
     }
 }
 
+/// 2026-09-24 review: `apply_op`'s dry run can fail two structurally
+/// different ways, and conflating them was a bug. A relational/constraint
+/// violation (task not in the target week, week not open, a CAS `UPDATE`
+/// matching zero rows, an illegal transition, …) means the PROPOSAL is bad —
+/// `SinkError::Invalid`, and the caller is meant to record this as
+/// `error_kind = "rejected_by_precheck"` (§11.3.5). A transient
+/// infrastructure failure (`SQLITE_BUSY` under contention, a raw I/O error,
+/// a `serde_json` payload that fails to (de)serialize) says NOTHING about
+/// whether the proposal itself is valid — recording that as
+/// "rejected_by_precheck" would be actively misleading (the model didn't
+/// produce bad output; the store just hiccuped). Those map to
+/// `SinkError::Store` instead, same as every other infra failure in this
+/// file.
+fn classify_apply_err(e: StoreError) -> SinkError {
+    match e {
+        StoreError::NotFound(_)
+        | StoreError::Conflict(_)
+        | StoreError::WeekNotOpen(_)
+        | StoreError::SameWeekCarry(_)
+        | StoreError::Invalid(_)
+        | StoreError::Transition(_)
+        | StoreError::Proposal(_) => SinkError::Invalid(e.to_string()),
+        StoreError::Sqlx(_)
+        | StoreError::Migrate(_)
+        | StoreError::Serde(_)
+        | StoreError::Internal(_) => SinkError::Store(e.to_string()),
+    }
+}
+
 /// Steps 2–3 of `submit`/`precheck` (§11.4 公共): `build_snapshot` →
 /// `validate` → SAVEPOINT `apply_op` × n → unconditional `ROLLBACK TO`. Never
 /// commits anything — the SAVEPOINT is always rolled back regardless of
@@ -256,7 +285,7 @@ async fn dry_run(
     let mut dry: Result<(), SinkError> = Ok(());
     for op in ops {
         if let Err(e) = apply_op(&mut sp, op, &mut event_ids).await {
-            dry = Err(SinkError::Invalid(e.to_string()));
+            dry = Err(classify_apply_err(e));
             break;
         }
     }
@@ -274,6 +303,23 @@ impl AiSink for Sin90Store {
         mut rec: AiCallRecord,
     ) -> Result<(), SinkError> {
         allowed_ops(cap, &draft.ops)?;
+        // 2026-09-24 review: `submit` is where a call record turns into a
+        // committed `ok=1` proposal row — it must not blindly trust what the
+        // caller put in `rec`. Two defenses:
+        //   1. `rec.engine == Reflex` together with a `served_tier` is a
+        //      contradiction (reflex never talks to a model, so it can never
+        //      have a served tier) — reject rather than silently store
+        //      nonsense that `source_for` would then derive a wrong
+        //      `source` from.
+        //   2. Regardless of what `rec.ok`/`rec.error_kind` said coming in,
+        //      the row `submit` inserts is ALWAYS `ok=1, error_kind=NULL` —
+        //      by definition, reaching this point (past the dry run below)
+        //      means this attempt produced the proposal being submitted.
+        if rec.engine == Engine::Reflex && rec.served_tier.is_some() {
+            return Err(SinkError::Invalid(
+                "a reflex call record cannot carry a served_tier".into(),
+            ));
+        }
 
         let mut tx = self
             .pool()
@@ -282,6 +328,8 @@ impl AiSink for Sin90Store {
             .map_err(|e| SinkError::Store(e.to_string()))?;
 
         dry_run(&mut tx, &draft.id, &draft.ops, &draft.rationale).await?;
+        rec.ok = true;
+        rec.error_kind = None;
 
         let source = source_for(rec.engine, rec.served_tier);
         let source_wire = to_wire(&source).map_err(|e| SinkError::Store(e.to_string()))?;
@@ -465,6 +513,18 @@ mod tests {
     /// `rowid` so insertion order is stable. Schema-agnostic on purpose:
     /// this test must not need updating every time a column is added
     /// elsewhere.
+    ///
+    /// 2026-09-24 review (M1): `sin90_events` is split into TWO keys —
+    /// `entity = 'proposal'` rows and everything else — instead of one
+    /// blob. §11.5's own exclusion list names exactly three things a
+    /// capability run may change: `sin90_proposals`, `sin90_ai_calls`, and
+    /// `sin90_events WHERE entity = 'proposal'`. A single `sin90_events` key
+    /// could not tell "the expected proposal.submitted row landed" apart
+    /// from "something ALSO wrote a task/direction/review event it had no
+    /// business writing" — both just say "sin90_events changed". Splitting
+    /// the key lets `ai_boundary_tables_unchanged` assert the narrower,
+    /// actually-designed claim: the `entity <> 'proposal'` half must NEVER
+    /// change from anything in `ai/`'s reach.
     async fn snapshot_all_tables(pool: &SqlitePool) -> BTreeMap<String, Vec<String>> {
         let tables: Vec<String> = sqlx::query_scalar(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
@@ -485,6 +545,24 @@ mod tests {
                 .map(|c| format!("quote({c})"))
                 .collect::<Vec<_>>()
                 .join(" || '|' || ");
+            if t == "sin90_events" {
+                for (key, where_clause) in [
+                    ("sin90_events(entity=proposal)", "WHERE entity = 'proposal'"),
+                    (
+                        "sin90_events(entity<>proposal)",
+                        "WHERE entity <> 'proposal'",
+                    ),
+                ] {
+                    let rows: Vec<String> = sqlx::query_scalar(&format!(
+                        "SELECT {expr} AS r FROM {t} {where_clause} ORDER BY rowid"
+                    ))
+                    .fetch_all(pool)
+                    .await
+                    .unwrap();
+                    out.insert(key.to_string(), rows);
+                }
+                continue;
+            }
             let rows: Vec<String> =
                 sqlx::query_scalar(&format!("SELECT {expr} AS r FROM {t} ORDER BY rowid"))
                     .fetch_all(pool)
@@ -599,10 +677,14 @@ mod tests {
 
         // ---- 3. AiSink::submit (H3's dry run: validate + SAVEPOINT
         //         apply_op + unconditional ROLLBACK TO) touches ONLY
-        //         sin90_proposals, sin90_ai_calls, and sin90_events (the
+        //         sin90_proposals, sin90_ai_calls, and the
+        //         `entity = 'proposal'` half of sin90_events (the
         //         proposal.submitted row) — sin90_tasks is UNCHANGED even
         //         though the proposal's ops reorder it, because the apply
-        //         itself was rolled back.
+        //         itself was rolled back, and the `entity <> 'proposal'`
+        //         half of sin90_events is untouched too (M1: this is the
+        //         narrower claim the design's 3-item exclusion list
+        //         actually makes, not just "sin90_events changed somehow").
         let before = after;
         let produced = rec("call-2", "run-1", true, None);
         AiSink::submit(&store, Capability::Propose, valid_draft.clone(), produced)
@@ -615,10 +697,11 @@ mod tests {
             changed,
             vec![
                 "sin90_ai_calls".to_string(),
-                "sin90_events".to_string(),
+                "sin90_events(entity=proposal)".to_string(),
                 "sin90_proposals".to_string(),
             ],
-            "submit's dry-run apply must leave sin90_tasks (and everything else) untouched"
+            "submit's dry-run apply must leave sin90_tasks (and everything else, including \
+             non-proposal events) untouched"
         );
         assert_eq!(
             before.get("sin90_tasks"),
@@ -862,5 +945,113 @@ mod tests {
         assert_eq!(n2, 2);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- 2026-09-24 review: submit doesn't trust the caller's rec --------
+
+    /// `submit` writes `ok=1, error_kind=NULL` REGARDLESS of what the caller
+    /// put in `rec` — reaching past the dry run means this attempt produced
+    /// the proposal. Mutation target: remove the `rec.ok = true; rec.error_kind
+    /// = None;` overwrite in `submit` and this goes red (the row keeps the
+    /// caller's `ok=0, error_kind=Some("bogus")`).
+    #[tokio::test]
+    async fn ai_sink_submit_always_writes_ok_true_and_null_error_kind() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let (week_id, t1, t2) = seed_week_with_tasks(&store).await;
+        let draft = ProposalDraft {
+            id: "p-forced-ok".into(),
+            ops: vec![Sin90Op::ReorderTasks {
+                week_id,
+                order: vec![t2, t1],
+            }],
+            rationale: None,
+        };
+        // A caller that (wrongly) claims failure — submit must not trust it.
+        let mut bogus = rec("call-forced", "run-forced", false, Some("bogus"));
+        bogus.proposal_id = None;
+        AiSink::submit(&store, Capability::Propose, draft, bogus)
+            .await
+            .unwrap();
+
+        let (ok, error_kind): (bool, Option<String>) =
+            sqlx::query_as("SELECT ok, error_kind FROM sin90_ai_calls WHERE id = 'call-forced'")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert!(
+            ok,
+            "submit must force ok=1 regardless of what the caller passed"
+        );
+        assert_eq!(
+            error_kind, None,
+            "submit must force error_kind=NULL regardless of what the caller passed"
+        );
+    }
+
+    /// `engine == Reflex` with a non-`None` `served_tier` is a contradiction
+    /// (reflex never talks to a model) — `submit` rejects it before even
+    /// opening a transaction. Mutation target: remove the guard in `submit`
+    /// and this goes from `is_err()` to succeeding (and `source_for` would
+    /// then derive a nonsensical `source` from the bogus tier).
+    #[tokio::test]
+    async fn ai_sink_submit_rejects_reflex_with_served_tier() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let (week_id, t1, t2) = seed_week_with_tasks(&store).await;
+        let draft = ProposalDraft {
+            id: "p-bad-combo".into(),
+            ops: vec![Sin90Op::ReorderTasks {
+                week_id,
+                order: vec![t2, t1],
+            }],
+            rationale: None,
+        };
+        let mut bad = rec("call-bad-combo", "run-bad-combo", true, None);
+        bad.served_tier = Some(crate::ai::ports::ServedTier::Local);
+        let err = AiSink::submit(&store, Capability::Propose, draft, bad).await;
+        assert!(
+            err.is_err(),
+            "reflex + served_tier is a contradiction and must be rejected"
+        );
+        let n: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM sin90_proposals WHERE id = 'p-bad-combo'")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            n, 0,
+            "the rejected submit must not have written a proposal row"
+        );
+    }
+
+    /// A relational/constraint error from `apply_op` (task not in the
+    /// target week) classifies as `SinkError::Invalid` — the caller is
+    /// meant to record this as `rejected_by_precheck`; a raw infrastructure
+    /// error (SQLite busy, I/O, a broken internal invariant) classifies as
+    /// `SinkError::Store` instead, since it says nothing about whether the
+    /// PROPOSAL was valid. Mutation target: collapse `classify_apply_err` to
+    /// always return `SinkError::Invalid` and the second assertion goes red
+    /// (matching on `SinkError::Store` would then fail).
+    #[test]
+    fn classify_apply_err_distinguishes_constraint_from_infra_errors() {
+        assert!(matches!(
+            classify_apply_err(StoreError::NotFound("task x".into())),
+            SinkError::Invalid(_)
+        ));
+        assert!(matches!(
+            classify_apply_err(StoreError::WeekNotOpen("w".into())),
+            SinkError::Invalid(_)
+        ));
+        assert!(matches!(
+            classify_apply_err(StoreError::Conflict("dup".into())),
+            SinkError::Invalid(_)
+        ));
+        assert!(matches!(
+            classify_apply_err(StoreError::Internal("broken invariant".into())),
+            SinkError::Store(_)
+        ));
+        assert!(matches!(
+            classify_apply_err(StoreError::Sqlx(sqlx::Error::PoolClosed)),
+            SinkError::Store(_)
+        ));
     }
 }

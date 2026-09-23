@@ -144,6 +144,17 @@ impl Sin90Store {
     /// discipline is unchanged (`max_connections(1)` here); a unique name per
     /// call keeps concurrent test stores from colliding with each other. No
     /// `data_dir` — see the field's doc.
+    ///
+    /// 2026-09-24 review: a NAMED shared-cache memory database is destroyed
+    /// the moment its LAST connection closes — SQLite has no other owner of
+    /// its storage. `sqlx`'s default pool reaper closes idle connections
+    /// (`idle_timeout`) and periodically recycles even busy ones
+    /// (`max_lifetime`); with `max_connections(1)` on the write pool, a
+    /// reap-then-nothing-holds-it-open window would silently drop every row
+    /// this store has ever written. Both pools below pin `min_connections(1)`
+    /// with `idle_timeout(None)`/`max_lifetime(None)` so at least one
+    /// connection to this store's name is ALWAYS open for as long as the
+    /// `Sin90Store` (and therefore these pools) exists.
     pub async fn open_memory() -> Result<Self> {
         let uri = format!(
             "sqlite:file:sin90-{}?mode=memory&cache=shared",
@@ -154,11 +165,17 @@ impl Sin90Store {
             .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
+            .min_connections(1)
+            .idle_timeout(None)
+            .max_lifetime(None)
             .connect_with(options.clone())
             .await?;
         sqlx::migrate!("./src/store/migrations").run(&pool).await?;
         let ai_pool = SqlitePoolOptions::new()
             .max_connections(2)
+            .min_connections(1)
+            .idle_timeout(None)
+            .max_lifetime(None)
             .connect_with(options.pragma("query_only", "ON"))
             .await?;
         Ok(Self {
