@@ -54,4 +54,10 @@ rustix = { version = "0.38", features = ["process"] }
 # named specifier actually fires on. Not a runtime dependency — Sin90 never
 # computes a next-fire itself (the kernel scheduler does).
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+# Test-only (T5.1.1, design §11.5): `tests/ai_boundary.rs`'s syn-based
+# whitelist walk over `src/ai/**/*.rs` (J7). Deliberately NOT a normal
+# dependency and NOT in `ai/`'s own allowed-external-crate list — the
+# checker cannot live inside `ai/` without failing its own check.
+syn = { version = "2", features = ["full", "visit"] }
+proc-macro2 = "1"
 
