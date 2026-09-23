@@ -12,10 +12,14 @@
 //! data itself was trivial to wire once Area existed).
 //!
 //! New in this port: [`ActorKey`]-gated direct writes (design §7.1) — every
-//! direct-write route requires the human actor key; only the Proposal routes
-//! accept the automation key. This is enforced HERE, in Sin90's own code, not
-//! delegated to Agent24 (design §7.1's evaluation: the kernel has no
-//! AI-vs-human caller concept and should not grow one for this).
+//! direct-write route requires the human actor key; only `POST /proposals`
+//! accepts the automation key. `POST /proposals/{id}/accept` commits state,
+//! so it requires the human key too — the automation key may propose but
+//! never approve its own proposal (Codex 2026-09-22 review, High: this used
+//! to accept either key, letting automation self-approve). This is enforced
+//! HERE, in Sin90's own code, not delegated to Agent24 (design §7.1's
+//! evaluation: the kernel has no AI-vs-human caller concept and should not
+//! grow one for this).
 
 pub mod actor;
 pub mod state;
@@ -536,7 +540,7 @@ async fn week_attention(State(state): State<Sin90State>, AxPath(id): AxPath<Stri
     }
 }
 
-// ---- Proposal handlers (ported, unchanged; automation key accepted here) ---
+// ---- Proposal handlers (submit: either key; accept: human only) ------------
 
 async fn submit_proposal(
     State(state): State<Sin90State>,
@@ -573,7 +577,11 @@ async fn accept_proposal(
     headers: HeaderMap,
     AxPath(id): AxPath<String>,
 ) -> Response {
-    if let Err(r) = state.require_any_actor(&headers) {
+    // Codex 2026-09-22 review (High): `require_any_actor` here let the
+    // automation key submit AND accept its own proposal, making the
+    // human-approval boundary (design §7.1) cosmetic. Accept commits state —
+    // only a human may pull that trigger; automation may still submit.
+    if let Err(r) = state.require_human(&headers) {
         return r;
     }
     match state.store.apply_proposal(&id).await {
