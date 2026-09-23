@@ -7,34 +7,59 @@
 //! [`crate::http::EventSink`] to `_a24/events/emit` over that same socket.
 //!
 //! `agent24-os-sdk` (Agent24's T13) does not exist yet (design §7.2) — this is
-//! the ~200 lines Sin90 writes itself until it does. Only this file needs to
+//! the code Sin90 writes itself until it does. Only this module needs to
 //! change when the SDK lands.
-
-use std::os::unix::io::FromRawFd;
-use std::sync::Arc;
+//!
+//! # Concurrency and connection lifetime (T3.2.0)
+//!
+//! [`KernelClients`] holds the live connection and the `Offer` it was
+//! granted, independently of any one caller — [`KernelEventSink`] is just one
+//! of its users, not the owner of the channel. The connection itself is a
+//! [`transport::Transport`] (single writer task, background reader task,
+//! calls dispatched by id — see that module for the in-flight bound,
+//! cancellation, and error semantics).
+//!
+//! **There is no reconnect.** The kernel serves exactly one callback
+//! connection per generation (`agent24-os-proto::endpoint::CallbackListener`,
+//! user decision D1): once it is gone, this generation is over. When
+//! [`transport::Transport`] decides the connection is dead it runs an
+//! injected hook exactly once; in production (`main.rs`) that hook is
+//! `std::process::exit`, so the supervisor starts a fresh generation — with a
+//! fresh process, fresh handshake, and whatever `Offer` the kernel grants
+//! that time. `KernelClients`'s own `Offer` is therefore set once, at
+//! construction, and never changes.
 
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use std::os::unix::io::FromRawFd;
+use std::sync::Arc;
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
-use tokio::sync::Mutex;
 
-use crate::http::EventSink;
+use crate::http::{EventSink, NullEventSink};
 
 mod frame;
 mod transport;
 
-/// Upper bound on one callback round trip (reconnect, or write + read the
-/// reply). A kernel that accepts but never answers must not wedge the event
-/// worker — and with it every later event — forever.
-const DEFAULT_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Events waiting for the worker. Past this, new events are dropped and
 /// counted rather than buffered without bound.
 const DEFAULT_EVENT_QUEUE: usize = 1024;
 
-/// This module's declared protocol range. `min == max == 1`: Sin90 speaks
-/// exactly the one version `me3f_blackbox.rs` exercises; there is nothing yet
-/// to negotiate a RANGE over.
+// L-1: only `FatalHook` is re-exported — `main.rs` needs to name it to
+// construct `KernelClients::handshake`'s `on_fatal` argument. `TransportError`
+// stays crate-internal (see `transport::TransportError`'s own doc): nothing
+// outside this crate calls `KernelClients::call` (only `KernelEventSink`
+// does, from inside this same module), so nothing outside needs to name the
+// error type it returns.
+pub use transport::FatalHook;
+
+/// Sin90 declares it accepts `initialize` protocol versions 1 through 1000
+/// (`min`/`max` below) — a wide, permissive range, NOT "exactly version 1"
+/// (an earlier version of this comment said `min == max == 1`, which was
+/// never true of the constants two lines down and was corrected along with
+/// T3.2.0). There is only one version `me3f_blackbox.rs` exercises today;
+/// the range exists so a later kernel offering, say, version 2 does not need
+/// this module rebuilt just to keep negotiating successfully.
 const PROTOCOL_MIN: u32 = 1;
 const PROTOCOL_MAX: u32 = 1000;
 
@@ -89,145 +114,118 @@ pub fn manifest_digest(manifest_bytes: &[u8]) -> String {
     format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
-/// A live callback connection, past the `initialize` handshake. `conn` is
-/// behind a `Mutex` because every subsequent call (only `_a24/events/emit` in
-/// M0) is a full request-then-read-the-matching-response round trip on the
-/// SAME socket — serializing access here is simpler and sufficient at M0's
-/// call volume than a background reader + per-request channel; if
-/// `agent24-os-sdk` supersedes this file (design §7.2), that concurrency
-/// design is its call to make, not this one's to anticipate.
-///
-/// `conn` is `None` exactly when the last known state of the socket is
-/// "desynced or closed" — a read/write error, a frame that failed to parse,
-/// or one that arrived with a `FrameTooLong`/id-mismatch shape we don't know
-/// how to keep reading past. Leaving a `BufReader` in place after any of
-/// those would mean every later `emit()` keeps reading from the wrong offset
-/// in the stream forever, silently warning on each call until the process is
-/// restarted — `emit()` reconnects (one fresh `initialize`) instead of
-/// reusing a connection it can no longer trust the framing of.
-pub struct CallbackChannel {
-    conn: Mutex<Option<BufReader<UnixStream>>>,
-    next_id: std::sync::atomic::AtomicU64,
-    sock_path: std::path::PathBuf,
-    module: String,
-    manifest_bytes: Vec<u8>,
-    auth_token: String,
-    io_timeout: std::time::Duration,
+/// Capability prefixes Sin90 has any use for, per the kernel contract table
+/// (`docs/agent/architecture.md` §"与内核的契约"). Only `events` is wired up
+/// today (`KernelEventSink`); `scheduler`/`memory` (private)/`approval` get
+/// typed clients in T3.2.1. `model` is deliberately NOT listed — Sin90 does
+/// not declare that capability this round (L4), and the `initialize`
+/// `capabilities` field below stays `["events"]` only; T3.2.1 is what
+/// expands both together.
+pub const SIN90_CAPABILITY_PREFIXES: &[&str] = &[
+    "_a24/events/",
+    "_a24/scheduler/",
+    "_a24/memory/private/",
+    "_a24/approval/",
+];
+
+/// Whether `offer` grants at least one prefix from
+/// [`SIN90_CAPABILITY_PREFIXES`] — the decoupled "keep the callback channel
+/// open" decision (design §5), separate from "is `events` specifically among
+/// them" (only [`wire_kernel_clients`]'s `EventSink` choice cares about
+/// that).
+pub fn provides_any_known_capability(offer: &[String]) -> bool {
+    offer.iter().any(|granted| {
+        SIN90_CAPABILITY_PREFIXES
+            .iter()
+            .any(|known| granted.starts_with(known) || known.starts_with(granted.as_str()))
+    })
 }
 
-impl CallbackChannel {
-    /// Connect and run `initialize`. Returns the channel plus the kernel's
-    /// `Offer` (which methods this connection may call).
+/// Independently holds the callback channel (a [`transport::Transport`]) and
+/// the `Offer` it was granted at handshake time — [`KernelEventSink`] is
+/// just one of this struct's users. No reconnect, no mutable `Offer` after
+/// construction — see module docs for why.
+pub struct KernelClients {
+    transport: transport::Transport,
+    offer: Vec<String>,
+}
+
+impl KernelClients {
+    /// Connect and run `initialize`. `on_fatal` runs exactly once, the
+    /// moment the underlying [`transport::Transport`] decides the connection
+    /// is dead (production: exit the process; tests: record that it
+    /// happened) — see [`transport`]'s module docs.
     pub async fn handshake(
         sock_path: &std::path::Path,
         module: &str,
         manifest_bytes: &[u8],
         auth_token: &str,
+        on_fatal: FatalHook,
     ) -> Result<(Self, Vec<String>), AdapterError> {
-        let (reader, provides) =
+        let (stream, offer) =
             connect_and_initialize(sock_path, module, manifest_bytes, auth_token).await?;
-        Ok((
-            Self {
-                conn: Mutex::new(Some(reader)),
-                next_id: std::sync::atomic::AtomicU64::new(2), // id "1" was the handshake
-                sock_path: sock_path.to_path_buf(),
-                module: module.to_string(),
-                manifest_bytes: manifest_bytes.to_vec(),
-                auth_token: auth_token.to_string(),
-                io_timeout: DEFAULT_IO_TIMEOUT,
-            },
-            provides,
-        ))
+        let transport = transport::Transport::spawn(stream, on_fatal);
+        let clients = Self {
+            transport,
+            offer: offer.clone(),
+        };
+        Ok((clients, offer))
     }
 
-    /// Call `_a24/events/emit`. Best-effort: a callback failure is logged and
-    /// swallowed, same posture as the ported kernel handlers' "no sink granted
-    /// -> degrade, don't fail the mutation" (design §5.3) — a Sin90 write must
-    /// not fail because the event side-channel hiccuped. On a desynced or
-    /// closed connection, reconnects once before giving up on this call —
-    /// see the struct doc for why reusing a broken `conn` isn't an option.
-    pub async fn emit(&self, kind: &str, payload: Map<String, Value>) {
-        let mut conn = self.conn.lock().await;
-        if conn.is_none() {
-            let reconnect = connect_and_initialize(
-                &self.sock_path,
-                &self.module,
-                &self.manifest_bytes,
-                &self.auth_token,
-            );
-            match tokio::time::timeout(self.io_timeout, reconnect).await {
-                Ok(Ok((reader, _provides))) => *conn = Some(reader),
-                Ok(Err(e)) => {
-                    tracing::warn!(error = %e, kind, "sin90: could not reconnect to emit events/emit");
-                    return;
-                }
-                Err(_) => {
-                    tracing::warn!(kind, "sin90: reconnect for events/emit timed out");
-                    return;
-                }
-            }
-        }
-        let id = self
-            .next_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            .to_string();
-        let req = json!({
-            "jsonrpc": "2.0",
-            "method": "_a24/events/emit",
-            "id": id,
-            "params": { "kind": kind, "payload": payload },
-        });
-        // From here on, any error means the stream's framing can no longer be
-        // trusted (we don't know how much of a frame the kernel received, or
-        // whether the reader's position matches a frame boundary) — drop the
-        // connection so the NEXT `emit()` reconnects rather than continuing
-        // to read a desynced stream. A timeout counts: the late reply would
-        // otherwise be read as the answer to the next request.
-        let reader = conn.as_mut().expect("just ensured Some above");
-        let round_trip = async {
-            frame::write_frame(reader.get_mut(), &req).await?;
-            frame::read_frame(reader).await
-        };
-        let line = match tokio::time::timeout(self.io_timeout, round_trip).await {
-            Ok(Ok(line)) => line,
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, kind, "sin90: events/emit round trip failed");
-                *conn = None;
-                return;
-            }
-            Err(_) => {
-                tracing::warn!(kind, "sin90: events/emit timed out");
-                *conn = None;
-                return;
-            }
-        };
-        match serde_json::from_slice::<Value>(&line) {
-            Ok(resp) if resp["id"].as_str() != Some(id.as_str()) => {
-                tracing::warn!(kind, sent = %id, got = %resp["id"], "sin90: events/emit reply id mismatch");
-                *conn = None;
-            }
-            Ok(resp) => {
-                if let Some(err) = resp.get("error") {
-                    tracing::warn!(kind, ?err, "sin90: events/emit rejected by kernel");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, kind, "sin90: events/emit response was not valid JSON");
-                *conn = None;
-            }
-        }
+    /// The `Offer.provides` this connection was granted at handshake time —
+    /// fixed for the connection's whole life (no reconnect to update it
+    /// from).
+    pub fn offer(&self) -> &[String] {
+        &self.offer
+    }
+
+    /// Mirrors `agent24-os-proto::initialize::Offer::provides`: unbounded
+    /// prefix match of a concrete method name against the granted `Offer`.
+    pub fn provides(&self, method: &str) -> bool {
+        self.offer.iter().any(|p| method.starts_with(p.as_str()))
+    }
+
+    /// Whether the underlying connection is still up. Once this turns
+    /// `false` it never turns back `true` — see module docs (no reconnect).
+    pub fn is_alive(&self) -> bool {
+        self.transport.is_alive()
+    }
+
+    /// Call a method through the transport. Fails fast (no waiting for a
+    /// slot) when 64 calls are already in flight — see
+    /// [`transport::Transport::call`]. Never retries: a
+    /// `ConnectionLost` means the outcome is genuinely unknown, and this
+    /// module does not guess. `pub(crate)` (L-1): only [`KernelEventSink`],
+    /// inside this crate, calls it today — nothing outside the crate needs
+    /// to name `transport::TransportError`, so nothing outside needs this
+    /// either. A future typed client (T3.2.1) that also lives inside
+    /// `adapter_agent24` can reach it the same way `KernelEventSink` does.
+    pub(crate) async fn call(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, transport::TransportError> {
+        self.transport.call(method, params).await
+    }
+
+    /// Builds a [`KernelClients`] over an already-spawned
+    /// [`transport::Transport`], skipping the dial-and-`initialize` step —
+    /// used by [`wire_kernel_clients`]'s own tests to inject an arbitrary
+    /// `Offer` without a real kernel on the other end.
+    #[cfg(test)]
+    fn from_transport(transport: transport::Transport, offer: Vec<String>) -> Self {
+        Self { transport, offer }
     }
 }
 
-/// Connect to `sock_path` and run the `initialize` exchange, shared by the
-/// initial [`CallbackChannel::handshake`] and every later reconnect inside
-/// [`CallbackChannel::emit`] — one place that speaks the wire format.
+/// Connect to `sock_path` and run the `initialize` exchange — the one place
+/// that speaks the wire format for [`KernelClients::handshake`].
 async fn connect_and_initialize(
     sock_path: &std::path::Path,
     module: &str,
     manifest_bytes: &[u8],
     auth_token: &str,
-) -> Result<(BufReader<UnixStream>, Vec<String>), AdapterError> {
+) -> Result<(UnixStream, Vec<String>), AdapterError> {
     let stream = UnixStream::connect(sock_path).await?;
     let mut reader = BufReader::new(stream);
 
@@ -267,17 +265,37 @@ async fn connect_and_initialize(
         })
         .unwrap_or_default();
 
-    Ok((reader, provides))
+    // Nothing should have arrived on the socket beyond this one handshake
+    // response — the kernel has nothing to say until we send it another
+    // request, and we have not yet. If the `BufReader` nonetheless has
+    // unconsumed bytes buffered, handing back only `reader.into_inner()`
+    // would silently drop them, so that case is treated as a protocol
+    // violation rather than risking lost bytes on the connection
+    // `transport::Transport` is about to take over.
+    if !reader.buffer().is_empty() {
+        return Err(AdapterError::HandshakeRefused(
+            "kernel sent unexpected extra bytes immediately after the initialize response"
+                .to_string(),
+        ));
+    }
+    Ok((reader.into_inner(), provides))
 }
 
-/// Adapts [`CallbackChannel`] to [`crate::http::EventSink`]. `http` never
-/// sees this type — only the trait.
+/// Adapts [`KernelClients`] to [`crate::http::EventSink`]. `http` never sees
+/// this type — only the trait.
 ///
 /// One worker drains a bounded queue, so events reach the kernel in the order
 /// they were emitted and a stalled kernel costs at most the queue, not one
 /// suspended task per mutation (Codex 2026-09-22 review, Medium #6). When the
 /// queue is full the event is dropped and counted — events are best-effort by
 /// design (§5.3), a committed write must not wait on them.
+///
+/// Emitting through the worker (rather than a bare `tokio::spawn` per event)
+/// also means at most one `_a24/events/emit` call is in flight at a time from
+/// this sink, so two events queued in quick succession cannot race each other
+/// on the wire — though this is still safe either way only because Sin90's
+/// own SQLite (not the event mirror) is the source of truth for everything
+/// the events describe (design §5.3, architecture.md "运行形态").
 pub struct KernelEventSink {
     tx: tokio::sync::mpsc::Sender<(String, Map<String, Value>)>,
     dropped: Arc<std::sync::atomic::AtomicU64>,
@@ -285,15 +303,18 @@ pub struct KernelEventSink {
 
 impl KernelEventSink {
     /// Must be called inside a Tokio runtime (spawns the worker).
-    pub fn spawn(chan: Arc<CallbackChannel>) -> Self {
-        Self::with_capacity(chan, DEFAULT_EVENT_QUEUE)
+    pub fn spawn(clients: Arc<KernelClients>) -> Self {
+        Self::with_capacity(clients, DEFAULT_EVENT_QUEUE)
     }
 
-    pub fn with_capacity(chan: Arc<CallbackChannel>, capacity: usize) -> Self {
+    pub fn with_capacity(clients: Arc<KernelClients>, capacity: usize) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, Map<String, Value>)>(capacity);
         tokio::spawn(async move {
             while let Some((kind, payload)) = rx.recv().await {
-                chan.emit(&kind, payload).await;
+                let params = json!({ "kind": kind, "payload": payload });
+                if let Err(e) = clients.call("_a24/events/emit", params).await {
+                    tracing::warn!(error = %e, kind, "sin90: events/emit failed");
+                }
             }
         });
         Self {
@@ -328,6 +349,57 @@ impl EventSink for KernelEventSink {
     }
 }
 
+/// The decision `main.rs`'s `run_as_agent24_module` actually applies —
+/// pulled out here so it can be exercised with an INJECTED `Offer` and a
+/// [`KernelClients`] built over an in-memory socket pair, no real kernel or
+/// handshake required. `main.rs` calls this verbatim; it does not
+/// reimplement the decision, so a bug in how the decision gets APPLIED (not
+/// just in the decision itself) shows up here too.
+///
+/// # N-H1: the callback connection is ALWAYS returned, never optional
+///
+/// An earlier version of this function returned `Option<Arc<KernelClients>>`
+/// — `None` when the kernel offered nothing Sin90 uses. That was a bug, not
+/// a feature: dropping the last `Arc<KernelClients>` drops its
+/// `transport::Transport`, which closes the socket — and the kernel serves
+/// exactly one callback connection per generation (design §5, D1), so
+/// closing it is indistinguishable from this generation crashing. The
+/// process then exits via `on_fatal` (as it should for a truly dead
+/// connection), the supervisor restarts a fresh generation, THAT generation
+/// negotiates the same empty `Offer` again (nothing about the manifest
+/// changed), and the cycle repeats — a restart storm bounded only by the
+/// supervisor's circuit breaker, for a module that was doing nothing wrong.
+///
+/// The fix: the connection is the generation's lifeline regardless of what
+/// business capability, if any, got granted. `Offer` only decides which
+/// CLIENT gets wired to it (today: `EventSink`, decoupled from "is `events`
+/// specifically granted" so a future scheduler/memory/approval client,
+/// T3.2.1, is not penalized for events being absent) — never whether the
+/// connection itself survives. The caller (`main.rs`) must hold the returned
+/// `Arc<KernelClients>` for the rest of the process's life either way.
+pub fn wire_kernel_clients(
+    offer: &[String],
+    clients: Arc<KernelClients>,
+) -> (Arc<dyn EventSink>, Arc<KernelClients>) {
+    if !provides_any_known_capability(offer) {
+        tracing::warn!(
+            "sin90: kernel offered no capability Sin90 uses; the callback connection is kept \
+             open regardless (N-H1 — closing it would end this generation) but no client is \
+             wired to it"
+        );
+        return (Arc::new(NullEventSink), clients);
+    }
+    let sink: Arc<dyn EventSink> = if clients.provides("_a24/events/emit") {
+        Arc::new(KernelEventSink::spawn(clients.clone()))
+    } else {
+        // Granted some other capability but not events — degrade, don't
+        // fail (design §5.3).
+        tracing::warn!("sin90: events not offered by kernel; running with events dropped");
+        Arc::new(NullEventSink)
+    };
+    (sink, clients)
+}
+
 /// Build a `tokio::net::UnixListener` from the kernel-bound `A24_LISTEN_FD`.
 ///
 /// Agent24's `agent24-os-proto::launch::LaunchSpec::listener` is a
@@ -354,7 +426,30 @@ pub fn listener_from_fd(fd: i32) -> std::io::Result<tokio::net::UnixListener> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+    /// A `KernelClients` over one half of an in-memory socket pair (the
+    /// other half stays a real, async, readable `UnixStream` a test can
+    /// probe for EOF/data) plus a `Transport` behind it, no real kernel or
+    /// handshake required. `offer` is injected directly.
+    fn clients_over_a_socket_pair(offer: Vec<String>) -> (Arc<KernelClients>, UnixStream) {
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        a.set_nonblocking(true).unwrap();
+        b.set_nonblocking(true).unwrap();
+        let stream = UnixStream::from_std(a).unwrap();
+        let peer = UnixStream::from_std(b).unwrap();
+        let transport = transport::Transport::spawn(stream, noop_hook());
+        (
+            Arc::new(KernelClients::from_transport(transport, offer)),
+            peer,
+        )
+    }
+
+    fn noop_hook() -> FatalHook {
+        Arc::new(|| {})
+    }
 
     #[test]
     fn manifest_digest_is_sha256_prefixed_hex() {
@@ -398,10 +493,14 @@ mod tests {
             }
         });
 
-        let (_chan, provides) = CallbackChannel::handshake(&sock_path, "sin90", manifest, token)
-            .await
-            .unwrap();
-        assert_eq!(provides, vec!["_a24/events/".to_string()]);
+        let (clients, offer) =
+            KernelClients::handshake(&sock_path, "sin90", manifest, token, noop_hook())
+                .await
+                .unwrap();
+        assert_eq!(offer, vec!["_a24/events/".to_string()]);
+        assert_eq!(clients.offer(), offer.as_slice());
+        assert!(clients.provides("_a24/events/emit"));
+        assert!(!clients.provides("_a24/scheduler/upsert"));
         server.await.unwrap();
     }
 
@@ -426,7 +525,8 @@ mod tests {
             reader.get_mut().write_all(&bytes).await.unwrap();
         });
 
-        let result = CallbackChannel::handshake(&sock_path, "sin90", b"x", "wrong-token").await;
+        let result =
+            KernelClients::handshake(&sock_path, "sin90", b"x", "wrong-token", noop_hook()).await;
         let Err(err) = result else {
             panic!("expected the handshake to be refused");
         };
@@ -435,25 +535,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emit_clears_the_connection_when_the_server_hangs_up() {
-        // Regression: before this fix, a read/write failure inside `emit()`
-        // left the old `BufReader` in place — every later `emit()` kept
-        // reading the same dead stream and silently warned forever, with no
-        // way back short of restarting the process. After this fix, any
-        // failure clears `conn`, so the NEXT `emit()` reconnects instead.
+    async fn kernel_clients_call_round_trips_through_the_real_handshake() {
         let dir = tempdir();
         let sock_path = dir.join("cb.sock");
         let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
-
         let manifest = b"name: sin90\n";
         let token = "test-token";
+
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut reader = BufReader::new(stream);
             let mut buf = Vec::new();
             reader.read_until(b'\n', &mut buf).await.unwrap();
             let req: Value = serde_json::from_slice(&buf).unwrap();
-            assert_eq!(req["method"], "initialize");
             let resp = json!({
                 "jsonrpc": "2.0", "id": req["id"],
                 "result": { "protocol_version": 1, "offer": { "provides": ["_a24/events/"] } }
@@ -461,100 +555,171 @@ mod tests {
             let mut bytes = serde_json::to_vec(&resp).unwrap();
             bytes.push(b'\n');
             reader.get_mut().write_all(&bytes).await.unwrap();
-            // Hang up immediately after the handshake, before any emit
-            // request can arrive — the dropped `reader` closes the socket.
-        });
 
-        let (chan, _provides) = CallbackChannel::handshake(&sock_path, "sin90", manifest, token)
-            .await
-            .unwrap();
-        server.await.unwrap();
-
-        chan.emit("test.orphaned", Map::new()).await;
-        assert!(
-            chan.conn.lock().await.is_none(),
-            "emit() against a hung-up connection must clear `conn`, not leave a desynced reader in place for the next call to reuse"
-        );
-    }
-
-    /// A kernel that completes the handshake, then reads every later frame
-    /// and never answers — reporting each received method on `seen`.
-    async fn silent_kernel(
-        sock_path: &std::path::Path,
-    ) -> tokio::sync::mpsc::UnboundedReceiver<String> {
-        let listener = tokio::net::UnixListener::bind(sock_path).unwrap();
-        let (seen_tx, seen) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-            let mut buf = Vec::new();
+            buf.clear();
             reader.read_until(b'\n', &mut buf).await.unwrap();
-            let req: Value = serde_json::from_slice(&buf).unwrap();
-            let resp = json!({
-                "jsonrpc": "2.0", "id": req["id"],
-                "result": { "protocol_version": 1, "offer": { "provides": ["_a24/events/"] } }
-            });
+            let call: Value = serde_json::from_slice(&buf).unwrap();
+            assert_eq!(call["method"], "_a24/events/emit");
+            let resp = json!({"jsonrpc": "2.0", "id": call["id"], "result": {}});
             let mut bytes = serde_json::to_vec(&resp).unwrap();
             bytes.push(b'\n');
             reader.get_mut().write_all(&bytes).await.unwrap();
-            loop {
-                buf.clear();
-                if reader.read_until(b'\n', &mut buf).await.unwrap_or(0) == 0 {
-                    return;
-                }
-                let req: Value = serde_json::from_slice(&buf).unwrap();
-                let _ = seen_tx.send(req["method"].as_str().unwrap_or_default().to_string());
-            }
         });
-        seen
-    }
 
-    /// Medium #6: a kernel that accepts but never replies used to hold the
-    /// connection mutex forever. The round trip is now bounded and the
-    /// connection is dropped so a late reply can't be misread later.
-    #[tokio::test]
-    async fn emit_times_out_and_drops_the_connection_when_the_kernel_never_replies() {
-        let dir = tempdir();
-        let sock_path = dir.join("cb.sock");
-        let _seen = silent_kernel(&sock_path).await;
-        let (mut chan, _) = CallbackChannel::handshake(&sock_path, "sin90", b"x", "t")
+        let (clients, _offer) =
+            KernelClients::handshake(&sock_path, "sin90", manifest, token, noop_hook())
+                .await
+                .unwrap();
+        let result = clients
+            .call("_a24/events/emit", json!({"kind": "test", "payload": {}}))
             .await
             .unwrap();
-        chan.io_timeout = std::time::Duration::from_millis(100);
-        let started = std::time::Instant::now();
-        chan.emit("test.silent", Map::new()).await;
+        assert_eq!(result, json!({}));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wiring_keeps_the_callback_connection_open_even_when_nothing_is_offered() {
+        // N-H1: the whole point of the fix — the connection must survive
+        // regardless of what `wire_kernel_clients` decided about wiring a
+        // client, because dropping it is how the kernel decides this
+        // generation is over.
+        let offer: Vec<String> = vec![];
+        let (clients, mut peer) = clients_over_a_socket_pair(offer.clone());
+
+        let (_sink, holder) = wire_kernel_clients(&offer, clients);
+
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_millis(200), peer.read(&mut buf)).await;
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
-            "emit must give up after its timeout, took {:?}",
-            started.elapsed()
+            read.is_err(),
+            "the peer must not see EOF while the returned KernelClients handle is held, even \
+             though nothing was offered"
         );
-        assert!(chan.conn.lock().await.is_none());
+        drop(holder); // keep it alive up to here, not a moment less.
+    }
+
+    #[tokio::test]
+    async fn wiring_positive_control_dropping_the_returned_holder_does_close_the_connection() {
+        // Positive control for the test above, and a demonstration of
+        // exactly what the N-H1 bug looked like: drop the handle
+        // `wire_kernel_clients` handed back (what the old `None` branch
+        // effectively did), and the peer genuinely does see EOF. This is
+        // why `main.rs` binding `_clients` (not `_`) to the returned value
+        // for the rest of its function is load-bearing, not decorative.
+        let offer: Vec<String> = vec![];
+        let (clients, mut peer) = clients_over_a_socket_pair(offer.clone());
+
+        let (_sink, holder) = wire_kernel_clients(&offer, clients);
+        drop(holder);
+
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_millis(200), peer.read(&mut buf)).await;
+        match read {
+            Ok(Ok(0)) => {} // EOF, as expected.
+            other => panic!("expected EOF after dropping the holder, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn wiring_uses_null_event_sink_when_only_scheduler_offered_not_events() {
+        // N-M4③: assert the CONCRETE sink behavior, not an `Option`'s
+        // shape — a `NullEventSink` must never put anything on the wire.
+        let offer = vec!["_a24/scheduler/".to_string()];
+        let (clients, mut peer) = clients_over_a_socket_pair(offer.clone());
+
+        let (sink, _holder) = wire_kernel_clients(&offer, clients);
+        sink.emit("test.kind", Map::new());
+
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_millis(200), peer.read(&mut buf)).await;
+        assert!(
+            read.is_err(),
+            "NullEventSink must never write anything to the wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn wiring_uses_kernel_event_sink_and_emit_reaches_the_wire_when_events_offered() {
+        // N-M4③ positive control: `events` granted → emit really goes out.
+        let offer = vec!["_a24/events/".to_string()];
+        let (clients, peer) = clients_over_a_socket_pair(offer.clone());
+        let mut peer_reader = BufReader::new(peer);
+
+        let (sink, _holder) = wire_kernel_clients(&offer, clients);
+        sink.emit("test.kind", Map::new());
+
+        let mut buf = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            peer_reader.read_until(b'\n', &mut buf),
+        )
+        .await
+        .expect("KernelEventSink must actually write to the wire")
+        .unwrap();
+        let parsed: Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(parsed["method"], "_a24/events/emit");
+    }
+
+    #[test]
+    fn on_fatal_is_a_plain_send_sync_closure_main_rs_can_construct_without_naming_transport() {
+        // main.rs (a different crate) must be able to build a `FatalHook`
+        // without ever naming `adapter_agent24::transport` (private module,
+        // L5) — only the re-exported alias.
+        let count = Arc::new(AtomicUsize::new(0));
+        let hook: FatalHook = {
+            let count = count.clone();
+            Arc::new(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        hook();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
     /// Medium #6: every mutation used to spawn its own task, each waiting
-    /// behind the stuck one. Now one worker and a bounded queue: overflow is
-    /// dropped and counted.
+    /// behind the stuck one. Now one worker drains a bounded queue: overflow
+    /// is dropped and counted rather than piling up one suspended task per
+    /// event. Uses the in-memory socket pair (no real kernel needed) with a
+    /// peer that reads but never answers, so the worker is provably stuck
+    /// inside its first round trip while the rest of the queue fills up.
     #[tokio::test]
     async fn event_queue_is_bounded_and_counts_drops_while_the_kernel_is_stuck() {
-        let dir = tempdir();
-        let sock_path = dir.join("cb.sock");
-        let mut seen = silent_kernel(&sock_path).await;
-        let (chan, _) = CallbackChannel::handshake(&sock_path, "sin90", b"x", "t")
-            .await
-            .unwrap();
-        let sink = KernelEventSink::with_capacity(Arc::new(chan), 4);
+        let offer = vec!["_a24/events/".to_string()];
+        let (clients, peer) = clients_over_a_socket_pair(offer);
+        let mut peer_reader = BufReader::new(peer);
 
-        // First event: wait until the kernel has it, so the worker is known
-        // to be parked inside that (never-answered) round trip.
+        let sink = KernelEventSink::with_capacity(clients, 4);
+
+        // First event: wait until the peer actually has the request, so the
+        // worker is known to be parked inside that (never-answered) round
+        // trip before the rest of the queue fills up.
         sink.emit("e0", Map::new());
-        assert_eq!(seen.recv().await.as_deref(), Some("_a24/events/emit"));
+        let mut buf = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            peer_reader.read_until(b'\n', &mut buf),
+        )
+        .await
+        .expect("the worker must have sent e0's request")
+        .unwrap();
 
         for i in 1..=14 {
             sink.emit(&format!("e{i}"), Map::new());
         }
         assert_eq!(sink.dropped(), 10, "4 queued, the other 10 dropped");
-        // Positive control: nothing else reached the kernel while it's stuck.
-        assert!(seen.try_recv().is_err());
+
+        // Positive control: nothing else reached the peer while it's stuck.
+        let mut extra = [0u8; 1];
+        let read = tokio::time::timeout(
+            Duration::from_millis(200),
+            peer_reader.get_mut().read(&mut extra),
+        )
+        .await;
+        assert!(
+            read.is_err(),
+            "no further events should reach the wire while the worker is stuck"
+        );
     }
 
     fn tempdir() -> std::path::PathBuf {

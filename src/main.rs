@@ -12,7 +12,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use sin90::adapter_agent24::{listener_from_fd, CallbackChannel, KernelEventSink, SpawnEnv};
+use sin90::adapter_agent24::{
+    listener_from_fd, wire_kernel_clients, FatalHook, KernelClients, SpawnEnv,
+};
 use sin90::http::{router, ActorKeys, NullEventSink, Sin90State};
 use sin90::store::Sin90Store;
 
@@ -84,22 +86,51 @@ async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
     // Before the handshake: a bad key file must stop the module outright, not
     // leave a mounted module whose every write route answers 403.
     let keys = ActorKeys::load(Some(&env.data_dir))?;
-    let (channel, offer) =
-        CallbackChannel::handshake(&env.callback_sock, "sin90", MANIFEST, &env.handshake_token)
-            .await?;
+
+    // T3.2.0/H3: the kernel serves exactly one callback connection per
+    // generation and never offers a second one (user decision D1,
+    // architecture.md §5) — so once `Transport` decides this connection is
+    // dead, there is nothing left to do but end this generation and let the
+    // supervisor start a fresh one. `on_fatal` is that: it runs exactly once,
+    // from inside `adapter_agent24`, the moment that happens.
+    //
+    // L-2: `warn`, not `error` — a clean kernel shutdown of this generation
+    // (the kernel closing its end on purpose, e.g. during its own graceful
+    // stop) looks IDENTICAL from here to a genuine failure; this path is not
+    // necessarily a bug being reported, just the one thing this process can
+    // do about "the connection is gone" either way. (N-M5, softening `exit`
+    // itself into something the supervisor can tell apart from a crash, is
+    // deliberately NOT part of this change — tracked as Sin90 SFU-7.)
+    let on_fatal: FatalHook = Arc::new(|| {
+        tracing::warn!(
+            "sin90: callback connection to the Agent24 kernel is gone (a clean kernel shutdown \
+             of this generation looks the same as a real failure from here); this generation \
+             cannot reconnect (design §5) — exiting so the supervisor starts a fresh one"
+        );
+        std::process::exit(70); // EX_SOFTWARE-ish: an unexpected runtime condition, not a CLI usage error.
+    });
+    let (clients, offer) = KernelClients::handshake(
+        &env.callback_sock,
+        "sin90",
+        MANIFEST,
+        &env.handshake_token,
+        on_fatal,
+    )
+    .await?;
     tracing::info!(?offer, "sin90: handshake accepted");
 
     let store = Sin90Store::open(&env.data_dir.join("sin90.db")).await?;
-    let sink: Arc<dyn sin90::http::EventSink> = if offer
-        .iter()
-        .any(|p| "_a24/events/emit".starts_with(p.as_str()) || p.starts_with("_a24/events/"))
-    {
-        Arc::new(KernelEventSink::spawn(Arc::new(channel)))
-    } else {
-        // Not granted events — degrade, don't fail (design §5.3).
-        tracing::warn!("sin90: events not offered by kernel; running with events dropped");
-        Arc::new(NullEventSink)
-    };
+    // `wire_kernel_clients` is the actual decision (decoupled from "is
+    // `events` specifically granted" — design §5); tested directly in
+    // `adapter_agent24`'s own test module with an injected `Offer`, so this
+    // call site stays a one-liner with nothing left to get wrong.
+    //
+    // N-H1: `_clients` is ALWAYS bound (never conditionally dropped) — the
+    // callback connection must outlive this whole function regardless of
+    // what `wire_kernel_clients` decided about wiring a business client to
+    // it. Dropping it early would close the kernel's only connection for
+    // this generation, which the kernel treats as this generation crashing.
+    let (sink, _clients) = wire_kernel_clients(&offer, Arc::new(clients));
     let state = Sin90State::new(store, sink, keys);
 
     let listener = listener_from_fd(env.listen_fd)?;
