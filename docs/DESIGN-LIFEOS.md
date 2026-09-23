@@ -275,7 +275,7 @@ kernel_capabilities: [events]
 impl_kind: out_of_process_provider      # ← 从 in_process_crate 改过来
 spawn:
   command: bin/sin90                     # 相对包内路径，不许绝对、不许 ..
-  args: ["--module"]
+  args: ["module"]
 ```
 
 ---
