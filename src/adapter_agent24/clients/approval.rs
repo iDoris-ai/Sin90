@@ -8,13 +8,26 @@
 //! separate query shape.
 //!
 //! `approval_token` is a one-time secret (kernel's own doc: "must never reach
-//! a `Debug` output"). This client never logs `params` or any constructed
-//! `Value` containing it — callers of [`ApprovalClient::gate`]/[`advise`]
-//! should hold the same discipline with the token they pass in.
+//! a `Debug` output") — wrapped in [`ApprovalToken`] below (L4) so that
+//! promise is enforced by the type system, not by every caller's own
+//! discipline about not logging `params`.
+//!
+//! L4: `request_id` and `approval_token` both come from the SAME place — the
+//! headers the kernel injects on the proxied request that is currently being
+//! handled (`X-A24-Request-Id` / `X-A24-Approval-Token`, SPEC-ME3's fired
+//! section and §2's injection list). Neither is something this client mints;
+//! both are read off the in-flight HTTP request (e.g. inside a `POST
+//! /_a24/scheduler/fired` handler, T3.2.2) and threaded straight through to
+//! [`ApprovalClient::gate`]/[`advise`]. **Dedupe by `fire_id` FIRST, before
+//! calling either** (SPEC: "模块应当先按 `fire_id` 去重、再提交审批") — the
+//! injected token is invalidated the instant its delivery ends, so a second
+//! delivery of the same logical fire that skips the dedup step and submits
+//! again will find the token already spent (`ClientError::TokenInvalid`,
+//! permanent) instead of harmlessly no-op'ing.
 
 use std::sync::Arc;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::error::{map_transport_error, ClientError};
@@ -23,6 +36,33 @@ use crate::adapter_agent24::KernelClients;
 /// The prefix `Offer.provides` must cover for [`ApprovalClient::new`] to
 /// return `Some`.
 pub const PREFIX: &str = "_a24/approval/";
+
+/// A one-time secret injected by the kernel as `X-A24-Approval-Token` on a
+/// proxied request that reached the closed-set gate (T7c/ME-3e). Wrapped
+/// specifically to keep it out of `Debug` output — Agent24's own
+/// `ApprovalSubmitParams` makes the identical move for the identical reason
+/// (`approval_callback.rs`: "`approval_token` must never reach a `Debug`
+/// output" — a hand-written `Debug` impl there redacts it so a future
+/// `{params:?}` cannot leak it by accident; this newtype gets the same
+/// property for free on this end, for every future caller, without relying
+/// on anyone remembering not to print it). `Serialize`s as the plain string
+/// the wire expects; deliberately no `Deserialize` — this crate only ever
+/// SENDS one, never reads one back.
+#[derive(Clone, Serialize)]
+pub struct ApprovalToken(String);
+
+impl ApprovalToken {
+    #[must_use]
+    pub fn new(token: impl Into<String>) -> Self {
+        Self(token.into())
+    }
+}
+
+impl std::fmt::Debug for ApprovalToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ApprovalToken(<redacted>)")
+    }
+}
 
 /// Mirrors `agent24_protocol::types::ModuleApprovalKind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -74,13 +114,17 @@ impl ApprovalClient {
     /// T7c/ME-3e: the closed set of executable actions may be empty or
     /// narrow; an action outside it comes back [`ClientError::Forbidden`]
     /// (SPEC's own wording: "reusing `Forbidden`, not a more precise kind").
+    ///
+    /// L4: `request_id`/`approval_token` — see the module docs. Both come
+    /// from the currently in-flight proxied request's injected headers; dedup
+    /// by `fire_id` BEFORE calling this, not after.
     pub async fn gate(
         &self,
         action: &str,
         target: Option<&str>,
         payload: Value,
         request_id: &str,
-        approval_token: &str,
+        approval_token: &ApprovalToken,
     ) -> Result<ApprovalAnswer, ClientError> {
         self.submit("gate", action, target, payload, request_id, approval_token)
             .await
@@ -89,13 +133,16 @@ impl ApprovalClient {
     /// `_a24/approval/advise` — submits a MODULE-DOMAIN action for
     /// knowledge/record only; the kernel does not execute it and does not
     /// guarantee it is honored (SPEC §6.1).
+    ///
+    /// L4: same `request_id`/`approval_token` source and dedup-first rule as
+    /// [`Self::gate`] — see the module docs.
     pub async fn advise(
         &self,
         action: &str,
         target: Option<&str>,
         payload: Value,
         request_id: &str,
-        approval_token: &str,
+        approval_token: &ApprovalToken,
     ) -> Result<ApprovalAnswer, ClientError> {
         self.submit(
             "advise",
@@ -111,6 +158,16 @@ impl ApprovalClient {
     /// `_a24/approval/status` — an independent read, any number of times,
     /// regardless of whether the originating request is still alive (Agent24
     /// `ApprovalStatusHandler`'s own doc comment).
+    ///
+    /// `approval_id` not found maps to [`ClientError::NotFound`], which this
+    /// shared enum classifies as neither permanent nor retryable in general
+    /// (see its own doc) — but for THIS specific call, it IS effectively
+    /// permanent: the same `approval_id` either exists or it never will
+    /// (nothing mints a `ModuleApproval` row after the fact under an id a
+    /// caller already holds), so re-querying it again cannot start
+    /// succeeding. A caller that wants a firm "give up" signal for `status`
+    /// specifically should treat `NotFound` from THIS method as permanent,
+    /// even though `ClientError` itself does not bake that in.
     pub async fn status(&self, approval_id: &str) -> Result<ApprovalAnswer, ClientError> {
         let params = json!({ "approval_id": approval_id });
         self.call("status", params).await
@@ -123,7 +180,7 @@ impl ApprovalClient {
         target: Option<&str>,
         payload: Value,
         request_id: &str,
-        approval_token: &str,
+        approval_token: &ApprovalToken,
     ) -> Result<ApprovalAnswer, ClientError> {
         let mut params = json!({
             "action": action,
@@ -159,6 +216,33 @@ mod tests {
     };
     use serde_json::json;
 
+    /// L4: the whole point of the newtype — `{:?}` on an `ApprovalToken`
+    /// must never contain the secret itself.
+    #[test]
+    fn approval_token_debug_output_is_redacted() {
+        let token = ApprovalToken::new("super-secret-value");
+        let shown = format!("{token:?}");
+        assert!(
+            !shown.contains("super-secret-value"),
+            "token leaked into Debug output: {shown:?}"
+        );
+        assert_eq!(shown, "ApprovalToken(<redacted>)");
+    }
+
+    /// Positive control for the test above: the token DOES still reach the
+    /// wire correctly (redaction is a `Debug`-only property, not a
+    /// serialization change) — covered end-to-end by
+    /// `gate_request_shape_matches_the_kernel_handler_field_for_field` below,
+    /// which asserts the exact `approval_token` string in the request JSON.
+    #[test]
+    fn approval_token_serializes_as_the_plain_string() {
+        let token = ApprovalToken::new("super-secret-value");
+        assert_eq!(
+            serde_json::to_value(&token).unwrap(),
+            json!("super-secret-value")
+        );
+    }
+
     #[tokio::test]
     async fn offer_without_the_prefix_yields_none_with_the_prefix_yields_some() {
         let (clients, _peer) = fake_kernel(vec!["_a24/events/".to_string()]).await;
@@ -179,7 +263,7 @@ mod tests {
                     Some("2030-01-01T09:00:00Z"),
                     json!({"note": "run it"}),
                     "req-1",
-                    "tok-secret",
+                    &ApprovalToken::new("tok-secret"),
                 )
                 .await
         });
@@ -221,7 +305,13 @@ mod tests {
         let client = ApprovalClient::new(&clients).unwrap();
         tokio::spawn(async move {
             client
-                .advise("routine.note", None, json!({}), "req-2", "tok")
+                .advise(
+                    "routine.note",
+                    None,
+                    json!({}),
+                    "req-2",
+                    &ApprovalToken::new("tok"),
+                )
                 .await
         });
         let req = read_request(&mut peer).await;
@@ -297,7 +387,13 @@ mod tests {
         let client = ApprovalClient::new(&clients).unwrap();
         let call = tokio::spawn(async move {
             client
-                .gate("schedule_callback", None, json!({}), "r", "t")
+                .gate(
+                    "schedule_callback",
+                    None,
+                    json!({}),
+                    "r",
+                    &ApprovalToken::new("t"),
+                )
                 .await
         });
         let req = read_request(&mut peer).await;

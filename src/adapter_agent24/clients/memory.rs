@@ -72,6 +72,24 @@ impl MemoryClient {
 
     /// `_a24/memory/private/remember`. `kind` is Sin90's own free-form
     /// category (not the kernel's), `body` an arbitrary JSON object.
+    ///
+    /// M3 (post-review note): **not idempotent.** Every successful call
+    /// mints a brand-new [`Remembered::id`] (`agent24_domain::memory`'s own
+    /// doc: "the kernel mints the identifier") — there is no dedup key like
+    /// scheduler's `key` or approval's `(module, request_id, kind)`. A
+    /// blind retry after [`ClientError::Timeout`] or
+    /// [`ClientError::ConnectionLost`] — both mean the outcome is genuinely
+    /// UNKNOWN, not "definitely failed" (`ClientError::is_retryable`'s own
+    /// doc) — risks writing the SAME memory twice under two different ids.
+    /// Callers that need write-once semantics (the derived-summary use case
+    /// architecture.md's contract table describes: "复盘定稿的**派生摘要**
+    /// 进内核私有记忆") must supply their own idempotence above this client
+    /// — e.g. checking `recall`/`recent` for an existing entry with the same
+    /// `kind` and a caller-chosen marker in `body` before calling this, or
+    /// simply accepting an occasional duplicate as an acceptable cost of a
+    /// rare timeout (unlike scheduler's `upsert`, there is no wire-level fix
+    /// available here — SPEC's `private/*` methods were not designed to be
+    /// retried blindly).
     pub async fn remember(
         &self,
         kind: &str,
