@@ -7,15 +7,18 @@
 //! allowed to appear — the boundary check (`tests/ai_boundary.rs`, J7) only
 //! walks `src/ai/**/*.rs`.
 //!
-//! **Capability → allowed ops, today (deliberate T5.1.1 narrowing).** The
-//! design's `allowed_ops(cap)` (§11.4 公共) is `Classify ⇒
-//! {AssignTaskDirection}`, `Summarize ⇒ {DraftReviewBody}`, `Propose ⇒
-//! {CarryOverTask, ReorderTasks, CreateTasks}`. `AssignTaskDirection` and
-//! `DraftReviewBody` do not exist on this branch yet (T5.2.1/T5.3.1 add
-//! them) — so [`allowed_ops`] here answers "nothing" for `Classify` and
-//! `Summarize` and the real three-op set for `Propose`. `submit`/`precheck`
-//! for the first two capabilities will always be `SinkError::Invalid` until
-//! those ops land; that is expected, not a bug this task should paper over.
+//! **Capability → allowed ops.** The design's `allowed_ops(cap)` (§11.4 公共)
+//! is `Classify ⇒ {AssignTaskDirection}`, `Summarize ⇒ {DraftReviewBody}`,
+//! `Propose ⇒ {CarryOverTask, ReorderTasks, CreateTasks}`. `AssignTaskDirection`
+//! landed in T5.2.1 (this file's [`allowed_ops`] now answers the real
+//! one-op set for `Classify`). `Sin90Op::DraftReviewBody` ALSO exists as of
+//! T5.2.1 (design §11.2.3/§11.8's "一次加齐" — the Op's type/validate/apply
+//! is added alongside `AssignTaskDirection` so `ValidationCtx` is widened
+//! only once) — but the `summarize` CAPABILITY that will eventually PRODUCE
+//! it is T5.3.1's job, explicitly out of this task's scope. So `allowed_ops`
+//! deliberately still answers "nothing" for `Summarize`, and `submit`/
+//! `precheck` for it will always be `SinkError::Invalid` until T5.3.1 opens
+//! it; that is expected, not a bug this task should paper over.
 
 use sqlx::{Acquire, Row, SqlitePool};
 
@@ -25,8 +28,8 @@ use crate::ai::ports::{
 };
 use crate::ai::source_for;
 use crate::core::{
-    validate, DirectionId, DirectionStatus, ProposalStatus, Review, Sin90Op, Sin90Proposal, Task,
-    WeekId,
+    task_is_terminal, validate, DirectionId, DirectionStatus, ProposalStatus, Review, Sin90Op,
+    Sin90Proposal, Task, TaskStatus, WeekId,
 };
 use crate::store::repo::{
     append_event, apply_op, build_snapshot, from_wire, row_to_review, row_to_task, to_wire,
@@ -42,6 +45,35 @@ const EXECUTIVE_ENABLED_KEY: &str = "ai.executive_enabled";
 /// queries below can't drift apart from each other.
 const TASK_COLUMNS: &str = "id, direction_id, week_id, parent_task_id, title, status, kind, \
      energy, est_minutes, carried_from, created_at, updated_at";
+
+/// Every `TaskStatus` variant — kept as an explicit list (Rust has no enum
+/// reflection) purely so [`terminal_task_status_wires`] can DERIVE its
+/// exclusion set from [`task_is_terminal`] instead of maintaining a second,
+/// driftable copy of "which statuses are terminal" as a hand-written SQL
+/// literal (2026-09-24 review, H1). Mutation target: add a new terminal
+/// `TaskStatus` variant to `core::types` without adding it here too — this
+/// list stops being exhaustive and `inbox`'s exclusion set silently misses
+/// it again.
+const ALL_TASK_STATUSES: [TaskStatus; 6] = [
+    TaskStatus::Backlog,
+    TaskStatus::Planned,
+    TaskStatus::InProgress,
+    TaskStatus::Done,
+    TaskStatus::Dropped,
+    TaskStatus::CarriedOver,
+];
+
+/// The wire values of every TERMINAL `TaskStatus`, computed by asking
+/// [`task_is_terminal`] about each known status — see [`ALL_TASK_STATUSES`]'s
+/// doc for why this indirection exists.
+fn terminal_task_status_wires() -> Vec<String> {
+    ALL_TASK_STATUSES
+        .iter()
+        .copied()
+        .filter(|&s| task_is_terminal(s))
+        .map(|s| to_wire(&s).expect("TaskStatus always serializes"))
+        .collect()
+}
 
 /// A read-only handle over `sin90.db` (§11.5 v2.1 M1): every connection in
 /// its pool was opened with `pragma("query_only", "ON")` — see
@@ -73,21 +105,56 @@ impl SettingsRead for AiReader {
 }
 
 impl AiReadModel for AiReader {
+    /// 2026-09-24 review (H1, blocking): the exclusion list is DERIVED from
+    /// [`task_is_terminal`] (via [`terminal_task_status_wires`]), not a
+    /// hand-maintained SQL literal — the ORIGINAL `NOT IN ('done', 'dropped')`
+    /// forgot `carried_over`, so an already-closed, still-unclassified
+    /// carried-over task (its ORIGINAL row: status flips to `carried_over`
+    /// but `direction_id` is untouched by `CarryOverTask`'s apply) would sort
+    /// into the inbox by `created_at ASC` FOREVER — permanently occupying a
+    /// slot ahead of every real candidate once 20+ such rows accumulate,
+    /// since nothing ever reclassifies a closed task. See
+    /// `inbox_excludes_carried_over_tasks` for the regression.
     async fn inbox(&self, limit: u32) -> Result<Vec<Task>, ReadError> {
-        let rows = sqlx::query(&format!(
+        let terminal = terminal_task_status_wires();
+        let placeholders = terminal.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!(
             "SELECT {TASK_COLUMNS} FROM sin90_tasks
-             WHERE direction_id IS NULL AND status NOT IN ('done', 'dropped')
+             WHERE direction_id IS NULL AND status NOT IN ({placeholders})
              ORDER BY created_at ASC
              LIMIT ?"
-        ))
-        .bind(limit)
-        .fetch_all(&self.0)
-        .await
-        .map_err(rerr)?;
+        );
+        let mut q = sqlx::query(&sql);
+        for t in &terminal {
+            q = q.bind(t);
+        }
+        q = q.bind(limit);
+        let rows = q.fetch_all(&self.0).await.map_err(rerr)?;
         rows.into_iter()
             .map(row_to_task)
             .collect::<StoreResult<_>>()
             .map_err(rerr)
+    }
+
+    /// New (2026-09-24 review, L4): a point lookup — "is task `id` CURRENTLY
+    /// in the inbox?" — for `ai::classify::select_targets` to validate
+    /// explicitly-given `task_ids` against, instead of paging through the
+    /// entire inbox with an arbitrary large `limit` (T5.2.1's original
+    /// `inbox(10_000)` placeholder). Shares the SAME terminal-status
+    /// exclusion [`inbox`] uses.
+    async fn inbox_task(&self, id: &str) -> Result<Option<Task>, ReadError> {
+        let terminal = terminal_task_status_wires();
+        let placeholders = terminal.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT {TASK_COLUMNS} FROM sin90_tasks
+             WHERE id = ? AND direction_id IS NULL AND status NOT IN ({placeholders})"
+        );
+        let mut q = sqlx::query(&sql).bind(id);
+        for t in &terminal {
+            q = q.bind(t);
+        }
+        let row = q.fetch_optional(&self.0).await.map_err(rerr)?;
+        row.map(row_to_task).transpose().map_err(rerr)
     }
 
     async fn direction_candidates(&self, limit: u32) -> Result<Vec<DirectionCandidate>, ReadError> {
@@ -116,18 +183,27 @@ impl AiReadModel for AiReader {
             .collect()
     }
 
-    /// **T5.1.1 placeholder** (see this file's module doc): the frozen
-    /// `normalize_title` algorithm (§11.4.1 R1) is a T5.2.1 deliverable
-    /// (`src/ai/classify.rs`). Until then this compares each classified
-    /// task's title, folded through the SAME coarse
+    /// R1's history lookup (§11.4.1, T5.2.1): every ALREADY-classified task
+    /// whose Direction is still non-terminal, normalized through the real
+    /// `normalize_title` (`crate::ai::classify`, not a local approximation —
+    /// see this file's module doc's history) and compared against `normalized`
+    /// **T5.2.1a placeholder** (this branch has no `ai::classify` yet — that
+    /// lands in T5.2.1b): the frozen `normalize_title` algorithm (§11.4.1 R1)
+    /// is `ai::classify`'s deliverable. Until then this compares each
+    /// classified task's title, folded through the SAME coarse
     /// whitespace-collapse-and-lowercase here, against `normalized` taken
     /// as-is — correct as long as the caller normalizes its query the same
-    /// way this folds candidates, wrong only in the sense that it is not yet
-    /// the frozen algorithm's exact Unicode/CJK handling.
+    /// way this folds candidates. The non-terminal-Direction filter (the
+    /// `JOIN` + `status NOT IN (...)`) is real already: "is this Direction
+    /// still open" is a plain relational check that belongs here regardless
+    /// of which normalization algorithm is doing the string comparison.
     async fn title_history(&self, normalized: &str) -> Result<Vec<DirectionId>, ReadError> {
         let rows = sqlx::query(
-            "SELECT title, direction_id FROM sin90_tasks
-             WHERE direction_id IS NOT NULL",
+            "SELECT t.title AS title, t.direction_id AS direction_id
+             FROM sin90_tasks t
+             JOIN sin90_directions d ON d.id = t.direction_id
+             WHERE t.direction_id IS NOT NULL
+               AND d.status NOT IN ('achieved', 'abandoned')",
         )
         .fetch_all(&self.0)
         .await
@@ -204,7 +280,8 @@ fn allowed_ops(cap: Capability, ops: &[Sin90Op]) -> Result<(), SinkError> {
     }
     let ok = |op: &Sin90Op| -> bool {
         match cap {
-            Capability::Classify | Capability::Summarize => false,
+            Capability::Classify => matches!(op, Sin90Op::AssignTaskDirection { .. }),
+            Capability::Summarize => false,
             Capability::Propose => matches!(
                 op,
                 Sin90Op::CarryOverTask { .. }
@@ -636,6 +713,7 @@ mod tests {
         let reader = store.ai_reader();
         let _ = reader.settings().await.unwrap();
         let _ = reader.inbox(50).await.unwrap();
+        let _ = reader.inbox_task(&t1).await.unwrap();
         let _ = reader.direction_candidates(50).await.unwrap();
         let _ = reader.title_history("t1").await.unwrap();
         let _ = reader.review("does-not-exist").await.unwrap();
@@ -1053,5 +1131,65 @@ mod tests {
             classify_apply_err(StoreError::Sqlx(sqlx::Error::PoolClosed)),
             SinkError::Store(_)
         ));
+    }
+
+    /// H1 (2026-09-24 review, blocking): a task that got carried over WHILE
+    /// still unclassified — its ORIGINAL row flips to `carried_over` but
+    /// `CarryOverTask`'s apply never touches `direction_id` — must NOT show
+    /// up in the inbox (it is closed, historical; nothing will ever classify
+    /// it again). The NEW task the carry-over produces (still unclassified,
+    /// still open) DOES belong in the inbox. Mutation target: revert
+    /// `inbox`'s exclusion list to the literal `('done', 'dropped')` this
+    /// replaces and the first assertion goes red.
+    #[tokio::test]
+    async fn inbox_excludes_carried_over_tasks() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let (_week, t1, t2) = seed_week_with_tasks(&store).await; // both planned, direction_id NULL
+        let next_week = store.create_week("2026-W41").await.unwrap();
+
+        let carry = Sin90Proposal {
+            id: "carry-1".into(),
+            status: ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![Sin90Op::CarryOverTask {
+                task_id: t1.clone(),
+                to_week: next_week.id.clone(),
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&carry).await.unwrap();
+        store.apply_proposal("carry-1").await.unwrap();
+
+        let child: String = sqlx::query_scalar("SELECT id FROM sin90_tasks WHERE carried_from = ?")
+            .bind(&t1)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+
+        let reader = store.ai_reader();
+        let inbox_ids: Vec<String> = reader
+            .inbox(50)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert!(
+            !inbox_ids.contains(&t1),
+            "the CLOSED (carried_over) original task must not be in the inbox: {inbox_ids:?}"
+        );
+        assert!(
+            inbox_ids.contains(&t2),
+            "an untouched, still-open unclassified task must still be in the inbox"
+        );
+        assert!(
+            inbox_ids.contains(&child),
+            "the NEW task the carry-over produced is still open and unclassified"
+        );
+
+        // Positive control for `inbox_task` (L4's point lookup): the closed
+        // task is unusable as an explicit classify target; the new one isn't.
+        assert!(reader.inbox_task(&t1).await.unwrap().is_none());
+        assert!(reader.inbox_task(&child).await.unwrap().is_some());
     }
 }
