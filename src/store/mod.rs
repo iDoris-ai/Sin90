@@ -18,7 +18,7 @@ pub mod repo;
 
 pub use attention::{AttentionRow, WeekAttention};
 pub use packs::{five_life_systems, SeedArea};
-pub use repo::{AppliedProposal, ApplyOutcome, EventRow, StoredProposal, TodayView};
+pub use repo::{AppliedProposal, ApplyOutcome, EventRow, RoutineUpdate, StoredProposal, TodayView};
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;

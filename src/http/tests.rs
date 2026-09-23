@@ -2822,9 +2822,36 @@ mod routine {
     }
 
     // ---- events mirrored to the kernel sink -----------------------------------
+    //
+    // T3.1.2 review: the mirror must be one-for-one with the store's OWN
+    // `sin90_events` writes — same event count, same kind names, same
+    // payload shape (`store::repo::update_routine`'s `RoutineUpdate::changed`
+    // is exactly what gates this; `transition_routine`'s destination-specific
+    // kind is what names it).
 
     #[tokio::test]
-    async fn create_update_transition_each_emit_a_mirrored_event() {
+    async fn create_emits_a_mirrored_routine_created_event() {
+        let (app, sink) = test_app().await;
+        app.oneshot(human_req("POST", "/routines", new_routine_body()))
+            .await
+            .unwrap();
+        assert!(sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(kind, _)| kind == "routine.created"));
+    }
+
+    /// A no-op PATCH (absent fields, or fields re-stating the current
+    /// values) must emit ZERO mirrored events — the store itself wrote no
+    /// `sin90_events` row for it either (`update_routine`'s L1), so a mirror
+    /// firing anyway would be a lie about what happened. Positive control:
+    /// an actual field change still emits exactly one `routine.updated`,
+    /// whose payload is the full post-update snapshot plus a `changed` array
+    /// naming exactly the field that moved — not an ad hoc field list.
+    #[tokio::test]
+    async fn noop_patch_emits_no_event_real_change_emits_exactly_one_with_changed() {
         let (app, sink) = test_app().await;
         let created = body_json(
             app.clone()
@@ -2834,40 +2861,145 @@ mod routine {
         )
         .await;
         let id = created["id"].as_str().unwrap().to_string();
-        assert!(sink
-            .0
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|(kind, _)| kind == "routine.created"));
+        let events_before = sink.0.lock().unwrap().len();
 
-        app.clone()
-            .oneshot(human_req(
+        // Absent fields.
+        assert_eq!(
+            app.clone()
+                .oneshot(human_req("PATCH", &format!("/routines/{id}"), json!({})))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            sink.0.lock().unwrap().len(),
+            events_before,
+            "an absent-fields (no-op) patch must not emit a mirrored event"
+        );
+
+        // Present but re-stating the current value.
+        assert_eq!(
+            app.clone()
+                .oneshot(human_req(
+                    "PATCH",
+                    &format!("/routines/{id}"),
+                    json!({"title": "Morning run"}),
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            sink.0.lock().unwrap().len(),
+            events_before,
+            "a same-values (no-op) patch must not emit a mirrored event"
+        );
+
+        // Positive control: an actual change.
+        assert_eq!(
+            app.oneshot(human_req(
                 "PATCH",
                 &format!("/routines/{id}"),
-                json!({"title": "renamed"}),
+                json!({"title": "Evening run"}),
             ))
             .await
-            .unwrap();
-        assert!(sink
-            .0
-            .lock()
             .unwrap()
-            .iter()
-            .any(|(kind, _)| kind == "routine.updated"));
+            .status(),
+            StatusCode::OK
+        );
+        let events = sink.0.lock().unwrap();
+        let new_events = &events[events_before..];
+        assert_eq!(
+            new_events.len(),
+            1,
+            "a real change must emit exactly one mirrored event: {new_events:?}"
+        );
+        assert_eq!(new_events[0].0, "routine.updated");
+        assert_eq!(new_events[0].1["id"], json!(id));
+        assert_eq!(new_events[0].1["title"], json!("Evening run"));
+        assert_eq!(new_events[0].1["changed"], json!(["title"]));
+    }
 
-        app.oneshot(human_req(
-            "POST",
-            &format!("/routines/{id}/transition"),
-            json!({"to": "paused"}),
-        ))
-        .await
-        .unwrap();
-        assert!(sink
-            .0
-            .lock()
+    /// The mirrored transition event's kind is the SAME destination-specific
+    /// name `store::repo::transition_routine` uses internally — `paused` /
+    /// `resumed` / `retired` — not a generic `routine.transitioned`. Each
+    /// edge is asserted individually (exact new-event count of 1, exact
+    /// kind), not just "some routine.* event fired somewhere".
+    #[tokio::test]
+    async fn transition_mirrored_event_kind_matches_the_destination_status() {
+        let (app, sink) = test_app().await;
+        let created = body_json(
+            app.clone()
+                .oneshot(human_req("POST", "/routines", new_routine_body()))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let id = created["id"].as_str().unwrap().to_string();
+
+        // active -> paused: `routine.paused`.
+        let events_before = sink.0.lock().unwrap().len();
+        assert_eq!(
+            app.clone()
+                .oneshot(human_req(
+                    "POST",
+                    &format!("/routines/{id}/transition"),
+                    json!({"to": "paused"}),
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        {
+            let events = sink.0.lock().unwrap();
+            let new_events = &events[events_before..];
+            assert_eq!(new_events.len(), 1, "{new_events:?}");
+            assert_eq!(new_events[0].0, "routine.paused");
+            assert_eq!(new_events[0].1["routine_id"], json!(id));
+        }
+
+        // paused -> active: `routine.resumed`.
+        let events_before = sink.0.lock().unwrap().len();
+        assert_eq!(
+            app.clone()
+                .oneshot(human_req(
+                    "POST",
+                    &format!("/routines/{id}/transition"),
+                    json!({"to": "active"}),
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        {
+            let events = sink.0.lock().unwrap();
+            let new_events = &events[events_before..];
+            assert_eq!(new_events.len(), 1, "{new_events:?}");
+            assert_eq!(new_events[0].0, "routine.resumed");
+            assert_eq!(new_events[0].1["routine_id"], json!(id));
+        }
+
+        // active -> retired: `routine.retired`.
+        let events_before = sink.0.lock().unwrap().len();
+        assert_eq!(
+            app.oneshot(human_req(
+                "POST",
+                &format!("/routines/{id}/transition"),
+                json!({"to": "retired"}),
+            ))
+            .await
             .unwrap()
-            .iter()
-            .any(|(kind, _)| kind == "routine.transitioned"));
+            .status(),
+            StatusCode::OK
+        );
+        let events = sink.0.lock().unwrap();
+        let new_events = &events[events_before..];
+        assert_eq!(new_events.len(), 1, "{new_events:?}");
+        assert_eq!(new_events[0].0, "routine.retired");
+        assert_eq!(new_events[0].1["routine_id"], json!(id));
     }
 }

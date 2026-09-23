@@ -875,6 +875,15 @@ async fn get_routine(State(state): State<Sin90State>, AxPath(id): AxPath<String>
 /// (double-`Option` fields: absent key = leave unchanged, `null` = clear,
 /// value = set — see `RoutinePatch`'s doc comment). A `retired` routine
 /// rejects any patch with `StoreError::Conflict` -> 409 (`store::repo`'s H2).
+///
+/// Mirrors `routine.updated` to `EventSink` — but ONLY when
+/// [`crate::store::RoutineUpdate::changed`] is non-empty (T3.1.2 review): a
+/// no-op patch (absent fields, or ones re-stating the current values) writes
+/// no internal `sin90_events` row either (`update_routine`'s L1), so the
+/// mirror must stay silent too, one-for-one with the store. The mirrored
+/// payload is the SAME shape the store's own `updated` event uses — the
+/// full post-update snapshot plus a `"changed"` array — not an ad hoc field
+/// list, so both audiences see the identical fact.
 async fn update_routine(
     State(state): State<Sin90State>,
     headers: HeaderMap,
@@ -889,12 +898,18 @@ async fn update_routine(
         Err(r) => return r,
     };
     match state.store.update_routine(&id, &patch).await {
-        Ok(routine) => {
-            state.emit(
-                "routine.updated",
-                serde_json::json!({ "routine_id": routine.id, "status": routine.status }),
-            );
-            Json(routine).into_response()
+        Ok(outcome) => {
+            if !outcome.changed.is_empty() {
+                let mut payload = match serde_json::to_value(&outcome.routine) {
+                    Ok(v) => v,
+                    Err(e) => return map_err(e.into()),
+                };
+                if let serde_json::Value::Object(map) = &mut payload {
+                    map.insert("changed".to_string(), serde_json::json!(outcome.changed));
+                }
+                state.emit("routine.updated", payload);
+            }
+            Json(outcome.routine).into_response()
         }
         Err(e) => map_err(e),
     }
@@ -904,6 +919,13 @@ async fn update_routine(
 /// `{active,paused} -> retired` (design §3.2); an illegal edge (including any
 /// edge out of `retired`) comes back as `StoreError::Transition` -> 409, same
 /// convention as `PATCH /tasks/{id}`/`PATCH /weeks/{id}` above.
+///
+/// The mirrored event kind is the SAME destination-specific name
+/// `store::repo::transition_routine` uses internally (`routine.paused` /
+/// `routine.resumed` / `routine.retired`, T3.1.2 review) — not a generic
+/// `routine.transitioned` — and the payload matches the store's own ad hoc
+/// `{"routine_id": id}` shape, so both audiences agree on both the event
+/// name and its contents.
 async fn transition_routine(
     State(state): State<Sin90State>,
     headers: HeaderMap,
@@ -919,10 +941,12 @@ async fn transition_routine(
     };
     match state.store.transition_routine(&id, req.to).await {
         Ok(routine) => {
-            state.emit(
-                "routine.transitioned",
-                serde_json::json!({ "routine_id": routine.id, "to": routine.status }),
-            );
+            let kind = match routine.status {
+                RoutineStatus::Paused => "routine.paused",
+                RoutineStatus::Active => "routine.resumed",
+                RoutineStatus::Retired => "routine.retired",
+            };
+            state.emit(kind, serde_json::json!({ "routine_id": routine.id }));
             Json(routine).into_response()
         }
         Err(e) => map_err(e),
