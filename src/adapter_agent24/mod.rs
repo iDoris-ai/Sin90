@@ -32,18 +32,17 @@
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::os::unix::io::FromRawFd;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
+use tokio::sync::{mpsc, Mutex as AsyncMutex, Semaphore};
 
 use crate::http::{EventSink, NullEventSink};
 
 mod frame;
 mod transport;
-
-/// Events waiting for the worker. Past this, new events are dropped and
-/// counted rather than buffered without bound.
-const DEFAULT_EVENT_QUEUE: usize = 1024;
 
 // L-1: only `FatalHook` is re-exported — `main.rs` needs to name it to
 // construct `KernelClients::handshake`'s `on_fatal` argument. `TransportError`
@@ -62,6 +61,44 @@ pub use transport::FatalHook;
 /// this module rebuilt just to keep negotiating successfully.
 const PROTOCOL_MIN: u32 = 1;
 const PROTOCOL_MAX: u32 = 1000;
+
+/// How long a queued event will wait — combined, across both the sub-quota
+/// gate and the main in-flight semaphore (M5) — before it is given up on and
+/// dropped. Sin90's own SQLite (not the event mirror) is the source of truth
+/// regardless (design §5.3); a dropped event is a degraded mirror, not data
+/// loss.
+const EMIT_SLOT_WAIT: Duration = Duration::from_secs(5);
+
+/// N-M2: `KernelEventSink::emit` is a sync trait method that used to
+/// `tokio::spawn` one task per call — unbounded under a heavy event burst.
+/// Instead, `emit` does a non-blocking `try_send` onto a channel of this
+/// capacity (full → the event is dropped and counted, not queued
+/// unboundedly) drained by a FIXED pool of [`EMIT_WORKER_COUNT`] worker
+/// tasks spawned once, at [`KernelEventSink::new`].
+const EMIT_QUEUE_CAPACITY: usize = 256;
+const EMIT_WORKER_COUNT: usize = 4;
+
+/// N-M1: caps how many emits may be simultaneously past this gate and
+/// therefore competing for `transport::Transport`'s own
+/// `MAX_IN_FLIGHT_PER_CONNECTION` (64) semaphore. Bounding it below that
+/// (32 < 64) guarantees at least `64 - EMIT_SUB_QUOTA` slots are always free
+/// for fail-fast (non-emit) callers, no matter how many events are queued —
+/// a burst of events can no longer starve, say, a scheduler call's
+/// `Transport::call` of a slot just by holding onto main-semaphore permits
+/// longer (via `call_with_slot_wait`) than a fail-fast caller is willing to
+/// wait (which is: not at all).
+const EMIT_SUB_QUOTA: usize = 32;
+
+// Honesty check on the relationship between the two knobs above: with only
+// `EMIT_WORKER_COUNT` workers, at most that many emits can ever be mid-flight
+// (holding a sub-quota permit and/or a main-semaphore permit) at once — the
+// worker count is what actually binds concurrency today, and the sub-quota
+// is a forward-looking guard for if that count is ever raised. This assert
+// is what keeps that true: it fails to COMPILE, not just a lint, if someone
+// raises `EMIT_WORKER_COUNT` past `EMIT_SUB_QUOTA` without also reconsidering
+// N-M1's "at least `MAX_IN_FLIGHT_PER_CONNECTION - EMIT_SUB_QUOTA` slots free
+// for fail-fast callers" guarantee.
+const _: () = assert!(EMIT_WORKER_COUNT <= EMIT_SUB_QUOTA);
 
 #[derive(Debug, thiserror::Error)]
 pub enum AdapterError {
@@ -195,17 +232,39 @@ impl KernelClients {
     /// slot) when 64 calls are already in flight — see
     /// [`transport::Transport::call`]. Never retries: a
     /// `ConnectionLost` means the outcome is genuinely unknown, and this
-    /// module does not guess. `pub(crate)` (L-1): only [`KernelEventSink`],
-    /// inside this crate, calls it today — nothing outside the crate needs
-    /// to name `transport::TransportError`, so nothing outside needs this
-    /// either. A future typed client (T3.2.1) that also lives inside
-    /// `adapter_agent24` can reach it the same way `KernelEventSink` does.
+    /// module does not guess. `pub(crate)` (L-1): nothing outside the crate
+    /// needs to name `transport::TransportError`, so nothing outside needs
+    /// this either.
+    ///
+    /// No production caller as of this commit — [`KernelEventSink`] (the
+    /// only client today) uses [`Self::call_with_slot_wait`] instead. Kept,
+    /// not deleted: this fail-fast form is exactly what a future typed
+    /// client (T3.2.1 — scheduler/memory/approval) is expected to want
+    /// ("tell the caller now, let THEM decide whether to retry" fits a
+    /// business call better than emit's own bounded wait), and it is the
+    /// crate's own test suite's primary way of exercising `Transport`.
+    #[allow(dead_code)]
     pub(crate) async fn call(
         &self,
         method: &str,
         params: Value,
     ) -> Result<Value, transport::TransportError> {
         self.transport.call(method, params).await
+    }
+
+    /// Like [`Self::call`], but waits up to `slot_wait` for an in-flight
+    /// slot instead of failing immediately — see
+    /// [`transport::Transport::call_with_slot_wait`]. `pub(crate)`, same
+    /// reasoning as [`Self::call`] (L-1): only [`KernelEventSink`] calls it.
+    pub(crate) async fn call_with_slot_wait(
+        &self,
+        method: &str,
+        params: Value,
+        slot_wait: Duration,
+    ) -> Result<Value, transport::TransportError> {
+        self.transport
+            .call_with_slot_wait(method, params, slot_wait)
+            .await
     }
 
     /// Builds a [`KernelClients`] over an already-spawned
@@ -284,60 +343,93 @@ async fn connect_and_initialize(
 /// Adapts [`KernelClients`] to [`crate::http::EventSink`]. `http` never sees
 /// this type — only the trait.
 ///
-/// One worker drains a bounded queue, so events reach the kernel in the order
-/// they were emitted and a stalled kernel costs at most the queue, not one
-/// suspended task per mutation (Codex 2026-09-22 review, Medium #6). When the
-/// queue is full the event is dropped and counted — events are best-effort by
-/// design (§5.3), a committed write must not wait on them.
+/// **No cross-event ordering guarantee.** The kernel may process concurrent
+/// `_a24/events/emit` calls in any order, and [`KernelClients::call`]'s own
+/// dispatch is by response id, not by call order — two events emitted in
+/// quick succession can land at the event bus in either order. This is safe
+/// only because Sin90's own SQLite (not the event mirror) is the source of
+/// truth for everything the events describe (design §5.3, architecture.md
+/// "运行形态").
 ///
-/// Emitting through the worker (rather than a bare `tokio::spawn` per event)
-/// also means at most one `_a24/events/emit` call is in flight at a time from
-/// this sink, so two events queued in quick succession cannot race each other
-/// on the wire — though this is still safe either way only because Sin90's
-/// own SQLite (not the event mirror) is the source of truth for everything
-/// the events describe (design §5.3, architecture.md "运行形态").
+/// `emit()` itself only ever does a non-blocking `try_send` (M5/N-M2) onto a
+/// bounded channel drained by [`EMIT_WORKER_COUNT`] worker tasks spawned
+/// once at [`KernelEventSink::new`] — not one `tokio::spawn` per event
+/// (Codex 2026-09-22 review, Medium #6: a stalled kernel used to cost one
+/// suspended task per mutation). A full queue means the event is dropped
+/// (and counted via `dropped`); a worker additionally gates each dequeued
+/// event through a small sub-quota semaphore (N-M1, [`EMIT_SUB_QUOTA`])
+/// before it ever competes for `transport::Transport`'s own 64-slot
+/// semaphore, so a burst of events can never leave fail-fast (non-emit)
+/// callers permanently starved of a slot.
 pub struct KernelEventSink {
-    tx: tokio::sync::mpsc::Sender<(String, Map<String, Value>)>,
-    dropped: Arc<std::sync::atomic::AtomicU64>,
+    tx: mpsc::Sender<(String, Map<String, Value>)>,
+    dropped: Arc<AtomicU64>,
 }
 
 impl KernelEventSink {
-    /// Must be called inside a Tokio runtime (spawns the worker).
-    pub fn spawn(clients: Arc<KernelClients>) -> Self {
-        Self::with_capacity(clients, DEFAULT_EVENT_QUEUE)
-    }
-
-    pub fn with_capacity(clients: Arc<KernelClients>, capacity: usize) -> Self {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, Map<String, Value>)>(capacity);
-        tokio::spawn(async move {
-            while let Some((kind, payload)) = rx.recv().await {
-                let params = json!({ "kind": kind, "payload": payload });
-                if let Err(e) = clients.call("_a24/events/emit", params).await {
-                    tracing::warn!(error = %e, kind, "sin90: events/emit failed");
+    pub fn new(clients: Arc<KernelClients>) -> Self {
+        let (tx, rx) = mpsc::channel(EMIT_QUEUE_CAPACITY);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let rx = Arc::new(AsyncMutex::new(rx));
+        let sub_quota = Arc::new(Semaphore::new(EMIT_SUB_QUOTA));
+        for _ in 0..EMIT_WORKER_COUNT {
+            let clients = Arc::clone(&clients);
+            let rx = Arc::clone(&rx);
+            let sub_quota = Arc::clone(&sub_quota);
+            tokio::spawn(async move {
+                loop {
+                    let item = { rx.lock().await.recv().await };
+                    let Some((kind, payload)) = item else {
+                        break; // every `Sender` (and `KernelEventSink`) dropped.
+                    };
+                    let deadline = tokio::time::Instant::now() + EMIT_SLOT_WAIT;
+                    let sub_permit =
+                        tokio::time::timeout_at(deadline, Arc::clone(&sub_quota).acquire_owned())
+                            .await;
+                    let _sub_permit = match sub_permit {
+                        Ok(Ok(permit)) => permit,
+                        _ => {
+                            tracing::warn!(
+                                kind,
+                                "sin90: events/emit dropped — timed out waiting for the emit \
+                                 sub-quota"
+                            );
+                            continue;
+                        }
+                    };
+                    // Whatever's left of the combined budget, after the
+                    // sub-quota wait, is what's left to wait for a slot on
+                    // the main semaphore.
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    let params = json!({ "kind": kind, "payload": payload });
+                    if let Err(e) = clients
+                        .call_with_slot_wait("_a24/events/emit", params, remaining)
+                        .await
+                    {
+                        tracing::warn!(error = %e, kind, "sin90: events/emit failed or was dropped");
+                    }
                 }
-            }
-        });
-        Self {
-            tx,
-            dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            });
         }
+        Self { tx, dropped }
     }
 
-    /// Events dropped so far because the queue was full (or the worker gone).
-    pub fn dropped(&self) -> u64 {
-        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+    /// How many events were dropped because the bounded queue was full
+    /// (N-M2) — an observability hook, `pub(crate)` for this crate's own
+    /// tests; nothing production reads it yet.
+    #[cfg(test)]
+    pub(crate) fn dropped_count(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 }
 
 impl EventSink for KernelEventSink {
     fn emit(&self, kind: &str, payload: Map<String, Value>) {
         if self.tx.try_send((kind.to_string(), payload)).is_err() {
-            let n = self
-                .dropped
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                + 1;
+            let n = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
             // Log the 1st, 2nd, 4th, 8th... drop: visible, but a stalled
-            // kernel can't turn this into a log flood.
+            // kernel can't turn this into a log flood (Codex 2026-09-22
+            // review, Medium #6).
             if n.is_power_of_two() {
                 tracing::warn!(
                     kind,
@@ -390,7 +482,7 @@ pub fn wire_kernel_clients(
         return (Arc::new(NullEventSink), clients);
     }
     let sink: Arc<dyn EventSink> = if clients.provides("_a24/events/emit") {
-        Arc::new(KernelEventSink::spawn(clients.clone()))
+        Arc::new(KernelEventSink::new(clients.clone()))
     } else {
         // Granted some other capability but not events — degrade, don't
         // fail (design §5.3).
@@ -661,6 +753,62 @@ mod tests {
         assert_eq!(parsed["method"], "_a24/events/emit");
     }
 
+    #[tokio::test]
+    async fn kernel_event_sink_drops_and_counts_when_the_bounded_queue_is_full() {
+        // N-M2: `emit()` itself only ever does a non-blocking `try_send` —
+        // a full queue means the event is dropped, not queued unboundedly.
+        // Filling it in a tight, non-yielding loop on the (default,
+        // current-thread) `#[tokio::test]` runtime means none of the fixed
+        // worker tasks get a chance to drain anything while we fill it, so
+        // the overflow count below is exact, not a race.
+        let offer = vec!["_a24/events/".to_string()];
+        let (clients, _peer) = clients_over_a_socket_pair(offer);
+        let sink = KernelEventSink::new(clients);
+
+        let overflow = 44;
+        for i in 0..(EMIT_QUEUE_CAPACITY + overflow) {
+            sink.emit(&format!("flood.{i}"), Map::new());
+        }
+        assert_eq!(sink.dropped_count(), overflow as u64);
+    }
+
+    #[tokio::test]
+    async fn fail_fast_calls_are_not_starved_by_a_heavy_emit_burst() {
+        // N-M1: even while a heavy, sustained emit burst is in flight (each
+        // one stuck holding a main-semaphore permit, since the peer never
+        // reads and so no response — or write failure — ever arrives), a
+        // fail-fast (non-emit) caller must still ACQUIRE A SLOT immediately.
+        // With `EMIT_WORKER_COUNT` (4) far below `EMIT_SUB_QUOTA` (32) and
+        // `MAX_IN_FLIGHT_PER_CONNECTION` (64), the fixed worker pool itself
+        // already bounds how many slots a burst can ever occupy — this test
+        // exercises that user-visible guarantee directly, whichever
+        // mechanism (worker count vs. sub-quota) ends up doing the actual
+        // limiting as those numbers evolve.
+        let offer = vec!["_a24/events/".to_string()];
+        let (clients, peer) = clients_over_a_socket_pair(offer);
+        let sink = KernelEventSink::new(Arc::clone(&clients));
+        let _peer = peer; // held, never read from.
+
+        for i in 0..200 {
+            sink.emit(&format!("flood.{i}"), Map::new());
+        }
+        // Let the fixed worker pool pick up work and start occupying
+        // main-semaphore permits.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let handle = tokio::spawn({
+            let clients = Arc::clone(&clients);
+            async move { clients.call("_a24/scheduler/upsert", json!({})).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !handle.is_finished(),
+            "a fail-fast call must acquire a slot (not resolve immediately with Busy) even \
+             during a heavy emit burst"
+        );
+        handle.abort();
+    }
+
     #[test]
     fn on_fatal_is_a_plain_send_sync_closure_main_rs_can_construct_without_naming_transport() {
         // main.rs (a different crate) must be able to build a `FatalHook`
@@ -675,51 +823,6 @@ mod tests {
         };
         hook();
         assert_eq!(count.load(Ordering::SeqCst), 1);
-    }
-
-    /// Medium #6: every mutation used to spawn its own task, each waiting
-    /// behind the stuck one. Now one worker drains a bounded queue: overflow
-    /// is dropped and counted rather than piling up one suspended task per
-    /// event. Uses the in-memory socket pair (no real kernel needed) with a
-    /// peer that reads but never answers, so the worker is provably stuck
-    /// inside its first round trip while the rest of the queue fills up.
-    #[tokio::test]
-    async fn event_queue_is_bounded_and_counts_drops_while_the_kernel_is_stuck() {
-        let offer = vec!["_a24/events/".to_string()];
-        let (clients, peer) = clients_over_a_socket_pair(offer);
-        let mut peer_reader = BufReader::new(peer);
-
-        let sink = KernelEventSink::with_capacity(clients, 4);
-
-        // First event: wait until the peer actually has the request, so the
-        // worker is known to be parked inside that (never-answered) round
-        // trip before the rest of the queue fills up.
-        sink.emit("e0", Map::new());
-        let mut buf = Vec::new();
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            peer_reader.read_until(b'\n', &mut buf),
-        )
-        .await
-        .expect("the worker must have sent e0's request")
-        .unwrap();
-
-        for i in 1..=14 {
-            sink.emit(&format!("e{i}"), Map::new());
-        }
-        assert_eq!(sink.dropped(), 10, "4 queued, the other 10 dropped");
-
-        // Positive control: nothing else reached the peer while it's stuck.
-        let mut extra = [0u8; 1];
-        let read = tokio::time::timeout(
-            Duration::from_millis(200),
-            peer_reader.get_mut().read(&mut extra),
-        )
-        .await;
-        assert!(
-            read.is_err(),
-            "no further events should reach the wire while the worker is stuck"
-        );
     }
 
     fn tempdir() -> std::path::PathBuf {

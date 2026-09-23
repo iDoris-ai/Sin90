@@ -112,16 +112,15 @@ pub type FatalHook = Arc<dyn Fn() + Send + Sync>;
 /// The kernel's `error.data.kind` and the rest of an RPC error, parsed once
 /// here rather than left as a `Value` every caller re-navigates. `T3.2.1`'s
 /// typed clients match on `kind`; `raw` keeps the original payload for
-/// anything not typed yet.
-// `code`/`raw` aren't read by anything in THIS commit (nothing calls
-// `Transport::call` outside its own tests yet — see `Transport`'s own
-// `#[allow(dead_code)]`); `T3.2.1`'s typed clients are the intended reader.
-#[allow(dead_code)]
+/// anything not typed yet — genuinely unread by anything in this crate
+/// today (only `code`/`kind`/`message` are, via `Display`), which is why it
+/// alone still carries `#[allow(dead_code)]`.
 #[derive(Debug, Clone)]
 pub(crate) struct RpcErrorInfo {
     pub code: i64,
     pub kind: Option<String>,
     pub message: String,
+    #[allow(dead_code)]
     pub raw: Value,
 }
 
@@ -242,12 +241,9 @@ impl Default for TransportConfig {
 /// [`Transport::spawn`] — this module does not know how to dial or
 /// handshake; that stays in `adapter_agent24::mod` (design §8: adapter owns
 /// the wire protocol, this module owns concurrency over an established
-/// connection).
-///
-/// **Not wired to any caller yet in this commit** (T3.2.0 is split across
-/// two stacked branches): `KernelClients` starts using this in the next one.
-/// The `#[allow(dead_code)]` below is that gap, not an oversight.
-#[allow(dead_code)]
+/// connection). Owned by `adapter_agent24::KernelClients`, one per
+/// connection, for that connection's whole life — no reconnect (module
+/// docs).
 pub(crate) struct Transport {
     write_tx: mpsc::Sender<Vec<u8>>,
     pending: Pending,
@@ -258,7 +254,6 @@ pub(crate) struct Transport {
     reader_task: JoinHandle<()>,
 }
 
-#[allow(dead_code)]
 impl Transport {
     pub(crate) fn spawn(stream: UnixStream, on_fatal: FatalHook) -> Self {
         Self::spawn_with_config(stream, on_fatal, TransportConfig::default())
@@ -388,6 +383,12 @@ impl Transport {
     /// monotonic counter formatted as a string — unique for this
     /// connection's lifetime, which is all it needs to be (no reconnect, no
     /// surviving id to carry over).
+    ///
+    /// No production caller as of this commit (`KernelEventSink` uses
+    /// [`Transport::call_with_slot_wait`] instead) — kept for a future
+    /// fail-fast typed client (T3.2.1) and used throughout this module's own
+    /// tests, which is most of what exercises `Transport` at all.
+    #[allow(dead_code)]
     pub(crate) async fn call(&self, method: &str, params: Value) -> Result<Value, TransportError> {
         self.call_with_timeout(method, params, RESPONSE_TIMEOUT)
             .await
@@ -397,27 +398,14 @@ impl Transport {
     /// production code never needs this (`Transport::call` always uses
     /// [`RESPONSE_TIMEOUT`]); tests use it to exercise the timeout path
     /// without a 35-second sleep.
+    #[allow(dead_code)]
     pub(crate) async fn call_with_timeout(
         &self,
         method: &str,
         params: Value,
         response_timeout: Duration,
     ) -> Result<Value, TransportError> {
-        let id = format!("t-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
-        let req = json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        });
-        let mut encoded = serde_json::to_vec(&req).expect("a json! Value always serializes");
-        // M3: reject an oversized call BEFORE it ever reaches the writer —
-        // the writer must never be handed a frame it would have to refuse.
-        if encoded.len() > frame::MAX_FRAME_BYTES {
-            return Err(TransportError::FrameTooLarge);
-        }
-        encoded.push(b'\n');
-
+        let (id, encoded) = self.encode_request(method, params)?;
         let permit = match Arc::clone(&self.semaphore).try_acquire_owned() {
             Ok(permit) => permit,
             // N-M3: `declare_dead` now closes the semaphore, so a dead
@@ -427,7 +415,77 @@ impl Transport {
             Err(tokio::sync::TryAcquireError::Closed) => return Err(TransportError::NotSent),
             Err(tokio::sync::TryAcquireError::NoPermits) => return Err(TransportError::Busy),
         };
+        self.send_and_await(id, encoded, permit, response_timeout)
+            .await
+    }
 
+    /// Like [`Transport::call`], but waits up to `slot_wait` for an
+    /// in-flight slot instead of failing immediately the moment all
+    /// [`MAX_IN_FLIGHT_PER_CONNECTION`] are taken (M5/N-M1:
+    /// `KernelEventSink` uses this via its own sub-quota gate — an event
+    /// tolerates a brief wait better than being silently dropped on a short
+    /// burst; nothing else needs the extra tolerance, so every other caller
+    /// stays fail-fast via [`Transport::call`]). Giving up after `slot_wait`
+    /// still reports [`TransportError::Busy`] — the meaning is the same ("no
+    /// slot"), only how long it took to give up differs. N-M3: if the
+    /// connection dies while this is waiting, `declare_dead`'s
+    /// `semaphore.close()` wakes it immediately with
+    /// [`TransportError::NotSent`] rather than riding out the rest of
+    /// `slot_wait`.
+    pub(crate) async fn call_with_slot_wait(
+        &self,
+        method: &str,
+        params: Value,
+        slot_wait: Duration,
+    ) -> Result<Value, TransportError> {
+        let (id, encoded) = self.encode_request(method, params)?;
+        let permit = match tokio::time::timeout(
+            slot_wait,
+            Arc::clone(&self.semaphore).acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_closed)) => return Err(TransportError::NotSent),
+            Err(_elapsed) => return Err(TransportError::Busy),
+        };
+        self.send_and_await(id, encoded, permit, RESPONSE_TIMEOUT)
+            .await
+    }
+
+    /// Serializes the envelope and applies M3's size check — shared by every
+    /// `call*` entry point so the check runs identically, and BEFORE a
+    /// semaphore permit is taken, regardless of which one is used.
+    fn encode_request(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<(String, Vec<u8>), TransportError> {
+        let id = format!("t-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        let mut encoded = serde_json::to_vec(&req).expect("a json! Value always serializes");
+        if encoded.len() > frame::MAX_FRAME_BYTES {
+            return Err(TransportError::FrameTooLarge);
+        }
+        encoded.push(b'\n');
+        Ok((id, encoded))
+    }
+
+    /// Registers the waiter, hands the encoded frame to the writer, and
+    /// awaits the response (or `response_timeout`) — the tail shared by
+    /// every `call*` entry point, once each has its own permit.
+    async fn send_and_await(
+        &self,
+        id: String,
+        encoded: Vec<u8>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        response_timeout: Duration,
+    ) -> Result<Value, TransportError> {
         let (tx, rx) = oneshot::channel();
         {
             let mut guard = self.pending.lock().unwrap();
@@ -1177,6 +1235,124 @@ mod tests {
             "got {result:?}"
         );
         wait_until(|| count.load(Ordering::SeqCst) == 1, Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn transport_call_with_slot_wait_succeeds_once_a_slot_frees_up() {
+        let (client, server) = connected_pair().await;
+        let (hook, _count) = counting_hook();
+        let transport = Arc::new(Transport::spawn(client, hook));
+        let (server_read, mut server_write) = server.into_split();
+        let mut server_read = TokioBufReader::new(server_read);
+
+        // Saturate all 64 slots with calls the fake kernel never answers.
+        let mut handles = Vec::new();
+        let mut ids = Vec::new();
+        for i in 0..MAX_IN_FLIGHT_PER_CONNECTION {
+            let t = Arc::clone(&transport);
+            handles.push(tokio::spawn(async move {
+                t.call(&format!("method.{i}"), json!({})).await
+            }));
+        }
+        for _ in 0..MAX_IN_FLIGHT_PER_CONNECTION {
+            ids.push(
+                read_json_line(&mut server_read).await["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        wait_until(
+            || transport.available_permits() == 0,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        // A slot-waiting call, parked behind the full semaphore.
+        let t = Arc::clone(&transport);
+        let waiter = tokio::spawn(async move {
+            t.call_with_slot_wait("event.emit", json!({}), Duration::from_secs(2))
+                .await
+        });
+        // L-5: give the waiter task a moment to actually start (and block
+        // on) `acquire_owned`, THEN assert it has NOT finished yet — proving
+        // it is genuinely waiting for a slot, not that it happened to run
+        // fast enough that the timing of the assertion below wouldn't have
+        // caught a bug either way.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !waiter.is_finished(),
+            "the waiter must still be blocked on a slot before any is freed"
+        );
+
+        // Free exactly one slot by answering one in-flight call.
+        write_json_line(
+            &mut server_write,
+            &json!({"jsonrpc": "2.0", "id": ids[0], "result": {}}),
+        )
+        .await;
+
+        let waiter_request = read_json_line(&mut server_read).await;
+        assert_eq!(waiter_request["method"], "event.emit");
+        write_json_line(
+            &mut server_write,
+            &json!({"jsonrpc": "2.0", "id": waiter_request["id"], "result": {"ok": true}}),
+        )
+        .await;
+        let result = waiter.await.unwrap();
+        assert_eq!(result.unwrap(), json!({"ok": true}));
+
+        for h in handles {
+            h.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_call_with_slot_wait_times_out_to_busy_when_no_slot_frees() {
+        let (client, server) = connected_pair().await;
+        let (hook, _count) = counting_hook();
+        let transport = Arc::new(Transport::spawn(client, hook));
+        let (server_read, _server_write) = server.into_split();
+        tokio::spawn(async move {
+            let mut reader = TokioBufReader::new(server_read);
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                if reader.read_until(b'\n', &mut buf).await.unwrap_or(0) == 0 {
+                    break;
+                }
+            }
+        });
+
+        let mut handles = Vec::new();
+        for i in 0..MAX_IN_FLIGHT_PER_CONNECTION {
+            let t = Arc::clone(&transport);
+            handles.push(tokio::spawn(async move {
+                t.call(&format!("method.{i}"), json!({})).await
+            }));
+        }
+        wait_until(
+            || transport.available_permits() == 0,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        let started = tokio::time::Instant::now();
+        let result = transport
+            .call_with_slot_wait("event.emit", json!({}), Duration::from_millis(50))
+            .await;
+        assert!(
+            matches!(result, Err(TransportError::Busy)),
+            "got {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "must give up around the requested wait, not hang"
+        );
+
+        for h in handles {
+            h.abort();
+        }
     }
 
     async fn read_frame_bytes(
