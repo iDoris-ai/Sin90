@@ -15,9 +15,10 @@ use crate::core::{
     check_alloc, check_area_transition, check_rhythm_transition, check_routine_transition,
     check_schedule_block_transition, check_task_transition, check_week_transition, now_iso8601,
     routine_is_terminal, ulid, validate, validate_cron, validate_tz, week_is_open, Alloc, Area,
-    AreaStatus, Direction, DirectionStatus, Energy, NewRoutine, ProposalSource, ProposalStatus,
-    Rhythm, RhythmStatus, Routine, RoutinePatch, RoutineStatus, ScheduleBlock, ScheduleBlockStatus,
-    Sin90Op, Sin90Proposal, Task, TaskKind, TaskStatus, ValidationCtx, Week, WeekStatus,
+    AreaStatus, Direction, DirectionStatus, Energy, FireTrigger, NewRoutine, ProposalSource,
+    ProposalStatus, Rhythm, RhythmStatus, Routine, RoutinePatch, RoutineStatus, ScheduleBlock,
+    ScheduleBlockStatus, Sin90Op, Sin90Proposal, Task, TaskKind, TaskStatus, ValidationCtx, Week,
+    WeekStatus,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -57,6 +58,31 @@ pub struct ApplyOutcome {
 pub struct RoutineUpdate {
     pub routine: Routine,
     pub changed: Vec<&'static str>,
+}
+
+/// Outcome of [`Sin90Store::record_routine_fire`] (T3.2.2). Every variant
+/// maps to an HTTP 2xx in `http::scheduler_fired` — spec.md M3 "fired" and
+/// Agent24's `ME4-S1-scheduler-callback.md` §4.1 both require it: the kernel
+/// treats a non-2xx as a failed delivery and retries, and none of these
+/// outcomes are a delivery failure — a duplicate is the kernel's OWN retry
+/// working as designed, and an unknown/retired routine is Sin90's local
+/// bookkeeping drift (an orphan the reconciler, T3.3.2, will clean up later),
+/// not something rejecting the request fixes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoutineFireOutcome {
+    /// First time this `fire_id` was seen: a `sin90_routine_fires` row was
+    /// inserted and a `routine.fired` event appended, in the same tx.
+    Recorded { routine_id: String },
+    /// This `fire_id` was already recorded — the kernel's at-least-once
+    /// retry of the same due slot (design §4.1/§4.2: same slot, same
+    /// `fire_id`). No new row, no new event (spec.md M3: "重复投递幂等返回
+    /// 2xx").
+    Duplicate { routine_id: String },
+    /// `key` is not shaped `routine.<id>`, or no such routine exists.
+    UnknownKey,
+    /// The routine exists but has already reached `retired` — a schedule the
+    /// kernel had not yet finished tearing down when it fired one last time.
+    RoutineRetired { routine_id: String },
 }
 
 /// A persisted proposal as returned by the read endpoints — the stored row plus
@@ -217,6 +243,12 @@ pub struct TodayView {
     pub deep_block: Option<ScheduleBlock>,
     pub inbox: Vec<Task>,
     pub carry_over_candidates: Vec<Task>,
+    /// New (T3.2.2, spec.md M3 "`/today` 增「今日到点的 Routine」段"): every
+    /// `Routine` with at least one `sin90_routine_fires` row whose
+    /// `received_at` falls on today's UTC calendar day (same day-boundary
+    /// rule `carry_over_candidates` above uses), deduplicated so a routine
+    /// that fired more than once today appears exactly once.
+    pub fired_routines: Vec<Routine>,
 }
 
 type Tx<'a> = Transaction<'a, Sqlite>;
@@ -1232,12 +1264,37 @@ impl Sin90Store {
         .map(row_to_task)
         .collect::<Result<Vec<_>>>()?;
 
+        // T3.2.2: routines with a `sin90_routine_fires` row received today
+        // (>= same UTC-day boundary `carry_over_candidates` uses above).
+        // `DISTINCT` over the full routine column set collapses a routine
+        // that fired more than once today to one row — every matching join
+        // row carries identical routine columns, so `DISTINCT` here is
+        // exactly "group by routine.id" without a separate GROUP BY clause.
+        let fired_routines = sqlx::query(&format!(
+            "SELECT DISTINCT {cols} FROM sin90_routine_fires f
+             JOIN sin90_routines r ON r.id = f.routine_id
+             WHERE f.received_at >= ?
+             ORDER BY r.title ASC",
+            cols = ROUTINE_COLUMNS
+                .split(", ")
+                .map(|c| format!("r.{c}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+        .bind(&today_start)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(row_to_routine)
+        .collect::<Result<Vec<_>>>()?;
+
         tx.commit().await?;
         Ok(TodayView {
             must_do,
             deep_block,
             inbox,
             carry_over_candidates,
+            fired_routines,
         })
     }
 
@@ -1660,6 +1717,117 @@ impl Sin90Store {
             status: to,
             updated_at: now,
             ..current
+        })
+    }
+
+    // ----- fired receipt (T3.2.2, design §2 #16, spec.md M3 "fired") ---------
+
+    /// Record one `POST /_a24/scheduler/fired` delivery, idempotently by
+    /// `fire_id` (Agent24's delivery contract is at-least-once with the same
+    /// `fire_id` shared by every retry of one due slot —
+    /// `ME4-S1-scheduler-callback.md` §4.1/§4.2). `key` is the kernel's
+    /// schedule key, expected in the `routine.<id>` shape `store::repo`'s own
+    /// outbox code mints (see `routine_outbox_upsert_desired`); any other
+    /// shape, or an id that doesn't resolve to a `sin90_routines` row, comes
+    /// back as [`RoutineFireOutcome::UnknownKey`] — not an error, since it is
+    /// this module's bookkeeping that's out of sync, not the kernel's
+    /// mistake (the caller must still answer 2xx so the kernel does not
+    /// retry a "failure" that isn't one).
+    ///
+    /// Everything — the routine lookup, the dedup insert, and the event
+    /// append — runs inside ONE `BEGIN IMMEDIATE` transaction, so a
+    /// concurrent `transition_routine(.., Retired)` can't interleave between
+    /// "routine looked active" and "fire recorded": either this call sees
+    /// the retirement (and returns [`RoutineFireOutcome::RoutineRetired`]
+    /// without writing anything) or it doesn't (and the retirement, which
+    /// also takes `BEGIN IMMEDIATE`, waits for this one to finish first).
+    ///
+    /// No production caller exists on THIS branch (`feat/t3.2.2a-routine-fires-store`)
+    /// — only this module's own `fired_tests` (`#[cfg(test)]`) exercise it.
+    /// The caller is `http::scheduler_fired`, added by
+    /// `feat/t3.2.2-fired-route` stacked on top. Being `pub` on a `pub`
+    /// struct already keeps `dead_code` from firing here either way (same
+    /// as every other `pub` store method), so the `allow` below changes
+    /// nothing functionally — it documents, same convention as
+    /// `core::proposal`'s `_AreaIdUsed`, that a caller-less `pub fn` at this
+    /// point in the stack is expected, not a mistake.
+    #[allow(dead_code)]
+    pub async fn record_routine_fire(
+        &self,
+        fire_id: &str,
+        key: &str,
+        scheduled_for: &str,
+        trigger: FireTrigger,
+    ) -> Result<RoutineFireOutcome> {
+        let Some(routine_id) = key.strip_prefix("routine.").filter(|rest| !rest.is_empty()) else {
+            return Ok(RoutineFireOutcome::UnknownKey);
+        };
+
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+
+        let status: Option<String> = sqlx::query("SELECT status FROM sin90_routines WHERE id = ?")
+            .bind(routine_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(|r| r.get::<String, _>("status"));
+
+        let Some(status) = status else {
+            return Ok(RoutineFireOutcome::UnknownKey);
+        };
+        if status == "retired" {
+            return Ok(RoutineFireOutcome::RoutineRetired {
+                routine_id: routine_id.to_string(),
+            });
+        }
+
+        let now = now_iso8601();
+        let trigger_str = to_wire(&trigger)?;
+        // `ON CONFLICT(fire_id) DO NOTHING RETURNING fire_id`: a fresh
+        // `fire_id` inserts and returns its own id (`Some`); a `fire_id`
+        // already in the table hits the PRIMARY KEY conflict, inserts
+        // nothing, and RETURNING yields zero rows (`None`) — SQLite only
+        // returns rows for the INSERT's actual effect, same as
+        // `apply_proposal`'s CAS `UPDATE ... RETURNING` above.
+        let inserted: Option<String> = sqlx::query(
+            "INSERT INTO sin90_routine_fires
+                 (fire_id, routine_id, scheduled_for, trigger, received_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(fire_id) DO NOTHING
+             RETURNING fire_id",
+        )
+        .bind(fire_id)
+        .bind(routine_id)
+        .bind(scheduled_for)
+        .bind(&trigger_str)
+        .bind(&now)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(|r| r.get::<String, _>("fire_id"));
+
+        if inserted.is_none() {
+            tx.commit().await?;
+            return Ok(RoutineFireOutcome::Duplicate {
+                routine_id: routine_id.to_string(),
+            });
+        }
+
+        append_event(
+            &mut tx,
+            "routine",
+            routine_id,
+            "fired",
+            None,
+            None,
+            &json!({
+                "routine_id": routine_id, "fire_id": fire_id,
+                "scheduled_for": scheduled_for, "trigger": trigger_str,
+            }),
+            &now,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(RoutineFireOutcome::Recorded {
+            routine_id: routine_id.to_string(),
         })
     }
 
@@ -3618,5 +3786,295 @@ mod outbox_tests {
              (found {versions:?}) — a gap means a future migration filling it in \
              would apply out of chronological order on an already-upgraded db"
         );
+    }
+}
+
+// ----- T3.2.2: fired receipt dedup + event (design §2 #16, spec.md M3) ----
+
+#[cfg(test)]
+mod fired_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::routine_tests::{create_ok, nr};
+    use super::*;
+    use crate::core::{FireTrigger, RoutineKind};
+    use crate::store::test_hooks;
+
+    async fn new_store() -> Sin90Store {
+        Sin90Store::open_memory().await.unwrap()
+    }
+
+    // ----- same fire_id twice -> one row, one event ------------------------
+
+    /// The kernel's at-least-once retry sends the SAME `fire_id` twice for
+    /// one due slot (design doc §4.1/§4.2) — recording it must collapse to
+    /// exactly one `sin90_routine_fires` row and exactly one `routine.fired`
+    /// event, and BOTH calls must report success (idempotent 2xx, not the
+    /// second one erroring).
+    #[tokio::test]
+    async fn fired_duplicate_fire_id_collapses_to_one_row_one_event() {
+        let store = new_store().await;
+        let routine = create_ok(&store).await;
+
+        let first = store
+            .record_routine_fire(
+                "fire-dup-1",
+                &format!("routine.{}", routine.id),
+                "2026-09-24T07:00:00Z",
+                FireTrigger::Tick,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(first, RoutineFireOutcome::Recorded { .. }),
+            "{first:?}"
+        );
+
+        let second = store
+            .record_routine_fire(
+                "fire-dup-1",
+                &format!("routine.{}", routine.id),
+                "2026-09-24T07:00:00Z",
+                FireTrigger::Tick,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second,
+            RoutineFireOutcome::Duplicate {
+                routine_id: routine.id.clone()
+            }
+        );
+
+        assert_eq!(
+            test_hooks::routine_fire_count(&store, &routine.id)
+                .await
+                .unwrap(),
+            1
+        );
+        // `routine.created` already wrote one event at create_ok() time — so
+        // exactly one MORE (`fired`) event exists for this routine, not two.
+        assert_eq!(
+            test_hooks::event_count(&store, "routine", &routine.id)
+                .await
+                .unwrap(),
+            2,
+            "expected exactly `created` + one `fired` (not two `fired`s)"
+        );
+    }
+
+    /// Positive control for the test above: two DISTINCT `fire_id`s (a real
+    /// second due slot, not a retry) leave two rows and two `fired` events.
+    #[tokio::test]
+    async fn fired_distinct_fire_ids_leave_two_rows_positive_control() {
+        let store = new_store().await;
+        let routine = create_ok(&store).await;
+
+        store
+            .record_routine_fire(
+                "fire-a",
+                &format!("routine.{}", routine.id),
+                "2026-09-24T07:00:00Z",
+                FireTrigger::Tick,
+            )
+            .await
+            .unwrap();
+        store
+            .record_routine_fire(
+                "fire-b",
+                &format!("routine.{}", routine.id),
+                "2026-09-26T07:00:00Z",
+                FireTrigger::Tick,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            test_hooks::routine_fire_count(&store, &routine.id)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            test_hooks::event_count(&store, "routine", &routine.id)
+                .await
+                .unwrap(),
+            3,
+            "created + two distinct fired events"
+        );
+    }
+
+    // ----- unknown key / retired routine: 200-shaped outcome, no row, no event
+
+    #[tokio::test]
+    async fn fired_unknown_key_records_nothing() {
+        let store = new_store().await;
+        // No routine exists at all yet — this key can never resolve.
+        let outcome = store
+            .record_routine_fire(
+                "fire-unknown",
+                "routine.does-not-exist",
+                "2026-09-24T07:00:00Z",
+                FireTrigger::Tick,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, RoutineFireOutcome::UnknownKey);
+        assert_eq!(
+            test_hooks::routine_fire_count(&store, "does-not-exist")
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    /// A key that isn't even shaped `routine.<id>` is ALSO `UnknownKey`, not
+    /// a crash/500 — the kernel only ever sends keys this module minted
+    /// itself, but a stale/foreign key must not panic the handler.
+    #[tokio::test]
+    async fn fired_malformed_key_is_unknown_not_an_error() {
+        let store = new_store().await;
+        let outcome = store
+            .record_routine_fire(
+                "fire-malformed",
+                "not-a-routine-key",
+                "2026-09-24T07:00:00Z",
+                FireTrigger::Tick,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, RoutineFireOutcome::UnknownKey);
+    }
+
+    #[tokio::test]
+    async fn fired_retired_routine_records_nothing() {
+        let store = new_store().await;
+        let routine = create_ok(&store).await;
+        store
+            .transition_routine(&routine.id, RoutineStatus::Retired)
+            .await
+            .unwrap();
+
+        let outcome = store
+            .record_routine_fire(
+                "fire-after-retire",
+                &format!("routine.{}", routine.id),
+                "2026-09-24T07:00:00Z",
+                FireTrigger::Tick,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            RoutineFireOutcome::RoutineRetired {
+                routine_id: routine.id.clone()
+            }
+        );
+        assert_eq!(
+            test_hooks::routine_fire_count(&store, &routine.id)
+                .await
+                .unwrap(),
+            0
+        );
+        // create + retire = 2 events; no `fired` got appended on top.
+        assert_eq!(
+            test_hooks::event_count(&store, "routine", &routine.id)
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    // ----- /today "fired today" section -------------------------------------
+
+    #[tokio::test]
+    async fn fired_today_view_lists_routines_fired_today_not_yesterday() {
+        let store = new_store().await;
+        let today_routine = store
+            .create_routine(&nr(
+                "Today run",
+                RoutineKind::Exercise,
+                "0 7 * * MON,WED,FRI",
+            ))
+            .await
+            .unwrap();
+        let yesterday_routine = store
+            .create_routine(&nr(
+                "Yesterday run",
+                RoutineKind::Exercise,
+                "0 7 * * MON,WED,FRI",
+            ))
+            .await
+            .unwrap();
+
+        // `received_at` is always server-assigned to the real "now" inside
+        // `record_routine_fire` (the client-supplied `scheduled_for` below is
+        // irrelevant to the day-boundary check) — so this call alone lands
+        // `today_routine` in today's bucket with no backdating needed.
+        store
+            .record_routine_fire(
+                "fire-today",
+                &format!("routine.{}", today_routine.id),
+                "2026-09-24T07:00:00Z",
+                FireTrigger::Tick,
+            )
+            .await
+            .unwrap();
+        store
+            .record_routine_fire(
+                "fire-yesterday",
+                &format!("routine.{}", yesterday_routine.id),
+                "2026-09-23T07:00:00Z",
+                FireTrigger::Tick,
+            )
+            .await
+            .unwrap();
+        // Backdate the "yesterday" row's `received_at` itself to a real day
+        // boundary in the past — a fixed far-past date, not a sleep, and not
+        // tied to whatever the real wall-clock date happens to be when this
+        // test runs (`today_view` filters on `received_at`, not
+        // `scheduled_for`, so without this the test asserts nothing about
+        // the boundary it actually checks).
+        test_hooks::set_routine_fire_received_at(&store, "fire-yesterday", "2020-01-01T00:00:00Z")
+            .await
+            .unwrap();
+
+        let view = store.today_view().await.unwrap();
+        let ids: Vec<&str> = view.fired_routines.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&today_routine.id.as_str()), "{ids:?}");
+        assert!(!ids.contains(&yesterday_routine.id.as_str()), "{ids:?}");
+    }
+
+    /// A routine that fired twice today appears exactly once.
+    #[tokio::test]
+    async fn fired_today_view_dedups_a_routine_fired_twice_today() {
+        let store = new_store().await;
+        let routine = create_ok(&store).await;
+        store
+            .record_routine_fire(
+                "fire-1",
+                &format!("routine.{}", routine.id),
+                "2026-09-24T07:00:00Z",
+                FireTrigger::Tick,
+            )
+            .await
+            .unwrap();
+        store
+            .record_routine_fire(
+                "fire-2",
+                &format!("routine.{}", routine.id),
+                "2026-09-24T08:00:00Z",
+                FireTrigger::RunNow,
+            )
+            .await
+            .unwrap();
+
+        let view = store.today_view().await.unwrap();
+        let count = view
+            .fired_routines
+            .iter()
+            .filter(|r| r.id == routine.id)
+            .count();
+        assert_eq!(count, 1, "{:?}", view.fired_routines);
     }
 }

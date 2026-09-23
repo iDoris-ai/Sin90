@@ -340,6 +340,20 @@ pub struct RoutinePatch {
     pub target_minutes: Option<Option<u32>>,
 }
 
+/// New (T3.2.2, design §2 #16): which of the kernel's two fire sources
+/// produced a `POST /_a24/scheduler/fired` delivery (Agent24 design doc
+/// `ME4-S1-scheduler-callback.md` §4.2/§5.3 — the `trigger` domain a
+/// `fire_id` is derived from, `tick` for a due cron slot and `run_now` for a
+/// manually-triggered one). Typed here (not left as a bare `String` on the
+/// wire) so an unrecognized value is a clean 400 at deserialize time, same
+/// convention as every other closed-set field in this module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FireTrigger {
+    Tick,
+    RunNow,
+}
+
 /// The standard serde "double `Option`" trick: applied to a field already
 /// typed `Option<Option<T>>`, it deserializes the INNER `Option<T>`
 /// normally (so a JSON `null` becomes `None`, a value becomes `Some(v)`) and
@@ -394,6 +408,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&RoutineKind::DeepWork).unwrap(),
             "\"deep_work\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FireTrigger::RunNow).unwrap(),
+            "\"run_now\""
         );
     }
 
