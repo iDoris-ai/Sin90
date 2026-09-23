@@ -127,7 +127,7 @@ manifest 的 `impl_kind: out_of_process_provider` 必须**同时**带 `spawn: {c
 | 2 | 加 `Goal` 层 | **拒绝** | `Direction` 的 `achieved` 终态已经是 Goal 语义。插一层会让用户每次录入做两次分类决策（这是 PARA 类系统最常见的弃用原因），而代价是一整套状态机+路由+事件+迁移。若需要可度量目标，加 `Direction.metric` 一列即可。**复审触发条件**：出现"同一 Direction 下需要并列多个互不相关、完成时间显著不同的可完成目标"的真实用例。 |
 | 3 | 加 `Project` 层 | **改造** | 不做独立实体，用 `Task.parent_task_id` 自引用表达（Project = 有子任务的 Task）。理由：Project 与 Task 的生命周期状态几乎完全重合（backlog/planned/in_progress/done/dropped），一条自引用列换掉一整套实体。**复审触发条件**：出现 Project 独有且 Task 上放不下的字段（预算、干系人、里程碑）。 |
 | 4 | 加 `Execution` 实体 | **拒绝（已满足）** | `ScheduleBlock` 的 `planned→started→completed/skipped` 就是"实际发生"，`attention` 回放已经从 block 完成事件算 actual。加 `Execution` 是开第二套账，两套账必然对不上。 |
-| 5 | 加 `Review` 环节 | **已满足** | `Review{kind: daily/weekly/rhythm, status: draft/finalized}` 内核已有实体与状态机，只缺路由（M4 补）。 |
+| 5 | 加 `Review` 环节 | **已满足（+ T4.1.1 补 `period`）** | `Review{kind: daily/weekly/rhythm, status: draft/finalized}` 内核已有实体与状态机，只缺路由（M4 补）。路由落地时发现旧 `week_id` 列表达不了 daily/rhythm 期间，补 `period TEXT NOT NULL` + `UNIQUE(kind, period)`（§3.2/§4.1，迁移 `0007_review_period.sql`）作为 Review 的实际身份轴；`week_id` 保留但新代码不再写。 |
 | 6 | Rhythm 细分 `Routine` | **采纳** | 现有 `Rhythm` 只表达"Direction 间的注意力配额"（`Vec<Alloc>`），表达不了"每周 3 次 ×30 分钟"。`Routine` 是重复发生的执行模板，与 Rhythm 正交，不是它的子类；触发规则是 `cron` + `tz`（IANA 时区名，缺省 `UTC`——cron 本身不含时区，DST 边界必须显式）。M3。 |
 | 7 | Rhythm 细分 `ScheduleBlock` | **已满足** | 内核已有，含状态机与三条路由。 |
 | 8 | Rhythm 细分 `ReviewCycle` | **拒绝** | 复盘周期 = `Routine{kind: review}` + 已有的 `Review` 实体。第三个对象没有新增表达力。 |
@@ -181,11 +181,12 @@ Area（永久容器，无生命周期）
 
 **沿用内核（不改语义）**
 
-`Direction`（+ 新增 `area_id` 可空外键）、`Task`（+ 新增 `parent_task_id` 自引用）、`Week`、`ScheduleBlock`、`Rhythm`、`Review`、`Proposal`、`Event`。
+`Direction`（+ 新增 `area_id` 可空外键）、`Task`（+ 新增 `parent_task_id` 自引用）、`Week`、`ScheduleBlock`、`Rhythm`、`Review`（+ T4.1.1 新增 `period` 必填列，见下）、`Proposal`、`Event`。
 
-字段级改动只有两处，**都是可空的新列**，对既有数据是无损迁移：
-- `sin90_directions.area_id TEXT REFERENCES sin90_areas(id)` —— 可空，未分类的 Direction 仍合法。
-- `sin90_tasks.parent_task_id TEXT REFERENCES sin90_tasks(id)` —— 可空；**约束：不允许自引用成环，且只允许一层**（M0 只查"父任务自己不能有父任务"，两行 SQL，比通用环检测便宜且够用；需要多层时再放开）。
+字段级改动共三处：
+- `sin90_directions.area_id TEXT REFERENCES sin90_areas(id)` —— 可空，未分类的 Direction 仍合法（无损迁移）。
+- `sin90_tasks.parent_task_id TEXT REFERENCES sin90_tasks(id)` —— 可空；**约束：不允许自引用成环，且只允许一层**（M0 只查"父任务自己不能有父任务"，两行 SQL，比通用环检测便宜且够用；需要多层时再放开）（无损迁移）。
+- `sin90_reviews.period TEXT NOT NULL`（T4.1.1，§4.1）—— 必填新列，靠迁移时 `DEFAULT ''` + 回填满足 SQLite 的 `ADD COLUMN NOT NULL` 限制；`UNIQUE(kind, period)` 让 (kind, period) 成为 Review 的实际身份轴，取代原先只能表达"这一周"的 `week_id`（`week_id` 列保留，新代码不再写）。
 
 ### 3.3 `Sin90Op` 的扩展
 
@@ -215,7 +216,8 @@ CreateTask   { title, direction_id?, parent_task_id?, kind?, energy?, est_minute
 | `sin90_events` | `entity` 值域扩 `area` / `routine`；schema 不变 | 值域扩展 |
 | `sin90_outbox`（T3.3.1） | `status` 值域扩 `pending\|done\|failed`（无 CHECK，代码约束）；+ `failure_kind TEXT NULL`、`last_error TEXT NULL`、`attempts INTEGER NOT NULL DEFAULT 0`、`next_attempt_at TEXT NULL` | 加列 |
 | `sin90_routine_fires`（T3.2.2） | `fire_id PK, routine_id FK, scheduled_for, trigger CHECK(tick\|run_now), received_at` —— 按 `fire_id` 去重内核的至少一次 fired 投递 | **新** |
-| 其余 8 张 | 不变 | 旧 |
+| `sin90_reviews`（T4.1.1） | + `period TEXT NOT NULL`（`daily=YYYY-MM-DD` / `weekly=YYYY-Www` / `rhythm=<rhythm_id>`），+ `UNIQUE(kind, period)`（`sin90_reviews_kind_period_uq`）；`week_id` 列保留（旧列不删）但新代码不再写它——`period` 取代它成为 Review 的唯一身份轴。`body_ref` 不在本条范围（T4.2.1）。迁移 `0007_review_period.sql`：本表在此之前从未被任何代码写入过（无 `INSERT INTO sin90_reviews`），所以回填在实际存量库上不可达；仍防御性实现——有 `week_id` 且指向真实 Week 的行回填该周 `iso_week`，其余回填 `'legacy-' || id`（`id` 是主键，不会与唯一约束冲突）。 | 加列 |
+| 其余 7 张 | 不变 | 旧 |
 
 **不做的事**：不重建表、不改现有列类型、不动 `sin90_attention_*` 的水位语义。用户的 `sin90.db` 靠迁移升级，不靠重建（Agent24 §4.3 既有硬约束）。
 
