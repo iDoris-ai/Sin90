@@ -360,13 +360,38 @@ const MAX_RATIONALE_CHARS: usize = 280;
 /// §11.4 公共's "提议形状": `rationale = "<engine>: <理由>"`, control
 /// characters stripped, truncated to 280 chars.
 fn build_rationale(engine: Engine, reason: &str) -> String {
-    let cleaned: String = reason.chars().filter(|c| !c.is_control()).collect();
+    let cleaned: String = reason
+        .chars()
+        .filter(|c| !c.is_control() && !is_cf_format_char(*c))
+        .collect();
     let s = format!("{}: {}", engine.as_str(), cleaned);
     if s.chars().count() > MAX_RATIONALE_CHARS {
         s.chars().take(MAX_RATIONALE_CHARS).collect()
     } else {
         s
     }
+}
+
+/// 2026-09-24 review (round 2, low): a hand-picked subset of Unicode
+/// category Cf ("format") code points worth stripping from AI-produced text
+/// a human will read (`rationale`) — bidi overrides (U+202A-U+202E,
+/// U+2066-U+2069) can make a rationale string DISPLAY differently from its
+/// actual byte content, and zero-width characters (U+200B-U+200F, U+2060-
+/// U+2064, U+FEFF, the Arabic Letter Mark U+061C, soft hyphen U+00AD) can
+/// hide content or split words invisibly. NOT the full Unicode Cf category
+/// (that table is `ai::summarize`'s deliverable, T5.3.1, per design
+/// §11.4.2's `normalize`) — just the characters relevant to a plain-text
+/// rationale string with no markup semantics of its own.
+fn is_cf_format_char(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD              // soft hyphen
+        | 0x061C            // Arabic letter mark
+        | 0x200B..=0x200F   // zero-width space/ZWNJ/ZWJ/LRM/RLM
+        | 0x202A..=0x202E   // LRE/RLE/PDF/LRO/RLO (bidi overrides)
+        | 0x2060..=0x2064   // word joiner and friends
+        | 0x2066..=0x2069   // LRI/RLI/FSI/PDI (bidi isolates)
+        | 0xFEFF // BOM / zero-width no-break space
+    )
 }
 
 // ---------------------------------------------------------------- run driver
@@ -578,6 +603,9 @@ pub const MAX_CLASSIFY_TASK_IDS: usize = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClassifyInputError {
+    /// 2026-09-24 review (round 2, low): `task_ids` was given but empty —
+    /// omit the field entirely to ask for the auto-selected inbox instead.
+    EmptyTaskIds,
     /// More than [`MAX_CLASSIFY_TASK_IDS`] ids were given (§11.4.1: rejected
     /// outright, never truncated).
     TooManyTaskIds,
@@ -604,6 +632,14 @@ pub async fn select_targets<R: AiReadModel>(
             .await
             .map_err(|e| ClassifyInputError::ReadFailed(e.to_string())),
         Some(ids) => {
+            // 2026-09-24 review (round 2, low): an explicit but EMPTY
+            // `task_ids` is a client mistake worth a loud 400, not a silent
+            // "run with zero targets" — `task_ids` omitted entirely (the
+            // `None` arm above) is the correct way to ask for the
+            // auto-selected inbox.
+            if ids.is_empty() {
+                return Err(ClassifyInputError::EmptyTaskIds);
+            }
             if ids.len() > MAX_CLASSIFY_TASK_IDS {
                 return Err(ClassifyInputError::TooManyTaskIds);
             }
@@ -644,10 +680,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::ai::ports::{AiSettings, ModelFailure, ReadError, SettingsRead, SinkError};
-    use crate::core::{
-        DirectionStatus, Energy, ProposalSource, ProposalStatus, TaskKind, TaskStatus,
-    };
+    use crate::ai::ports::{ModelFailure, SinkError};
+    use crate::core::{DirectionStatus, Energy, ProposalSource, ProposalStatus, TaskKind};
     use crate::store::Sin90Store;
 
     // ---- pure logic -----------------------------------------------------
@@ -767,6 +801,22 @@ mod tests {
         assert_eq!(keyed[0].direction_id, "a");
         assert_eq!(keyed[1].key, "d2");
         assert_eq!(keyed[1].area_title.as_deref(), Some("Area B"));
+    }
+
+    /// 2026-09-24 review (round 2, low): `build_rationale` strips both
+    /// plain control characters AND the hand-picked Cf subset (bidi
+    /// overrides, zero-width characters) — a rationale is plain text a
+    /// human reads; neither should survive into it. Mutation target: drop
+    /// the `!is_cf_format_char(*c)` half of the filter and this goes red
+    /// (the zero-width space and RLO survive).
+    #[test]
+    fn build_rationale_strips_control_and_cf_format_chars() {
+        let reason = "matches\u{200B}Work\u{202E}reversed\u{FEFF}";
+        let r = build_rationale(Engine::Local, reason);
+        assert_eq!(r, "local: matchesWorkreversed");
+        assert!(!r.contains('\u{200B}'));
+        assert!(!r.contains('\u{202E}'));
+        assert!(!r.contains('\u{FEFF}'));
     }
 
     #[test]
@@ -911,6 +961,25 @@ mod tests {
     impl ModelPort for PanicModel {
         async fn complete(&self, _req: ModelRequest) -> Result<ModelReply, ModelFailure> {
             panic!("classify: the model must not be called when R1 is decisive")
+        }
+    }
+
+    /// Answers differently by `complexity` — `executive`'s `Model(Executive)`
+    /// step requests `Complexity::Complex`, `local`'s `Model(Local)` step
+    /// requests `Complexity::Simple` (`build_classify_request`'s own
+    /// mapping) — for J16 (`classify_remote_down_local_up`).
+    #[derive(Clone)]
+    struct ByEngine {
+        exec: Result<ModelReply, ModelFailure>,
+        local: Result<ModelReply, ModelFailure>,
+    }
+    impl ModelPort for ByEngine {
+        async fn complete(&self, req: ModelRequest) -> Result<ModelReply, ModelFailure> {
+            if req.complexity == Complexity::Complex {
+                self.exec.clone()
+            } else {
+                self.local.clone()
+            }
         }
     }
 
@@ -1069,6 +1138,104 @@ mod tests {
         )
         .await;
         assert!(matches!(items2[0].result, ItemResult::Proposed(_)));
+    }
+
+    /// J16 (design §11.7's own name for this judgement): with
+    /// `RemoteAllowed` + the executive switch on, `Model(Executive)` runs
+    /// first (`build_classify_request`'s `Complexity::Complex`) — when it
+    /// fails with `no_provider`, the ladder degrades to `Model(Local)`
+    /// (`Complexity::Simple`), which succeeds and produces a proposal whose
+    /// `source` is derived from the SERVED tier (`local`), i.e.
+    /// `local_brain`, not from the fact that `executive` was REQUESTED.
+    /// Positive control: when `local` ALSO fails, the item ends `Nothing`
+    /// (R2 has nothing to match "unrelated task" against) and the `local`
+    /// step's own `ok=0` row still exists (the failure was recorded, not
+    /// swallowed).
+    #[tokio::test]
+    async fn classify_remote_down_local_up() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        store.put_ai_executive_enabled(true).await.unwrap();
+        let _direction = store
+            .create_direction("Work", "2026-Q4", None)
+            .await
+            .unwrap();
+        let task = inbox_task(&store, "Write the Q4 proposal doc").await;
+        let reader = store.ai_reader();
+
+        let model = ByEngine {
+            exec: Err(ModelFailure::Unavailable {
+                retryable: true,
+                cause: crate::ai::ports::UnavailableCause::NoProvider,
+            }),
+            local: Ok(reply(
+                r#"{"choice":"d1","confidence":"high","reason":"fits"}"#,
+            )),
+        };
+        let items = run_classify(
+            "run-remote-down",
+            std::slice::from_ref(&task),
+            ModelAccess::RemoteAllowed,
+            Some(&model),
+            &store,
+            &reader,
+        )
+        .await;
+        let proposal_id = match &items[0].result {
+            ItemResult::Proposed(id) => id.clone(),
+            other => panic!("expected Proposed via local fallback, got {other:?}"),
+        };
+        let stored = store.get_proposal(&proposal_id).await.unwrap();
+        assert_eq!(stored.source, ProposalSource::LocalBrain);
+
+        let rows: Vec<(String, bool, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT engine, ok, error_kind, fallback_from FROM sin90_ai_calls \
+             WHERE run_id = 'run-remote-down'",
+        )
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        assert!(rows
+            .iter()
+            .any(|(engine, ok, kind, _)| engine == "executive"
+                && !ok
+                && kind.as_deref() == Some("unavailable.no_provider")));
+        assert!(rows
+            .iter()
+            .any(|(engine, ok, _, fallback_from)| engine == "local"
+                && *ok
+                && fallback_from.as_deref() == Some("executive")));
+
+        // Positive control: the local engine ALSO fails — no proposal, and
+        // the local step's ok=0 row still exists (not silently dropped).
+        let both_down = ByEngine {
+            exec: Err(ModelFailure::Unavailable {
+                retryable: true,
+                cause: crate::ai::ports::UnavailableCause::NoProvider,
+            }),
+            local: Err(ModelFailure::Timeout),
+        };
+        let task2 = inbox_task(&store, "Totally unrelated errand").await;
+        let items2 = run_classify(
+            "run-remote-down-2",
+            std::slice::from_ref(&task2),
+            ModelAccess::RemoteAllowed,
+            Some(&both_down),
+            &store,
+            &reader,
+        )
+        .await;
+        assert_eq!(items2[0].result, ItemResult::Nothing);
+        let local_row_exists: bool = sqlx::query_scalar(
+            "SELECT count(*) > 0 FROM sin90_ai_calls \
+             WHERE run_id = 'run-remote-down-2' AND engine = 'local' AND ok = 0",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert!(
+            local_row_exists,
+            "local's own failure must still be recorded"
+        );
     }
 
     /// An `AiSink` that races a conflicting classification into the store
@@ -1305,6 +1472,22 @@ mod tests {
         }
         let targets = select_targets(&reader, Some(&ids)).await.unwrap();
         assert_eq!(targets.len(), 20);
+    }
+
+    /// 2026-09-24 review (round 2, low): an explicit but EMPTY `task_ids`
+    /// is a 400, not a silent "run with zero targets" — omitting the field
+    /// entirely (`None`) is the correct way to ask for auto-selection.
+    /// Mutation target: remove the `ids.is_empty()` check and this goes
+    /// from `Err` to `Ok(vec![])`.
+    #[tokio::test]
+    async fn classify_empty_task_ids_rejected() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let reader = store.ai_reader();
+        let empty: Vec<TaskId> = Vec::new();
+        assert_eq!(
+            select_targets(&reader, Some(&empty)).await,
+            Err(ClassifyInputError::EmptyTaskIds)
+        );
     }
 
     /// M2 (2026-09-24 review): a repeated id in `task_ids` is rejected
@@ -1617,16 +1800,5 @@ mod tests {
         )
         .await;
         assert!(matches!(items[0].result, ItemResult::Proposed(_)));
-    }
-
-    #[test]
-    fn _unused_import_guard() {
-        // Referenced only to keep `TaskStatus`/`ReadError`/`SettingsRead`
-        // imports honest if a future edit trims the tests above; cheap and
-        // self-documenting.
-        let _: Option<TaskStatus> = None;
-        let _: Option<ReadError> = None;
-        fn _needs_settings_read<T: SettingsRead>() {}
-        let _ = AiSettings::default();
     }
 }
