@@ -65,15 +65,14 @@ async fn run_standalone(
         "sin90: --standalone mode — development/test only, this is NOT how a real \
          install runs (see README). No Agent24, events are dropped."
     );
+    // Without --data-dir there is nowhere to persist keys, so they must come
+    // from SIN90_HUMAN_KEY/SIN90_AUTOMATION_KEY (`ActorKeys::load` says so).
+    let keys = ActorKeys::load(data_dir.as_deref())?;
     let store = match data_dir {
         Some(dir) => Sin90Store::open(&dir.join("sin90.db")).await?,
         None => Sin90Store::open_memory().await?,
     };
-    let state = Sin90State::new(
-        store,
-        Arc::new(NullEventSink),
-        ActorKeys::from_env_or_generate(),
-    );
+    let state = Sin90State::new(store, Arc::new(NullEventSink), keys);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     tracing::info!(port, "sin90: standalone listening");
     axum::serve(listener, router(state)).await?;
@@ -82,6 +81,9 @@ async fn run_standalone(
 
 async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
     let env = SpawnEnv::from_env()?;
+    // Before the handshake: a bad key file must stop the module outright, not
+    // leave a mounted module whose every write route answers 403.
+    let keys = ActorKeys::load(Some(&env.data_dir))?;
     let (channel, offer) =
         CallbackChannel::handshake(&env.callback_sock, "sin90", MANIFEST, &env.handshake_token)
             .await?;
@@ -98,7 +100,7 @@ async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("sin90: events not offered by kernel; running with events dropped");
         Arc::new(NullEventSink)
     };
-    let state = Sin90State::new(store, sink, ActorKeys::from_env_or_generate());
+    let state = Sin90State::new(store, sink, keys);
 
     let listener = listener_from_fd(env.listen_fd)?;
     tracing::info!("sin90: accepting on kernel-bound listener");

@@ -30,8 +30,11 @@ impl Server {
                 "--data-dir",
                 data_dir.to_str().unwrap(),
             ])
-            .env("SIN90_HUMAN_KEY", "blackbox-human-key")
-            .env("SIN90_AUTOMATION_KEY", "blackbox-automation-key")
+            .env("SIN90_HUMAN_KEY", "blackbox-human-key-0123456789abcdef")
+            .env(
+                "SIN90_AUTOMATION_KEY",
+                "blackbox-automation-key-0123456789abcdef",
+            )
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -89,7 +92,7 @@ async fn a_real_process_serves_http_and_a_second_process_sees_what_the_first_wro
 
         let resp = client
             .post(format!("{}/areas", server.base()))
-            .header("x-sin90-actor-key", "blackbox-human-key")
+            .header("x-sin90-actor-key", "blackbox-human-key-0123456789abcdef")
             .json(&serde_json::json!({"title": "Work"}))
             .send()
             .await
