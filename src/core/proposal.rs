@@ -527,10 +527,15 @@ fn validate_op(op: &Sin90Op, w: &mut Working<'_>) -> Result<(), ProposalError> {
             // A3: the task must still be in the inbox (no Direction yet) —
             // this is what makes `[Assign(t,d1), Assign(t,d2)]` reject the
             // second op (the overlay set by the first op is visible here).
-            if current_direction.is_some() {
+            // 2026-09-24 review (round 2, M2): `direction_id` here must be
+            // the task's CURRENT (already-assigned) Direction, not the
+            // TARGET one this op was trying to assign — the error is "you
+            // can't assign, it's already assigned to X", and X is
+            // `current_direction`, not `direction_id`.
+            if let Some(existing_direction_id) = current_direction {
                 return Err(ProposalError::NotInInbox {
                     task_id: task_id.clone(),
-                    direction_id: direction_id.clone(),
+                    direction_id: existing_direction_id,
                 });
             }
             // A4: the target Direction must exist.
@@ -1385,7 +1390,10 @@ mod tests {
             validate(&p, &ctx),
             Err(ProposalError::NotInInbox {
                 task_id: "t1".into(),
-                direction_id: "d1".into()
+                // 2026-09-24 review (round 2, M2): the error must name the
+                // task's CURRENT (already-assigned) Direction — "d-existing"
+                // — not the TARGET one ("d1") this op was trying to assign.
+                direction_id: "d-existing".into()
             })
         );
     }
@@ -1455,7 +1463,11 @@ mod tests {
             validate(&p, &ctx),
             Err(ProposalError::NotInInbox {
                 task_id: "t1".into(),
-                direction_id: "d2".into()
+                // 2026-09-24 review (round 2, M2): the SECOND op's A3 check
+                // sees the batch overlay set by the FIRST op — the task is
+                // now "already assigned to d1" (not "d2", the second op's
+                // own target).
+                direction_id: "d1".into()
             })
         );
     }

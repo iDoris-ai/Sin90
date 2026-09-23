@@ -3322,6 +3322,19 @@ pub(crate) async fn apply_op(
             // start of this transaction; this UPDATE re-checks it against the
             // CURRENT row, under the same write lock, closing any gap between
             // snapshot and apply.
+            //
+            // 2026-09-24 review (round 2, low): this branch is DEFENSE IN
+            // DEPTH, not something a unit test can currently force to fire
+            // independently of A3 — every caller of `apply_op` (both
+            // `AiSink::submit`'s dry run and `Sin90Store::apply_proposal`)
+            // calls `build_snapshot` + `validate` immediately before, in the
+            // SAME transaction, so by construction the snapshot `validate`
+            // saw is never stale by the time this UPDATE runs; there is no
+            // window today where A3 passes but this `affected != 1`. It
+            // exists so a FUTURE caller that reuses `apply_op` without that
+            // same validate-then-apply discipline (e.g. a batch/retry path
+            // that re-applies an already-decided op) fails safely instead of
+            // silently overwriting a task's Direction a second time.
             let affected = sqlx::query(
                 "UPDATE sin90_tasks SET direction_id = ?, updated_at = ?
                  WHERE id = ? AND direction_id IS NULL",
@@ -3372,7 +3385,13 @@ pub(crate) async fn apply_op(
             // human-accept path's `apply_proposal` re-runs `build_snapshot` +
             // `validate` immediately before calling `apply_op`, so D6 is
             // freshly re-checked either way, not stale by the time it gets
-            // here).
+            // here). 2026-09-24 review (round 2, low): like
+            // `AssignTaskDirection`'s CAS above, this `status = 'draft'`
+            // check is DEFENSE IN DEPTH — no unit test today can force
+            // `affected != 1` independently of D5, since every caller
+            // validates in the same transaction immediately before applying.
+            // It guards a future caller that reuses `apply_op` without that
+            // discipline.
             let affected = sqlx::query(
                 "UPDATE sin90_reviews SET body = ?, updated_at = ? WHERE id = ? AND status = 'draft'",
             )

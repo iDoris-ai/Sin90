@@ -28,8 +28,8 @@ use crate::ai::ports::{
 };
 use crate::ai::source_for;
 use crate::core::{
-    task_is_terminal, validate, DirectionId, DirectionStatus, ProposalStatus, Review, Sin90Op,
-    Sin90Proposal, Task, TaskStatus, WeekId,
+    direction_is_terminal, task_is_terminal, validate, DirectionId, DirectionStatus,
+    ProposalStatus, Review, Sin90Op, Sin90Proposal, Task, TaskStatus, WeekId,
 };
 use crate::store::repo::{
     append_event, apply_op, build_snapshot, from_wire, row_to_review, row_to_task, to_wire,
@@ -72,6 +72,34 @@ fn terminal_task_status_wires() -> Vec<String> {
         .copied()
         .filter(|&s| task_is_terminal(s))
         .map(|s| to_wire(&s).expect("TaskStatus always serializes"))
+        .collect()
+}
+
+/// Every `DirectionStatus` variant — same reflection-substitute as
+/// [`ALL_TASK_STATUSES`], for [`terminal_direction_status_wires`]
+/// (2026-09-24 review round 2, #4).
+const ALL_DIRECTION_STATUSES: [DirectionStatus; 5] = [
+    DirectionStatus::Draft,
+    DirectionStatus::Active,
+    DirectionStatus::Paused,
+    DirectionStatus::Achieved,
+    DirectionStatus::Abandoned,
+];
+
+/// The wire values of every TERMINAL `DirectionStatus`, derived from
+/// [`direction_is_terminal`] — `direction_candidates` and `title_history`
+/// both exclude terminal Directions and must agree on what "terminal" means;
+/// deriving it here (instead of two independent `NOT IN ('achieved',
+/// 'abandoned')` literals) means a new terminal status added to
+/// `core::transitions::direction_is_terminal` without updating
+/// [`ALL_DIRECTION_STATUSES`] fails loudly (this list stops being
+/// exhaustive) rather than silently leaving one of the two queries stale.
+fn terminal_direction_status_wires() -> Vec<String> {
+    ALL_DIRECTION_STATUSES
+        .iter()
+        .copied()
+        .filter(|&s| direction_is_terminal(s))
+        .map(|s| to_wire(&s).expect("DirectionStatus always serializes"))
         .collect()
 }
 
@@ -157,19 +185,29 @@ impl AiReadModel for AiReader {
         row.map(row_to_task).transpose().map_err(rerr)
     }
 
+    /// 2026-09-24 review (round 2, #4): the exclusion list is DERIVED from
+    /// [`direction_is_terminal`] (via [`terminal_direction_status_wires`]),
+    /// the same convention [`AiReadModel::inbox`]'s H1 fix established for
+    /// task statuses — not a hand-maintained `NOT IN ('achieved',
+    /// 'abandoned')` literal duplicated independently in this function and
+    /// in `title_history` below.
     async fn direction_candidates(&self, limit: u32) -> Result<Vec<DirectionCandidate>, ReadError> {
-        let rows = sqlx::query(
+        let terminal = terminal_direction_status_wires();
+        let placeholders = terminal.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!(
             "SELECT d.id AS id, d.title AS title, d.status AS status, a.title AS area_title
              FROM sin90_directions d
              LEFT JOIN sin90_areas a ON a.id = d.area_id
-             WHERE d.status NOT IN ('achieved', 'abandoned')
+             WHERE d.status NOT IN ({placeholders})
              ORDER BY d.updated_at DESC
-             LIMIT ?",
-        )
-        .bind(limit)
-        .fetch_all(&self.0)
-        .await
-        .map_err(rerr)?;
+             LIMIT ?"
+        );
+        let mut q = sqlx::query(&sql);
+        for t in &terminal {
+            q = q.bind(t);
+        }
+        q = q.bind(limit);
+        let rows = q.fetch_all(&self.0).await.map_err(rerr)?;
         rows.into_iter()
             .map(|r| {
                 Ok(DirectionCandidate {
@@ -184,30 +222,34 @@ impl AiReadModel for AiReader {
     }
 
     /// R1's history lookup (§11.4.1, T5.2.1): every ALREADY-classified task
-    /// whose Direction is still non-terminal, normalized through the real
-    /// `normalize_title` (`crate::ai::classify`, not a local approximation —
-    /// see this file's module doc's history) and compared against `normalized`
-    /// **T5.2.1a placeholder** (this branch has no `ai::classify` yet — that
-    /// lands in T5.2.1b): the frozen `normalize_title` algorithm (§11.4.1 R1)
-    /// is `ai::classify`'s deliverable. Until then this compares each
-    /// classified task's title, folded through the SAME coarse
-    /// whitespace-collapse-and-lowercase here, against `normalized` taken
-    /// as-is — correct as long as the caller normalizes its query the same
-    /// way this folds candidates. The non-terminal-Direction filter (the
-    /// `JOIN` + `status NOT IN (...)`) is real already: "is this Direction
-    /// still open" is a plain relational check that belongs here regardless
-    /// of which normalization algorithm is doing the string comparison.
+    /// whose Direction is still non-terminal, normalized here through the
+    /// **T5.2.1a placeholder** `coarse_normalize` (this branch has no
+    /// `ai::classify` yet — the frozen `normalize_title` algorithm, §11.4.1
+    /// R1, is `ai::classify`'s deliverable, T5.2.1b) and compared against
+    /// `normalized` taken as-is — correct as long as the caller normalizes
+    /// its query the same way this folds candidates. The non-terminal-
+    /// Direction filter (the `JOIN` + `status NOT IN (...)`, exclusion set
+    /// shared with `direction_candidates` above via
+    /// [`terminal_direction_status_wires`]) is real already: "is this
+    /// Direction still open" is a plain relational check that belongs here
+    /// regardless of which normalization algorithm is doing the string
+    /// comparison. See `r1_history_ignores_abandoned_direction` for the
+    /// regression this filter guards against.
     async fn title_history(&self, normalized: &str) -> Result<Vec<DirectionId>, ReadError> {
-        let rows = sqlx::query(
+        let terminal = terminal_direction_status_wires();
+        let placeholders = terminal.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!(
             "SELECT t.title AS title, t.direction_id AS direction_id
              FROM sin90_tasks t
              JOIN sin90_directions d ON d.id = t.direction_id
              WHERE t.direction_id IS NOT NULL
-               AND d.status NOT IN ('achieved', 'abandoned')",
-        )
-        .fetch_all(&self.0)
-        .await
-        .map_err(rerr)?;
+               AND d.status NOT IN ({placeholders})"
+        );
+        let mut q = sqlx::query(&sql);
+        for t in &terminal {
+            q = q.bind(t);
+        }
+        let rows = q.fetch_all(&self.0).await.map_err(rerr)?;
         let mut out = Vec::new();
         for r in rows {
             let title: String = r.get("title");
@@ -564,7 +606,7 @@ mod tests {
     use sqlx::sqlite::SqlitePool;
 
     use super::*;
-    use crate::core::NewTask;
+    use crate::core::{Energy, NewTask, TaskKind};
 
     fn rec(id: &str, run_id: &str, ok: bool, error_kind: Option<&'static str>) -> AiCallRecord {
         AiCallRecord {
@@ -1191,5 +1233,54 @@ mod tests {
         // task is unusable as an explicit classify target; the new one isn't.
         assert!(reader.inbox_task(&t1).await.unwrap().is_none());
         assert!(reader.inbox_task(&child).await.unwrap().is_some());
+    }
+
+    /// 2026-09-24 review (round 2, #4): `title_history` must exclude a
+    /// classified task whose Direction has since been abandoned — feeding
+    /// R1 (`ai::classify::r1_reflex`, T5.2.1b) an empty history for that
+    /// title, which R1's own contract reads as "undecided" (able to degrade
+    /// to the model or fall back to R2), not as "decisively points nowhere".
+    /// Mutation target: delete the `terminal_direction_status_wires()`
+    /// filtering (revert to no `WHERE d.status NOT IN (...)` clause at all)
+    /// and this goes red — the abandoned Direction's id would come back.
+    #[tokio::test]
+    async fn r1_history_ignores_abandoned_direction() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let direction = store
+            .create_direction("Side quest", "2026-Q4", None)
+            .await
+            .unwrap();
+        store
+            .create_task(
+                "Write the report",
+                Some(&direction.id),
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+        let reader = store.ai_reader();
+
+        // Positive control: while the Direction is still open, history sees it.
+        let before = reader.title_history("write the report").await.unwrap();
+        assert_eq!(before, vec![direction.id.clone()]);
+
+        // Abandon it (no direct-write route/Op exists for this in this
+        // branch — see `abandon_direction`'s doc for why raw SQL is the
+        // deliberate choice here, same convention `ai::classify`'s own
+        // fixtures use for this exact gap).
+        sqlx::query("UPDATE sin90_directions SET status = 'abandoned' WHERE id = ?")
+            .bind(&direction.id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let after = reader.title_history("write the report").await.unwrap();
+        assert!(
+            after.is_empty(),
+            "a classified-but-now-abandoned Direction must not show up in R1's history: {after:?}"
+        );
     }
 }
