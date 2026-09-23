@@ -3567,6 +3567,79 @@ mod weekly_draft {
     }
 }
 
+// ---- T5.1.1: GET|PUT /settings/ai (J10b) ------------------------------------
+
+mod ai_settings {
+    use super::*;
+
+    #[tokio::test]
+    async fn get_defaults_to_false_when_no_row_exists() {
+        let (app, _sink) = test_app().await;
+        let resp = app.oneshot(get_req("/settings/ai")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["executive_enabled"], Value::Bool(false));
+    }
+
+    #[tokio::test]
+    async fn put_requires_human_key_and_mirrors_setting_changed() {
+        let (app, sink) = test_app().await;
+
+        // Automation key -> 403, no event.
+        let resp = app
+            .clone()
+            .oneshot(automation_req(
+                "PUT",
+                "/settings/ai",
+                json!({"executive_enabled": true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(sink.0.lock().unwrap().is_empty());
+
+        // Positive control: human key -> 200, exactly one `setting.changed`.
+        let resp = app
+            .clone()
+            .oneshot(human_req(
+                "PUT",
+                "/settings/ai",
+                json!({"executive_enabled": true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["executive_enabled"], Value::Bool(true));
+        {
+            let events = sink.0.lock().unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].0, "setting.changed");
+            assert_eq!(events[0].1["key"], "ai.executive_enabled");
+            assert_eq!(events[0].1["value"], Value::Bool(true));
+        }
+
+        // GET now reflects the write.
+        let resp = app.oneshot(get_req("/settings/ai")).await.unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["executive_enabled"], Value::Bool(true));
+    }
+
+    #[tokio::test]
+    async fn put_rejects_unknown_field() {
+        let (app, _sink) = test_app().await;
+        let resp = app
+            .oneshot(human_req(
+                "PUT",
+                "/settings/ai",
+                json!({"executive_enabled": true, "bogus": 1}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
 // ---- T3.2.2: POST /_a24/scheduler/fired -------------------------------------
 
 mod fired {
