@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 
 use crate::core::{
-    check_area_transition, check_rhythm_transition, check_schedule_block_transition,
+    check_alloc, check_area_transition, check_rhythm_transition, check_schedule_block_transition,
     check_task_transition, check_week_transition, now_iso8601, ulid, validate, week_is_open, Alloc,
     Area, AreaStatus, Direction, DirectionStatus, Energy, ProposalSource, ProposalStatus, Rhythm,
     RhythmStatus, ScheduleBlock, ScheduleBlockStatus, Sin90Op, Sin90Proposal, Task, TaskKind,
@@ -388,60 +388,35 @@ impl Sin90Store {
 
     /// `POST /rhythms` (spec.md "Rhythm 路由", T3.4.1) — direct write, human
     /// gate: creating a Rhythm is a planning-ritual action, same convention as
-    /// `create_area`/`create_direction`/`create_week`. Structural checks (pct
-    /// range, duplicate direction, sum <= 100) run BEFORE the transaction so a
-    /// bad request never takes the write lock; direction existence is checked
-    /// INSIDE the transaction (under the write lock, consistent with every
-    /// other direct-write existence check here) and rejected as `Invalid`
-    /// (400), not left to fall through to an FK violation (which would map to
-    /// 404 per `http::map_err` and diverge from every other validation error
-    /// this route raises).
+    /// `create_area`/`create_direction`/`create_week`.
+    ///
+    /// Structural checks (non-empty, pct range, duplicate direction, sum <=
+    /// 100) are `core::check_alloc` — the SAME function `AdjustRhythm`'s pure
+    /// `validate` calls (Opus 2026-09-23 review H1: the two paths used to
+    /// each carry their own, divergent copy) — run BEFORE the transaction so
+    /// a structurally bad request never takes the write lock, and mapped to
+    /// `Invalid` (400) here instead of the `Proposal` variant `?` would give
+    /// (422, the AdjustRhythm path's code — direct writes use 400 for a
+    /// validation failure everywhere else in this file).
+    ///
+    /// Direction existence is checked INSIDE the transaction by
+    /// `require_directions_exist` — again the SAME helper `AdjustRhythm`'s
+    /// apply arm calls — and reported as `NotFound` (404), consistent with
+    /// `create_task`/`create_block`'s "referenced entity does not exist" 404
+    /// convention (Opus 2026-09-23 review M2; this used to be a 400 here,
+    /// diverging from that convention).
     ///
     /// Adjusting an existing Rhythm does NOT go through this store method —
     /// only `Sin90Op::AdjustRhythm` via `POST /proposals` + human accept does
     /// (design §7.1's proposal gate; T3.4.1 adds no new Op and no direct
     /// adjust route).
     pub async fn create_rhythm(&self, allocations: &[Alloc]) -> Result<Rhythm> {
-        let mut seen = std::collections::HashSet::new();
-        let mut total: u32 = 0;
-        for a in allocations {
-            if !(1..=100).contains(&a.pct) {
-                return Err(StoreError::Invalid(format!(
-                    "pct must be an integer 1..=100, got {} for direction {}",
-                    a.pct, a.direction_id
-                )));
-            }
-            if !seen.insert(a.direction_id.as_str()) {
-                return Err(StoreError::Invalid(format!(
-                    "direction {} referenced more than once",
-                    a.direction_id
-                )));
-            }
-            total = total.saturating_add(a.pct);
-        }
-        if total > 100 {
-            return Err(StoreError::Invalid(format!(
-                "allocation percentages sum to {total} (must be <= 100)"
-            )));
-        }
+        check_alloc(allocations).map_err(|e| StoreError::Invalid(e.to_string()))?;
 
         let id = ulid();
         let now = now_iso8601();
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
-        for a in allocations {
-            let exists: i64 =
-                sqlx::query("SELECT COUNT(*) AS n FROM sin90_directions WHERE id = ?")
-                    .bind(&a.direction_id)
-                    .fetch_one(&mut *tx)
-                    .await?
-                    .get("n");
-            if exists == 0 {
-                return Err(StoreError::Invalid(format!(
-                    "unknown direction: {}",
-                    a.direction_id
-                )));
-            }
-        }
+        require_directions_exist(&mut tx, allocations).await?;
         sqlx::query(
             "INSERT INTO sin90_rhythms (id, status, allocations, created_at, updated_at)
              VALUES (?, 'active', ?, ?, ?)",
@@ -1516,6 +1491,31 @@ async fn load_rhythm(tx: &mut Tx<'_>, id: &str, snap: &mut DbSnapshot) -> Result
     Ok(())
 }
 
+/// Shared by `Sin90Store::create_rhythm` (direct write) and `AdjustRhythm`'s
+/// apply arm below (Opus 2026-09-23 review H1): every `direction_id` in
+/// `allocations` must reference a live `sin90_directions` row, checked under
+/// the SAME `BEGIN IMMEDIATE` write lock as the insert/update that follows —
+/// not a pure/`ValidationCtx` check (module doc's scope note: existence
+/// against live rows is a relational check, the store's job). A missing
+/// direction is `NotFound` (404), the same "referenced entity does not
+/// exist" convention `create_task`/`create_block` already use.
+async fn require_directions_exist(tx: &mut Tx<'_>, allocations: &[Alloc]) -> Result<()> {
+    for a in allocations {
+        let exists: i64 = sqlx::query("SELECT COUNT(*) AS n FROM sin90_directions WHERE id = ?")
+            .bind(&a.direction_id)
+            .fetch_one(&mut **tx)
+            .await?
+            .get("n");
+        if exists == 0 {
+            return Err(StoreError::NotFound(format!(
+                "direction {}",
+                a.direction_id
+            )));
+        }
+    }
+    Ok(())
+}
+
 async fn apply_op(tx: &mut Tx<'_>, op: &Sin90Op, event_ids: &mut Vec<String>) -> Result<()> {
     let now = now_iso8601();
     match op {
@@ -1711,6 +1711,10 @@ async fn apply_op(tx: &mut Tx<'_>, op: &Sin90Op, event_ids: &mut Vec<String>) ->
             rhythm_id,
             new_alloc,
         } => {
+            // Opus 2026-09-23 review H1: `new_alloc`'s directions must exist,
+            // same as `create_rhythm`'s — checked under this SAME write lock,
+            // via the SAME helper, so the two paths cannot drift apart again.
+            require_directions_exist(tx, new_alloc).await?;
             let from = read_rhythm_status(tx, rhythm_id).await?;
             check_rhythm_transition(from, RhythmStatus::Adjusted)?;
             sqlx::query(

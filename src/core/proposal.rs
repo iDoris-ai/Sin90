@@ -157,6 +157,15 @@ pub enum ProposalError {
     DuplicateRef { op: &'static str, id: String },
     #[error("allocation percentages sum to {sum_pct} (must be <= 100)")]
     InvalidAlloc { sum_pct: u32 },
+    /// Opus 2026-09-23 review (H1/M1): the structural rhythm-allocation
+    /// checks — non-empty, every `pct` an integer in 1..=100, sum <= 100, no
+    /// duplicate direction — are now the ONE `check_alloc` both
+    /// `AdjustRhythm`'s pure `validate` and `Sin90Store::create_rhythm`'s
+    /// direct write call, so the two paths cannot silently drift apart.
+    #[error("allocations must not be empty")]
+    EmptyAllocations,
+    #[error("pct must be an integer 1..=100, got {pct} for direction {direction_id}")]
+    PctOutOfRange { direction_id: DirectionId, pct: u32 },
     #[error("{field} must not be blank")]
     BlankField { field: &'static str },
     #[error("task {parent_id} already has a parent; a task may only be nested one level deep")]
@@ -353,18 +362,37 @@ fn reject_dupes<'a>(
     Ok(())
 }
 
-fn check_alloc(alloc: &[Alloc]) -> Result<(), ProposalError> {
+/// The ONE structural check for a Rhythm's allocation list (Opus 2026-09-23
+/// review H1): non-empty, every `pct` an integer in 1..=100, no duplicate
+/// direction, sum <= 100. Shared by `AdjustRhythm`'s `validate_op` arm below
+/// AND `Sin90Store::create_rhythm`'s direct write — before this fix the two
+/// paths each had their own (divergent, incomplete) copy. Existence of the
+/// referenced directions is NOT checked here — same scope boundary as the
+/// rest of `ValidationCtx` (module doc): that's a relational check against
+/// live rows, done under the write lock by `require_directions_exist` in
+/// `store::repo`, identically for both paths.
+pub fn check_alloc(alloc: &[Alloc]) -> Result<(), ProposalError> {
+    if alloc.is_empty() {
+        return Err(ProposalError::EmptyAllocations);
+    }
     let mut seen = HashSet::new();
+    let mut sum: u32 = 0;
     for a in alloc {
+        if !(1..=100).contains(&a.pct) {
+            return Err(ProposalError::PctOutOfRange {
+                direction_id: a.direction_id.clone(),
+                pct: a.pct,
+            });
+        }
         if !seen.insert(a.direction_id.as_str()) {
             return Err(ProposalError::DuplicateRef {
                 op: "adjust_rhythm",
                 id: a.direction_id.clone(),
             });
         }
+        // Saturating so a huge value can't wrap; > 100 is rejected below.
+        sum = sum.saturating_add(a.pct);
     }
-    // Saturating so a huge value can't wrap; > 100 is rejected anyway.
-    let sum = alloc.iter().fold(0u32, |acc, a| acc.saturating_add(a.pct));
     if sum > 100 {
         Err(ProposalError::InvalidAlloc { sum_pct: sum })
     } else {
@@ -843,18 +871,30 @@ mod tests {
         }]);
         assert!(validate(&good, &ctx).is_ok());
 
+        // Each individual pct is within 1..=100 (so this pins the SUM check,
+        // not `PctOutOfRange` below — that's a separate, deliberately
+        // distinguished failure mode since Opus 2026-09-23 review H1).
         let over = proposal(vec![Sin90Op::AdjustRhythm {
             rhythm_id: "r_live".into(),
-            new_alloc: vec![Alloc {
-                direction_id: "d1".into(),
-                pct: 101,
-            }],
+            new_alloc: vec![
+                Alloc {
+                    direction_id: "d1".into(),
+                    pct: 60,
+                },
+                Alloc {
+                    direction_id: "d2".into(),
+                    pct: 50,
+                },
+            ],
         }]);
         assert_eq!(
             validate(&over, &ctx),
-            Err(ProposalError::InvalidAlloc { sum_pct: 101 })
+            Err(ProposalError::InvalidAlloc { sum_pct: 110 })
         );
 
+        // Retired check fires before `check_alloc` even runs (validate_op's
+        // AdjustRhythm arm order) — so an empty `new_alloc` on a retired
+        // rhythm still reports RhythmRetired, not EmptyAllocations.
         let dead = proposal(vec![Sin90Op::AdjustRhythm {
             rhythm_id: "r_dead".into(),
             new_alloc: vec![],
@@ -863,6 +903,66 @@ mod tests {
             validate(&dead, &ctx),
             Err(ProposalError::RhythmRetired { .. })
         ));
+    }
+
+    /// Opus 2026-09-23 review (H1/M1): `check_alloc` is now the ONE
+    /// structural gate for both `AdjustRhythm` and direct `create_rhythm` —
+    /// pin its two new checks (empty list, per-item pct range) at the pure
+    /// layer, on a LIVE (non-retired) rhythm so `check_alloc` is actually
+    /// reached.
+    #[test]
+    fn adjust_rhythm_empty_alloc_rejected() {
+        let mut ctx = MockCtx::default();
+        ctx.rhythms_retired.insert("r".into(), false);
+        let p = proposal(vec![Sin90Op::AdjustRhythm {
+            rhythm_id: "r".into(),
+            new_alloc: vec![],
+        }]);
+        assert_eq!(validate(&p, &ctx), Err(ProposalError::EmptyAllocations));
+
+        // Positive control: a single legal allocation passes.
+        let ok = proposal(vec![Sin90Op::AdjustRhythm {
+            rhythm_id: "r".into(),
+            new_alloc: vec![Alloc {
+                direction_id: "d1".into(),
+                pct: 1,
+            }],
+        }]);
+        assert!(validate(&ok, &ctx).is_ok());
+    }
+
+    #[test]
+    fn adjust_rhythm_pct_out_of_range_rejected() {
+        let mut ctx = MockCtx::default();
+        ctx.rhythms_retired.insert("r".into(), false);
+        for bad_pct in [0u32, 101] {
+            let p = proposal(vec![Sin90Op::AdjustRhythm {
+                rhythm_id: "r".into(),
+                new_alloc: vec![Alloc {
+                    direction_id: "d1".into(),
+                    pct: bad_pct,
+                }],
+            }]);
+            assert_eq!(
+                validate(&p, &ctx),
+                Err(ProposalError::PctOutOfRange {
+                    direction_id: "d1".into(),
+                    pct: bad_pct,
+                }),
+                "pct={bad_pct}"
+            );
+        }
+        // Positive controls: the range's own endpoints, 1 and 100, both pass.
+        for good_pct in [1u32, 100] {
+            let p = proposal(vec![Sin90Op::AdjustRhythm {
+                rhythm_id: "r".into(),
+                new_alloc: vec![Alloc {
+                    direction_id: "d1".into(),
+                    pct: good_pct,
+                }],
+            }]);
+            assert!(validate(&p, &ctx).is_ok(), "pct={good_pct}");
+        }
     }
 
     #[test]

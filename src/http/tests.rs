@@ -1650,273 +1650,702 @@ async fn carry_over_keeps_kind_energy_estimate_and_project() {
 // stays behind the existing proposal gate (AdjustRhythm via POST /proposals +
 // human accept). No new Op, no direct-write adjust route (spec.md "Rhythm
 // 路由", tasks.md T3.4.1).
+//
+// Opus 2026-09-23 review (H2): everything below lives in `mod rhythm` so
+// `cargo test --lib http::tests::rhythm -- --list` matches every test here;
+// individual names drop the now-redundant `rhythm_` prefix the module
+// already provides.
 // ============================================================================
 
-/// Shared setup: two Directions to allocate a Rhythm across.
-async fn two_directions(app: &axum::Router) -> (String, String) {
-    let d1 = body_json(
-        app.clone()
-            .oneshot(human_req(
-                "POST",
-                "/directions",
-                json!({"title": "d1", "target_window": "2026-Q4"}),
-            ))
-            .await
-            .unwrap(),
-    )
-    .await;
-    let d2 = body_json(
-        app.clone()
-            .oneshot(human_req(
-                "POST",
-                "/directions",
-                json!({"title": "d2", "target_window": "2026-Q4"}),
-            ))
-            .await
-            .unwrap(),
-    )
-    .await;
-    (
-        d1["id"].as_str().unwrap().to_string(),
-        d2["id"].as_str().unwrap().to_string(),
-    )
-}
+mod rhythm {
+    use super::*;
 
-/// Full path: create -> submit AdjustRhythm -> human accept -> GET shows
-/// `adjusted` with the new allocations. This is the T3.4.1 acceptance line
-/// itself: adjustment only ever lands through the proposal gate.
-#[tokio::test]
-async fn rhythm_created_then_adjusted_via_proposal_and_accept() {
-    let (app, _sink) = test_app().await;
-    let (d1, d2) = two_directions(&app).await;
+    /// Shared setup: two Directions to allocate a Rhythm across.
+    async fn two_directions(app: &axum::Router) -> (String, String) {
+        let d1 = body_json(
+            app.clone()
+                .oneshot(human_req(
+                    "POST",
+                    "/directions",
+                    json!({"title": "d1", "target_window": "2026-Q4"}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let d2 = body_json(
+            app.clone()
+                .oneshot(human_req(
+                    "POST",
+                    "/directions",
+                    json!({"title": "d2", "target_window": "2026-Q4"}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        (
+            d1["id"].as_str().unwrap().to_string(),
+            d2["id"].as_str().unwrap().to_string(),
+        )
+    }
 
-    let created = body_json(
-        app.clone()
+    /// Full path: create -> submit AdjustRhythm -> human accept -> GET shows
+    /// `adjusted` with the new allocations. This is the T3.4.1 acceptance line
+    /// itself: adjustment only ever lands through the proposal gate.
+    #[tokio::test]
+    async fn created_then_adjusted_via_proposal_and_accept() {
+        let (app, _sink) = test_app().await;
+        let (d1, d2) = two_directions(&app).await;
+
+        let created = body_json(
+            app.clone()
+                .oneshot(human_req(
+                    "POST",
+                    "/rhythms",
+                    json!({"allocations": [{"direction_id": d1, "pct": 60}]}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(created["status"], "active");
+        let rhythm_id = created["id"].as_str().unwrap().to_string();
+
+        let submit = app
+            .clone()
+            .oneshot(automation_proposal(json!({
+                "id": "p-adjust", "status": "pending", "source": "local_brain",
+                "ops": [{"op": "adjust_rhythm", "rhythm_id": rhythm_id,
+                         "new_alloc": [{"direction_id": d1, "pct": 30}, {"direction_id": d2, "pct": 40}]}],
+                "rationale": null
+            })))
+            .await
+            .unwrap();
+        assert_eq!(submit.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            app.clone()
+                .oneshot(accept_req("p-adjust"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        let fetched = body_json(
+            app.oneshot(get_req(&format!("/rhythms/{rhythm_id}")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(fetched["status"], "adjusted");
+        let allocs = fetched["allocations"].as_array().unwrap();
+        assert_eq!(allocs.len(), 2);
+        assert!(allocs
+            .iter()
+            .any(|a| a["direction_id"] == d1 && a["pct"] == 30));
+        assert!(allocs
+            .iter()
+            .any(|a| a["direction_id"] == d2 && a["pct"] == 40));
+    }
+
+    /// The direct-write gate itself: automation may not create a Rhythm, only
+    /// a human key may (positive control alongside the negative).
+    #[tokio::test]
+    async fn direct_create_requires_human_key() {
+        let (app, _sink) = test_app().await;
+        let (d1, _d2) = two_directions(&app).await;
+        let body = json!({"allocations": [{"direction_id": d1, "pct": 50}]});
+
+        let resp = app
+            .clone()
+            .oneshot(automation_req("POST", "/rhythms", body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "automation key must not be able to POST /rhythms directly"
+        );
+
+        // Positive control: the human key succeeds with the same body.
+        let resp = app
+            .oneshot(human_req("POST", "/rhythms", body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    /// The automation key must not be able to accept its own AdjustRhythm
+    /// proposal either — same boundary as every other proposal kind
+    /// (`automation_can_submit_but_not_accept_its_own_proposal`), pinned
+    /// again here because T3.4.1 explicitly routes adjustment through this
+    /// gate.
+    #[tokio::test]
+    async fn automation_key_cannot_accept_adjust_proposal() {
+        let (app, _sink) = test_app().await;
+        let (d1, _d2) = two_directions(&app).await;
+        let created = body_json(
+            app.clone()
+                .oneshot(human_req(
+                    "POST",
+                    "/rhythms",
+                    json!({"allocations": [{"direction_id": d1, "pct": 50}]}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let rhythm_id = created["id"].as_str().unwrap().to_string();
+
+        let submit = app
+            .clone()
+            .oneshot(automation_proposal(json!({
+                "id": "p-self", "status": "pending", "source": "local_brain",
+                "ops": [{"op": "adjust_rhythm", "rhythm_id": rhythm_id,
+                         "new_alloc": [{"direction_id": d1, "pct": 10}]}],
+                "rationale": null
+            })))
+            .await
+            .unwrap();
+        assert_eq!(submit.status(), StatusCode::ACCEPTED);
+
+        let accept_as_automation = Request::builder()
+            .method("POST")
+            .uri("/proposals/p-self/accept")
+            .header("x-sin90-actor-key", AUTOMATION)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(accept_as_automation)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN,
+            "automation must not be able to self-approve a Rhythm adjustment"
+        );
+
+        // Negative control: still `active`, not `adjusted` — the rejected
+        // accept must not have moved state.
+        let fetched = body_json(
+            app.oneshot(get_req(&format!("/rhythms/{rhythm_id}")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(fetched["status"], "active");
+    }
+
+    // ---- direct-write structural checks (core::check_alloc, via 400) -------
+
+    #[tokio::test]
+    async fn create_rejects_pct_sum_over_100() {
+        let (app, _sink) = test_app().await;
+        let (d1, d2) = two_directions(&app).await;
+        let resp = app
             .oneshot(human_req(
                 "POST",
                 "/rhythms",
-                json!({"allocations": [{"direction_id": d1, "pct": 60}]}),
+                json!({"allocations": [{"direction_id": d1, "pct": 60}, {"direction_id": d2, "pct": 41}]}),
             ))
             .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(created["status"], "active");
-    let rhythm_id = created["id"].as_str().unwrap().to_string();
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], "invalid_request");
+    }
 
-    let submit = app
-        .clone()
-        .oneshot(automation_proposal(json!({
-            "id": "p-adjust", "status": "pending", "source": "local_brain",
-            "ops": [{"op": "adjust_rhythm", "rhythm_id": rhythm_id,
-                     "new_alloc": [{"direction_id": d1, "pct": 30}, {"direction_id": d2, "pct": 40}]}],
-            "rationale": null
-        })))
-        .await
-        .unwrap();
-    assert_eq!(submit.status(), StatusCode::ACCEPTED);
-    assert_eq!(
-        app.clone()
-            .oneshot(accept_req("p-adjust"))
+    /// Positive control for the sum check above: a sum of exactly 100 is
+    /// legal.
+    #[tokio::test]
+    async fn create_allows_pct_sum_of_exactly_100() {
+        let (app, _sink) = test_app().await;
+        let (d1, d2) = two_directions(&app).await;
+        let resp = app
+            .oneshot(human_req(
+                "POST",
+                "/rhythms",
+                json!({"allocations": [{"direction_id": d1, "pct": 60}, {"direction_id": d2, "pct": 40}]}),
+            ))
             .await
-            .unwrap()
-            .status(),
-        StatusCode::OK
-    );
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
 
-    let fetched = body_json(
-        app.oneshot(get_req(&format!("/rhythms/{rhythm_id}")))
+    /// pct=0 is out of the 1..=100 structural range — 400 (positive control:
+    /// pct=1, the range's own lower bound, succeeds). Opus 2026-09-23 review
+    /// M3.
+    #[tokio::test]
+    async fn create_rejects_pct_zero() {
+        let (app, _sink) = test_app().await;
+        let (d1, _d2) = two_directions(&app).await;
+        let resp = app
+            .clone()
+            .oneshot(human_req(
+                "POST",
+                "/rhythms",
+                json!({"allocations": [{"direction_id": d1.clone(), "pct": 0}]}),
+            ))
             .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(fetched["status"], "adjusted");
-    let allocs = fetched["allocations"].as_array().unwrap();
-    assert_eq!(allocs.len(), 2);
-    assert!(allocs
-        .iter()
-        .any(|a| a["direction_id"] == d1 && a["pct"] == 30));
-    assert!(allocs
-        .iter()
-        .any(|a| a["direction_id"] == d2 && a["pct"] == 40));
-}
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], "invalid_request");
 
-/// The direct-write gate itself: automation may not create a Rhythm, only a
-/// human key may (positive control alongside the negative).
-#[tokio::test]
-async fn rhythm_direct_create_requires_human_key() {
-    let (app, _sink) = test_app().await;
-    let (d1, _d2) = two_directions(&app).await;
-    let body = json!({"allocations": [{"direction_id": d1, "pct": 50}]});
+        let resp = app
+            .oneshot(human_req(
+                "POST",
+                "/rhythms",
+                json!({"allocations": [{"direction_id": d1, "pct": 1}]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
 
-    let resp = app
-        .clone()
-        .oneshot(automation_req("POST", "/rhythms", body.clone()))
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::FORBIDDEN,
-        "automation key must not be able to POST /rhythms directly"
-    );
+    /// Opus 2026-09-23 review M1: an empty `allocations` list is a
+    /// structural error (`core::check_alloc::EmptyAllocations`), not a
+    /// legal "no-op" rhythm — 400 on the direct-write path (positive
+    /// control: a single legal allocation succeeds).
+    #[tokio::test]
+    async fn create_rejects_empty_allocations() {
+        let (app, _sink) = test_app().await;
+        let resp = app
+            .clone()
+            .oneshot(human_req("POST", "/rhythms", json!({"allocations": []})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], "invalid_request");
 
-    // Positive control: the human key succeeds with the same body.
-    let resp = app
-        .oneshot(human_req("POST", "/rhythms", body))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-}
+        let (d1, _d2) = two_directions(&app).await;
+        let resp = app
+            .oneshot(human_req(
+                "POST",
+                "/rhythms",
+                json!({"allocations": [{"direction_id": d1, "pct": 1}]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
 
-/// The automation key must not be able to accept its own AdjustRhythm
-/// proposal either — same boundary as every other proposal kind
-/// (`automation_can_submit_but_not_accept_its_own_proposal`), pinned again
-/// here because T3.4.1 explicitly routes adjustment through this gate.
-#[tokio::test]
-async fn rhythm_automation_key_cannot_accept_adjust_proposal() {
-    let (app, _sink) = test_app().await;
-    let (d1, _d2) = two_directions(&app).await;
-    let created = body_json(
-        app.clone()
+    #[tokio::test]
+    async fn create_rejects_duplicate_direction() {
+        let (app, _sink) = test_app().await;
+        let (d1, _d2) = two_directions(&app).await;
+        let resp = app
+            .oneshot(human_req(
+                "POST",
+                "/rhythms",
+                json!({"allocations": [{"direction_id": d1, "pct": 10}, {"direction_id": d1, "pct": 20}]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], "invalid_request");
+    }
+
+    #[tokio::test]
+    async fn create_rejects_unknown_field() {
+        let (app, _sink) = test_app().await;
+        let (d1, _d2) = two_directions(&app).await;
+        let resp = app
+            .oneshot(human_req(
+                "POST",
+                "/rhythms",
+                json!({"allocations": [{"direction_id": d1, "pct": 10}], "note": "typo field"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Opus 2026-09-23 review M2: an unknown direction is 404 — the same
+    /// "referenced entity does not exist" convention `create_task`/
+    /// `create_block` already use — NOT 400 (400 is reserved for the
+    /// structural checks above, which never touch the database).
+    #[tokio::test]
+    async fn create_rejects_unknown_direction() {
+        let (app, _sink) = test_app().await;
+        let resp = app
+            .clone()
+            .oneshot(human_req(
+                "POST",
+                "/rhythms",
+                json!({"allocations": [{"direction_id": "does-not-exist", "pct": 50}]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], "not_found");
+
+        // Positive control: a real direction succeeds.
+        let (d1, _d2) = two_directions(&app).await;
+        let resp = app
             .oneshot(human_req(
                 "POST",
                 "/rhythms",
                 json!({"allocations": [{"direction_id": d1, "pct": 50}]}),
             ))
             .await
-            .unwrap(),
-    )
-    .await;
-    let rhythm_id = created["id"].as_str().unwrap().to_string();
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
 
-    let submit = app
-        .clone()
-        .oneshot(automation_proposal(json!({
-            "id": "p-self", "status": "pending", "source": "local_brain",
-            "ops": [{"op": "adjust_rhythm", "rhythm_id": rhythm_id,
-                     "new_alloc": [{"direction_id": d1, "pct": 10}]}],
-            "rationale": null
-        })))
-        .await
-        .unwrap();
-    assert_eq!(submit.status(), StatusCode::ACCEPTED);
-
-    let accept_as_automation = Request::builder()
-        .method("POST")
-        .uri("/proposals/p-self/accept")
-        .header("x-sin90-actor-key", AUTOMATION)
-        .body(Body::empty())
-        .unwrap();
-    assert_eq!(
-        app.clone()
-            .oneshot(accept_as_automation)
+    #[tokio::test]
+    async fn get_unknown_id_is_404() {
+        let (app, _sink) = test_app().await;
+        let resp = app
+            .oneshot(get_req("/rhythms/does-not-exist"))
             .await
-            .unwrap()
-            .status(),
-        StatusCode::FORBIDDEN,
-        "automation must not be able to self-approve a Rhythm adjustment"
-    );
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
 
-    // Negative control: still `active`, not `adjusted` — the rejected accept
-    // must not have moved state.
-    let fetched = body_json(
-        app.oneshot(get_req(&format!("/rhythms/{rhythm_id}")))
+    // ---- H1: AdjustRhythm's apply arm must enforce the SAME invariants as
+    // create_rhythm — direction existence and pct range — not just the
+    // pure `validate()` structural check. ------------------------------------
+
+    /// Opus 2026-09-23 review H1: `AdjustRhythm`'s apply used to skip the
+    /// direction-existence check `create_rhythm` already enforced — accept
+    /// would silently move a Rhythm to `adjusted` referencing a direction
+    /// that does not exist. Now `require_directions_exist` runs inside the
+    /// SAME apply transaction, so this is 404, and the rhythm never moves.
+    #[tokio::test]
+    async fn adjust_rejects_unknown_direction_rhythm_stays_active_positive_control_legal_adjustment(
+    ) {
+        let (app, _sink) = test_app().await;
+        let (d1, d2) = two_directions(&app).await;
+        let created = body_json(
+            app.clone()
+                .oneshot(human_req(
+                    "POST",
+                    "/rhythms",
+                    json!({"allocations": [{"direction_id": d1, "pct": 50}]}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let rhythm_id = created["id"].as_str().unwrap().to_string();
+
+        let submit = app
+            .clone()
+            .oneshot(automation_proposal(json!({
+                "id": "p-ghost", "status": "pending", "source": "local_brain",
+                "ops": [{"op": "adjust_rhythm", "rhythm_id": rhythm_id,
+                         "new_alloc": [{"direction_id": "does-not-exist", "pct": 50}]}],
+                "rationale": null
+            })))
+            .await
+            .unwrap();
+        assert_eq!(submit.status(), StatusCode::ACCEPTED);
+        let accept = app.clone().oneshot(accept_req("p-ghost")).await.unwrap();
+        assert_eq!(
+            accept.status(),
+            StatusCode::NOT_FOUND,
+            "an AdjustRhythm referencing an unknown direction must be rejected, not applied"
+        );
+
+        // Negative control: the rejected accept must not have moved state.
+        let fetched = body_json(
+            app.clone()
+                .oneshot(get_req(&format!("/rhythms/{rhythm_id}")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(fetched["status"], "active");
+
+        // Positive control: a legal adjustment (existing direction) applies.
+        let submit = app
+            .clone()
+            .oneshot(automation_proposal(json!({
+                "id": "p-legal", "status": "pending", "source": "local_brain",
+                "ops": [{"op": "adjust_rhythm", "rhythm_id": rhythm_id,
+                         "new_alloc": [{"direction_id": d2, "pct": 30}]}],
+                "rationale": null
+            })))
+            .await
+            .unwrap();
+        assert_eq!(submit.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            app.clone()
+                .oneshot(accept_req("p-legal"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let fetched = body_json(
+            app.oneshot(get_req(&format!("/rhythms/{rhythm_id}")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(fetched["status"], "adjusted");
+    }
+
+    /// Opus 2026-09-23 review H1/M1: `AdjustRhythm`'s pure `validate()`
+    /// already rejects pct=0 via the shared `core::check_alloc`. Rebased onto
+    /// #29 (SFU-10, "提交即校验"): `submit_proposal` now runs that same
+    /// `validate()` at SUBMIT time, before anything is persisted — so pct=0
+    /// is now 422 at submit, not merely at accept, and the proposal never
+    /// exists at all. This pins the new-and-correct place it is caught, plus
+    /// the legal-adjustment positive control.
+    #[tokio::test]
+    async fn adjust_rejects_pct_zero_positive_control_legal_adjustment() {
+        let (app, _sink) = test_app().await;
+        let (d1, _d2) = two_directions(&app).await;
+        let created = body_json(
+            app.clone()
+                .oneshot(human_req(
+                    "POST",
+                    "/rhythms",
+                    json!({"allocations": [{"direction_id": d1.clone(), "pct": 50}]}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let rhythm_id = created["id"].as_str().unwrap().to_string();
+
+        let submit = app
+            .clone()
+            .oneshot(automation_proposal(json!({
+                "id": "p-pct0", "status": "pending", "source": "local_brain",
+                "ops": [{"op": "adjust_rhythm", "rhythm_id": rhythm_id.clone(),
+                         "new_alloc": [{"direction_id": d1.clone(), "pct": 0}]}],
+                "rationale": null
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            submit.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "pct=0 must be rejected at submit time (SFU-10), not persisted as pending"
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(get_req("/proposals/p-pct0"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND,
+            "a submit-time-rejected proposal must not exist at all"
+        );
+
+        let fetched = body_json(
+            app.clone()
+                .oneshot(get_req(&format!("/rhythms/{rhythm_id}")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(fetched["status"], "active");
+
+        // Positive control: pct in range applies.
+        let submit = app
+            .clone()
+            .oneshot(automation_proposal(json!({
+                "id": "p-legal", "status": "pending", "source": "local_brain",
+                "ops": [{"op": "adjust_rhythm", "rhythm_id": rhythm_id,
+                         "new_alloc": [{"direction_id": d1, "pct": 5}]}],
+                "rationale": null
+            })))
+            .await
+            .unwrap();
+        assert_eq!(submit.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            app.clone()
+                .oneshot(accept_req("p-legal"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let fetched = body_json(
+            app.oneshot(get_req(&format!("/rhythms/{rhythm_id}")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(fetched["status"], "adjusted");
+    }
+
+    /// Opus 2026-09-23 review M1: an empty `new_alloc` is rejected on the
+    /// proposal path too (`validate()` → `check_alloc` →
+    /// `ProposalError::EmptyAllocations`). Rebased onto #29 (SFU-10, "提交即
+    /// 校验"): `submit_proposal` now runs `validate()` at SUBMIT time, so this
+    /// is 422 at submit and the proposal is never persisted — the rhythm
+    /// stays `active`; positive control: a single legal allocation applies.
+    #[tokio::test]
+    async fn adjust_rejects_empty_allocations_positive_control_legal_adjustment() {
+        let (app, _sink) = test_app().await;
+        let (d1, _d2) = two_directions(&app).await;
+        let created = body_json(
+            app.clone()
+                .oneshot(human_req(
+                    "POST",
+                    "/rhythms",
+                    json!({"allocations": [{"direction_id": d1.clone(), "pct": 50}]}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let rhythm_id = created["id"].as_str().unwrap().to_string();
+
+        let submit = app
+            .clone()
+            .oneshot(automation_proposal(json!({
+                "id": "p-empty", "status": "pending", "source": "local_brain",
+                "ops": [{"op": "adjust_rhythm", "rhythm_id": rhythm_id, "new_alloc": []}],
+                "rationale": null
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            submit.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "an empty new_alloc must be rejected at submit time (SFU-10), not persisted"
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(get_req("/proposals/p-empty"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND,
+            "a submit-time-rejected proposal must not exist at all"
+        );
+
+        let fetched = body_json(
+            app.clone()
+                .oneshot(get_req(&format!("/rhythms/{rhythm_id}")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(fetched["status"], "active");
+
+        let submit = app
+            .clone()
+            .oneshot(automation_proposal(json!({
+                "id": "p-legal", "status": "pending", "source": "local_brain",
+                "ops": [{"op": "adjust_rhythm", "rhythm_id": rhythm_id,
+                         "new_alloc": [{"direction_id": d1, "pct": 10}]}],
+                "rationale": null
+            })))
+            .await
+            .unwrap();
+        assert_eq!(submit.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            app.clone()
+                .oneshot(accept_req("p-legal"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let fetched = body_json(
+            app.oneshot(get_req(&format!("/rhythms/{rhythm_id}")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(fetched["status"], "adjusted");
+    }
+
+    // ---- M3: list + the created event ---------------------------------------
+
+    #[tokio::test]
+    async fn list_is_empty_then_newest_first() {
+        let (app, _sink) = test_app().await;
+        let empty = body_json(app.clone().oneshot(get_req("/rhythms")).await.unwrap()).await;
+        assert_eq!(empty, json!({"rhythms": []}));
+
+        let (d1, d2) = two_directions(&app).await;
+        let first = body_json(
+            app.clone()
+                .oneshot(human_req(
+                    "POST",
+                    "/rhythms",
+                    json!({"allocations": [{"direction_id": d1, "pct": 10}]}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let second = body_json(
+            app.clone()
+                .oneshot(human_req(
+                    "POST",
+                    "/rhythms",
+                    json!({"allocations": [{"direction_id": d2, "pct": 20}]}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        let listed = body_json(app.oneshot(get_req("/rhythms")).await.unwrap()).await;
+        let rows = listed["rhythms"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0]["id"], second["id"],
+            "newest first, same convention as every other list_* route"
+        );
+        assert_eq!(rows[1]["id"], first["id"]);
+    }
+
+    /// `rhythm.created` fires exactly once per create, with `to_state` =
+    /// `active` — checked both via `/events` (the source of truth) and the
+    /// in-process `EventSink` the HTTP layer also emits to. Mutation: delete
+    /// the `append_event` call in `create_rhythm` → this goes red (see
+    /// commit body for the run).
+    #[tokio::test]
+    async fn create_emits_exactly_one_created_event_with_active_to_state() {
+        let (app, sink) = test_app().await;
+        let (d1, _d2) = two_directions(&app).await;
+        let created = body_json(
+            app.clone()
+                .oneshot(human_req(
+                    "POST",
+                    "/rhythms",
+                    json!({"allocations": [{"direction_id": d1, "pct": 10}]}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let rhythm_id = created["id"].as_str().unwrap().to_string();
+
+        let events = body_json(
+            app.oneshot(get_req(&format!(
+                "/events?entity=rhythm&entity_id={rhythm_id}"
+            )))
             .await
             .unwrap(),
-    )
-    .await;
-    assert_eq!(fetched["status"], "active");
-}
+        )
+        .await;
+        let rows = events["events"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["kind"], "created");
+        assert_eq!(rows[0]["to_state"], "active");
 
-/// pct summing over 100 is rejected — direct control for the mutation test
-/// below (delete the sum check → this goes from 400 to 201).
-#[tokio::test]
-async fn rhythm_create_rejects_pct_sum_over_100() {
-    let (app, _sink) = test_app().await;
-    let (d1, d2) = two_directions(&app).await;
-    let resp = app
-        .oneshot(human_req(
-            "POST",
-            "/rhythms",
-            json!({"allocations": [{"direction_id": d1, "pct": 60}, {"direction_id": d2, "pct": 41}]}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let body = body_json(resp).await;
-    assert_eq!(body["error"]["code"], "invalid_request");
-}
-
-/// Positive control for the sum check above: a sum of exactly 100 is legal.
-#[tokio::test]
-async fn rhythm_create_allows_pct_sum_of_exactly_100() {
-    let (app, _sink) = test_app().await;
-    let (d1, d2) = two_directions(&app).await;
-    let resp = app
-        .oneshot(human_req(
-            "POST",
-            "/rhythms",
-            json!({"allocations": [{"direction_id": d1, "pct": 60}, {"direction_id": d2, "pct": 40}]}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-}
-
-#[tokio::test]
-async fn rhythm_create_rejects_unknown_direction() {
-    let (app, _sink) = test_app().await;
-    let resp = app
-        .oneshot(human_req(
-            "POST",
-            "/rhythms",
-            json!({"allocations": [{"direction_id": "does-not-exist", "pct": 50}]}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let body = body_json(resp).await;
-    assert_eq!(body["error"]["code"], "invalid_request");
-}
-
-#[tokio::test]
-async fn rhythm_create_rejects_duplicate_direction() {
-    let (app, _sink) = test_app().await;
-    let (d1, _d2) = two_directions(&app).await;
-    let resp = app
-        .oneshot(human_req(
-            "POST",
-            "/rhythms",
-            json!({"allocations": [{"direction_id": d1, "pct": 10}, {"direction_id": d1, "pct": 20}]}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let body = body_json(resp).await;
-    assert_eq!(body["error"]["code"], "invalid_request");
-}
-
-#[tokio::test]
-async fn rhythm_create_rejects_unknown_field() {
-    let (app, _sink) = test_app().await;
-    let (d1, _d2) = two_directions(&app).await;
-    let resp = app
-        .oneshot(human_req(
-            "POST",
-            "/rhythms",
-            json!({"allocations": [{"direction_id": d1, "pct": 10}], "note": "typo field"}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn rhythm_get_unknown_id_is_404() {
-    let (app, _sink) = test_app().await;
-    let resp = app
-        .oneshot(get_req("/rhythms/does-not-exist"))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(
+            sink.0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(kind, payload)| kind == "rhythm.created" && payload["id"] == rhythm_id),
+            "EventSink must have received rhythm.created for this id"
+        );
+    }
 }

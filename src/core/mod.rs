@@ -11,7 +11,8 @@ pub mod types;
 pub mod util;
 
 pub use proposal::{
-    validate, NewTask, ProposalError, ProposalSource, Sin90Op, Sin90Proposal, ValidationCtx,
+    check_alloc, validate, NewTask, ProposalError, ProposalSource, Sin90Op, Sin90Proposal,
+    ValidationCtx,
 };
 pub use transitions::{
     area_transition_allowed, check_area_transition, check_direction_transition,
