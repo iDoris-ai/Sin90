@@ -30,6 +30,18 @@
 
 - 无。M3 的内核半边（调度回调）由 Agent24 `ME4-M1` 提供，属依赖不属阻塞。
 
+## 待用户拍板（T5.0.1 AI v1 设计提出，设计里暂用最保守占位；不影响 M3/M4 推进）
+
+设计草稿：`docs/t5.0.1-ai-v1-design` 分支 DESIGN-LIFEOS §11.11。
+- **Q1** 正式包要不要声明 `model_access: remote_allowed`？（占位：不声明——executive 在正式包里走不到。注意：一旦声明，内核对 Sin90 的**所有**推理调用都不再保证只走本地）
+- **Q2** executive（远端模型）开关的默认值？（占位：关）
+- **Q3** AI 多久触发、要不要自动触发（capture 后 / 复盘 Routine 到点 / 周进入 planning / 定时）？（占位：只手动触发）
+- **Q4** 没有合适的 Direction 时，classify 要不要提议新建一个？（占位：不要）
+- **Q5** 同意 reflex（纯规则）产出记 `source = rule`，并据此改 §M5 验收原文吗？
+- **Q6** M5 要不要加 `POST /proposals/{id}/reject`？（现在没有拒绝入口，过期提议一直挂 pending，见 SFU-5）
+- **Q7** 已经写过的复盘草稿，summarize 能不能提议整体改写？
+- **Q8** classify 模型低置信度时要不要仍然出提议？
+
 ## 需要用户做的事
 
 - main 无保护：请开 ruleset（1 个审批 + dismiss stale）。在此之前合并用 `gh pr merge --squash`（前提 clestons APPROVED）。
