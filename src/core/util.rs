@@ -102,7 +102,7 @@ fn iso_weeks_in_year(year: u32) -> u32 {
     let y = year - 1;
     // Day of week of Jan 1 (Gregorian), 0 = Sunday.
     let jan1 = (1 + 5 * (y % 4) + 4 * (y % 100) + 6 * (y % 400)) % 7;
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
     if jan1 == 4 || (leap && jan1 == 3) {
         53
     } else {
