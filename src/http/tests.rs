@@ -4016,3 +4016,334 @@ mod fired {
         );
     }
 }
+
+// ---- POST /ai/classify + GET /ai/runs/{id} (T5.2.1, design §11.4 公共) -----
+
+mod ai_classify {
+    use super::*;
+    use crate::ai::Capability;
+    use crate::core::{Energy, TaskKind};
+
+    fn no_key_req(method: &str, uri: &str, body: Value) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn trigger_classify_requires_an_actor_key() {
+        let (app, _sink) = test_app().await;
+        let resp = app
+            .oneshot(no_key_req("POST", "/ai/classify", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// Positive control for the 400 below: the automation key alone is
+    /// enough to trigger (design §11.4 公共's `require_any_actor`, same gate
+    /// `POST /proposals` uses).
+    #[tokio::test]
+    async fn trigger_classify_automation_key_is_accepted() {
+        let (app, _sink) = test_app().await;
+        let resp = app
+            .oneshot(automation_req("POST", "/ai/classify", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn trigger_classify_over_limit_task_ids_is_400() {
+        let (app, _sink) = test_app().await;
+        let ids: Vec<String> = (0..21).map(|i| format!("t{i}")).collect();
+        let resp = app
+            .oneshot(automation_req(
+                "POST",
+                "/ai/classify",
+                json!({"task_ids": ids}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn trigger_classify_unknown_field_is_400() {
+        let (app, _sink) = test_app().await;
+        let resp = app
+            .oneshot(automation_req(
+                "POST",
+                "/ai/classify",
+                json!({"oops": true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn trigger_classify_task_id_not_in_inbox_is_400() {
+        let (app, _sink) = test_app().await;
+        let resp = app
+            .oneshot(automation_req(
+                "POST",
+                "/ai/classify",
+                json!({"task_ids": ["does-not-exist"]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Pre-seeds the registry directly (rather than racing two real requests,
+    /// which would be flaky against a background `tokio::spawn`) to pin the
+    /// single-flight 409 shape.
+    #[tokio::test]
+    async fn trigger_classify_busy_returns_409_with_existing_run_id() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let state = Sin90State::new(
+            store,
+            Arc::new(RecordingSink::default()),
+            crate::http::ActorKeys {
+                human: HUMAN.into(),
+                automation: AUTOMATION.into(),
+            },
+        );
+        state
+            .ai_runs
+            .lock()
+            .unwrap()
+            .start(Capability::Classify, "run-already-going");
+        let app = router(state, false);
+        let resp = app
+            .oneshot(automation_req("POST", "/ai/classify", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "ai_busy");
+        assert_eq!(body["run_id"], "run-already-going");
+    }
+
+    #[tokio::test]
+    async fn get_ai_run_unknown_id_is_200_state_unknown() {
+        let (app, _sink) = test_app().await;
+        let resp = app
+            .oneshot(get_req("/ai/runs/does-not-exist"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["state"], "unknown");
+    }
+
+    /// End-to-end through the real router: `202` → background run → polled
+    /// to completion via `GET /ai/runs/{id}`. Production has no real
+    /// `ModelPort` wired yet (T5.1.2), so this only exercises reflex — the
+    /// task's title is crafted to overlap the Direction's title (R2) so the
+    /// item deterministically ends `proposed`, not `nothing`.
+    #[tokio::test]
+    async fn trigger_classify_runs_in_background_and_is_pollable_to_done() {
+        let (app, sink, store) = test_app_with_store().await;
+        store
+            .create_direction("Marketing Launch", "2026-Q4", None)
+            .await
+            .unwrap();
+        store
+            .create_task(
+                "Marketing Launch checklist",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let resp = app
+            .clone()
+            .oneshot(automation_req("POST", "/ai/classify", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body = body_json(resp).await;
+        assert_eq!(body["capability"], "classify");
+        let run_id = body["run_id"].as_str().unwrap().to_string();
+
+        // 2026-09-24 review (L6): a bounded WALL-CLOCK deadline, not a fixed
+        // iteration count — this run should finish in well under a second
+        // (in-memory SQLite, one item, reflex-only), but a wide 5s ceiling
+        // means a slow CI box doesn't turn a real pass into a flaky failure.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut state_str = "running".to_string();
+        let mut items = Value::Null;
+        let mut calls = Value::Null;
+        while tokio::time::Instant::now() < deadline {
+            let r = body_json(
+                app.clone()
+                    .oneshot(get_req(&format!("/ai/runs/{run_id}")))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            state_str = r["state"].as_str().unwrap().to_string();
+            items = r["items"].clone();
+            calls = r["calls"].clone();
+            if state_str != "running" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(state_str, "done", "run never finished: items={items:?}");
+        let items = items.as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["result"], "proposed");
+        // M5: `calls` is read from the durable `sin90_ai_calls` table.
+        let calls = calls.as_array().unwrap();
+        assert!(
+            !calls.is_empty(),
+            "the produced proposal's call row must be listed"
+        );
+        assert!(calls.iter().any(|c| c["ok"] == true));
+
+        // H2 (design §11.4 公共's L1): the run must have mirrored exactly one
+        // `proposal.submitted` event through the SAME `EventSink` the
+        // human `POST /proposals` path uses — one per produced proposal.
+        let submitted: Vec<_> = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(kind, _)| kind == "proposal.submitted")
+            .cloned()
+            .collect();
+        assert_eq!(
+            submitted.len(),
+            1,
+            "one proposal.submitted mirror per produced proposal: {submitted:?}"
+        );
+        assert!(submitted[0].1["id"].is_string());
+    }
+
+    // ---- J14: dedup skips/reprocesses (2026-09-24 review) ----------------
+
+    fn call_rec(id: &str) -> crate::ai::AiCallRecord {
+        crate::ai::AiCallRecord {
+            id: id.into(),
+            run_id: "run-dedup-http".into(),
+            task_kind: Capability::Classify,
+            engine: crate::ai::Engine::Reflex,
+            fallback_from: None,
+            served_tier: None,
+            model_id: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            latency_ms: 0,
+            ok: true,
+            error_kind: None,
+            proposal_id: None,
+            at: "2026-09-24T00:00:00Z".into(),
+        }
+    }
+
+    /// J14: `dedup_targets` (now `pub(crate)`) skips a task with a still-valid
+    /// PENDING `AssignTaskDirection` proposal, and stops skipping it once
+    /// that proposal is no longer valid (positive control: the target
+    /// Direction gets abandoned — same mechanism `ai::classify`'s own
+    /// `precheck_reflects_inbox_and_direction_closure` pins at the
+    /// `AiSink::precheck` layer; this test pins it at the HTTP layer's own
+    /// `dedup_targets` wrapper instead).
+    #[tokio::test]
+    async fn dedup_skips_valid_pending_then_reprocesses_after_direction_abandoned() {
+        let (_app, _sink, store) = test_app_with_store().await;
+        let direction = store
+            .create_direction("Side quest", "2026-Q4", None)
+            .await
+            .unwrap();
+        let task = store
+            .create_task(
+                "Ambiguous task",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let draft = crate::ai::ProposalDraft {
+            id: "p-dedup-http-1".into(),
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task.id.clone(),
+                direction_id: direction.id.clone(),
+            }],
+            rationale: None,
+        };
+        crate::ai::AiSink::submit(&store, Capability::Classify, draft, call_rec("c1"))
+            .await
+            .unwrap();
+
+        let (kept, skipped) =
+            crate::http::ai_classify::dedup_targets(&store, std::slice::from_ref(&task))
+                .await
+                .unwrap();
+        assert!(
+            kept.is_empty(),
+            "the still-valid pending proposal must skip this task"
+        );
+        assert_eq!(skipped, vec![task.id.clone()]);
+
+        // Positive control: abandon the target Direction — the pending
+        // proposal's dry-run now fails A5, so it no longer blocks anything.
+        sqlx::query("UPDATE sin90_directions SET status = 'abandoned' WHERE id = ?")
+            .bind(&direction.id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let (kept2, skipped2) =
+            crate::http::ai_classify::dedup_targets(&store, std::slice::from_ref(&task))
+                .await
+                .unwrap();
+        assert_eq!(
+            kept2.len(),
+            1,
+            "an invalidated pending proposal must no longer block it"
+        );
+        assert!(skipped2.is_empty());
+    }
+
+    // ---- M4: a panicking run releases the single-flight slot --------------
+
+    #[tokio::test]
+    async fn busy_guard_releases_slot_on_panic() {
+        use crate::http::ai_runs::{BusyGuard, RunRegistry};
+        let runs: crate::http::ai_runs::SharedRunRegistry =
+            std::sync::Arc::new(std::sync::Mutex::new(RunRegistry::default()));
+        {
+            let mut reg = runs.lock().unwrap();
+            reg.start(Capability::Classify, "run-panicking");
+        }
+        let guard_runs = runs.clone();
+        let handle = tokio::spawn(async move {
+            let _guard = BusyGuard::new(guard_runs, Capability::Classify, "run-panicking".into());
+            panic!("simulated background task failure");
+        });
+        let joined = handle.await;
+        assert!(joined.is_err(), "the spawned task must have panicked");
+
+        // The slot must be free — a NEW run can claim it immediately.
+        let busy = runs.lock().unwrap().busy_run(Capability::Classify);
+        assert_eq!(
+            busy, None,
+            "a panicking run must not leave the slot stuck busy forever"
+        );
+        let rec = runs.lock().unwrap().get("run-panicking");
+        assert_eq!(rec.map(|r| r.state), Some("aborted"));
+    }
+}
