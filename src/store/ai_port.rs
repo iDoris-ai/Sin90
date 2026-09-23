@@ -53,7 +53,13 @@ const TASK_COLUMNS: &str = "id, direction_id, week_id, parent_task_id, title, st
 /// literal (2026-09-24 review, H1). Mutation target: add a new terminal
 /// `TaskStatus` variant to `core::types` without adding it here too — this
 /// list stops being exhaustive and `inbox`'s exclusion set silently misses
-/// it again.
+/// it again. 2026-09-24 review (round 3, L5): that "silently misses it"
+/// framing undersold the actual guarantee — nothing here forces this ARRAY
+/// LITERAL to grow when the enum does. The test `all_task_statuses_array_is_
+/// exhaustive` (below) is what turns "silently stale" into "fails to
+/// compile": it wraps every one of these variants in a wildcard-free
+/// `match`, so a new `TaskStatus` variant breaks that match (E0004) until
+/// it's added both there AND here.
 const ALL_TASK_STATUSES: [TaskStatus; 6] = [
     TaskStatus::Backlog,
     TaskStatus::Planned,
@@ -94,6 +100,9 @@ const ALL_DIRECTION_STATUSES: [DirectionStatus; 5] = [
 /// `core::transitions::direction_is_terminal` without updating
 /// [`ALL_DIRECTION_STATUSES`] fails loudly (this list stops being
 /// exhaustive) rather than silently leaving one of the two queries stale.
+/// 2026-09-24 review (round 3, L5): same caveat as `ALL_TASK_STATUSES`'s —
+/// the compile-time enforcement is `all_direction_statuses_array_is_
+/// exhaustive` (below), not the array literal by itself.
 fn terminal_direction_status_wires() -> Vec<String> {
     ALL_DIRECTION_STATUSES
         .iter()
@@ -1282,5 +1291,89 @@ mod tests {
             after.is_empty(),
             "a classified-but-now-abandoned Direction must not show up in R1's history: {after:?}"
         );
+    }
+
+    /// L4 (2026-09-24 review, round 3): `direction_candidates` (§11.4.1's
+    /// "候选集") must exclude an abandoned Direction too — this was only
+    /// exercised indirectly (through `title_history`'s own regression); this
+    /// pins `direction_candidates` itself. Mutation target: swap
+    /// `terminal_direction_status_wires()`'s result for a set that names no
+    /// real wire value (e.g. `["__none__".to_string()]`) and this goes red
+    /// (the abandoned Direction comes back as a candidate).
+    #[tokio::test]
+    async fn direction_candidates_excludes_abandoned_direction() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let open = store
+            .create_direction("Work", "2026-Q4", None)
+            .await
+            .unwrap();
+        let closed = store
+            .create_direction("Side quest", "2026-Q4", None)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE sin90_directions SET status = 'abandoned' WHERE id = ?")
+            .bind(&closed.id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let reader = store.ai_reader();
+        let candidates = reader.direction_candidates(50).await.unwrap();
+        let ids: Vec<String> = candidates.iter().map(|c| c.direction_id.clone()).collect();
+        assert!(
+            ids.contains(&open.id),
+            "the still-open Direction must be a candidate: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&closed.id),
+            "the abandoned Direction must NOT be a candidate: {ids:?}"
+        );
+    }
+
+    /// L5 (2026-09-24 review, round 3): `ALL_TASK_STATUSES`/`ALL_DIRECTION_
+    /// STATUSES`'s doc comments claim a new terminal variant "fails loudly"
+    /// (fails to compile) if forgotten — but a plain fixed-size array
+    /// literal is NOT re-checked by the compiler when the source enum grows
+    /// a variant, so that claim was aspirational until an EXHAUSTIVE match
+    /// (no wildcard arm) existed somewhere to back it. These two functions
+    /// are that backing: a new `TaskStatus`/`DirectionStatus` variant added
+    /// to `core::types` without a matching arm here fails to COMPILE
+    /// (E0004), not silently leaves `ALL_TASK_STATUSES`/
+    /// `ALL_DIRECTION_STATUSES` (and therefore the derived exclusion sets)
+    /// stale. Exercised by iterating the `ALL_*` arrays so the test itself
+    /// also fails loudly (not just "compiles, never runs") if a variant is
+    /// ever REMOVED from an `ALL_*` array without being removed from the
+    /// enum.
+    #[test]
+    fn all_task_statuses_array_is_exhaustive() {
+        fn assert_exhaustive(s: TaskStatus) {
+            match s {
+                TaskStatus::Backlog
+                | TaskStatus::Planned
+                | TaskStatus::InProgress
+                | TaskStatus::Done
+                | TaskStatus::Dropped
+                | TaskStatus::CarriedOver => {}
+            }
+        }
+        for s in ALL_TASK_STATUSES {
+            assert_exhaustive(s);
+        }
+    }
+
+    #[test]
+    fn all_direction_statuses_array_is_exhaustive() {
+        fn assert_exhaustive(s: DirectionStatus) {
+            match s {
+                DirectionStatus::Draft
+                | DirectionStatus::Active
+                | DirectionStatus::Paused
+                | DirectionStatus::Achieved
+                | DirectionStatus::Abandoned => {}
+            }
+        }
+        for s in ALL_DIRECTION_STATUSES {
+            assert_exhaustive(s);
+        }
     }
 }
