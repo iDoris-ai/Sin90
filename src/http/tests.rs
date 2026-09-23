@@ -1128,3 +1128,163 @@ async fn week_attention_for_an_unknown_week_is_404_not_a_silent_zero() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+// ============================================================================
+// Codex 2026-09-22 review — store invariants (Medium #4, #5, #11)
+// ============================================================================
+
+async fn patch_status(app: &axum::Router, uri: &str, to: &str) -> StatusCode {
+    app.clone()
+        .oneshot(human_req("PATCH", uri, json!({"to": to})))
+        .await
+        .unwrap()
+        .status()
+}
+
+/// Medium #4: the direct `PATCH /tasks/{id}` path used to skip the
+/// "week must be open" invariant the Proposal path enforces, so a task in a
+/// reviewing/closed week could still change.
+#[tokio::test]
+async fn direct_task_transition_is_refused_once_its_week_is_no_longer_open() {
+    let (app, _sink) = test_app().await;
+    let (direction_id, week_id) = area_direction_and_open_week(&app).await;
+    let submit = app
+        .clone()
+        .oneshot(automation_proposal(json!({
+            "id": "p-two", "status": "pending", "source": "local_brain",
+            "ops": [{"op": "create_tasks", "week_id": week_id,
+                     "tasks": [{"title": "a", "direction_id": direction_id},
+                               {"title": "b", "direction_id": direction_id}]}],
+            "rationale": null
+        })))
+        .await
+        .unwrap();
+    assert_eq!(submit.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        app.clone()
+            .oneshot(accept_req("p-two"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let tasks = body_json(
+        app.clone()
+            .oneshot(get_req(&format!("/tasks?direction_id={direction_id}")))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let ids: Vec<String> = tasks["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids.len(), 2);
+
+    // Control: while the week is open, a direct transition works.
+    assert_eq!(
+        patch_status(&app, &format!("/tasks/{}", ids[0]), "in_progress").await,
+        StatusCode::OK
+    );
+
+    for to in ["active", "reviewing"] {
+        assert_eq!(
+            patch_status(&app, &format!("/weeks/{week_id}"), to).await,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        patch_status(&app, &format!("/tasks/{}", ids[1]), "in_progress").await,
+        StatusCode::CONFLICT,
+        "a task in a reviewing week must not change through the direct path"
+    );
+    let after = body_json(
+        app.oneshot(get_req(&format!("/tasks?direction_id={direction_id}")))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let t1 = after["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == ids[1].as_str())
+        .unwrap();
+    assert_eq!(
+        t1["status"], "planned",
+        "refused transition must not move state"
+    );
+}
+
+/// Medium #5: the Proposal `CreateArea` op inserted the bare slug and failed
+/// on the UNIQUE column when a same-titled area existed; direct creation
+/// already suffixed `-2`, `-3`.
+#[tokio::test]
+async fn proposal_created_area_gets_a_suffixed_slug_on_collision() {
+    let (app, _sink) = test_app().await;
+    assert_eq!(
+        app.clone()
+            .oneshot(human_req("POST", "/areas", json!({"title": "Health"})))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CREATED
+    );
+    let submit = app
+        .clone()
+        .oneshot(automation_proposal(json!({
+            "id": "p-area", "status": "pending", "source": "local_brain",
+            "ops": [{"op": "create_area", "title": "Health"}], "rationale": null
+        })))
+        .await
+        .unwrap();
+    assert_eq!(submit.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        app.clone()
+            .oneshot(accept_req("p-area"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK,
+        "a valid proposal must apply even when its slug collides"
+    );
+    let areas = body_json(app.oneshot(get_req("/areas")).await.unwrap()).await;
+    let mut slugs: Vec<&str> = areas["areas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["slug"].as_str().unwrap())
+        .collect();
+    slugs.sort_unstable();
+    assert_eq!(slugs, ["health", "health-2"]);
+}
+
+/// Medium #11: `iso_week` was stored verbatim with no uniqueness.
+#[tokio::test]
+async fn week_labels_are_validated_canonicalized_and_unique() {
+    let (app, _sink) = test_app().await;
+    let post = |label: &str| human_req("POST", "/weeks", json!({"iso_week": label}));
+    for bad in ["garbage", "2026-W99", "2026-W00", "2021-W53"] {
+        assert_eq!(
+            app.clone().oneshot(post(bad)).await.unwrap().status(),
+            StatusCode::BAD_REQUEST,
+            "{bad} must be rejected"
+        );
+    }
+    let resp = app.clone().oneshot(post("2026-w42")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(body_json(resp).await["iso_week"], "2026-W42");
+    assert_eq!(
+        app.clone()
+            .oneshot(post("2026-W42"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT,
+        "a second row for the same calendar week must be refused"
+    );
+    let weeks = body_json(app.oneshot(get_req("/weeks")).await.unwrap()).await;
+    assert_eq!(weeks["weeks"].as_array().unwrap().len(), 1);
+}

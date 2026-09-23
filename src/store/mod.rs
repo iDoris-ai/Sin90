@@ -51,6 +51,10 @@ pub enum StoreError {
     /// duplicate in the same week).
     #[error("cannot carry task {0} into its own week")]
     SameWeekCarry(String),
+    /// Client input that is well-formed JSON but not a valid value (e.g. a
+    /// malformed ISO week label) — maps to 400.
+    #[error("invalid: {0}")]
+    Invalid(String),
     /// A broken internal invariant (not the client's fault) — maps to 500.
     #[error("internal: {0}")]
     Internal(String),

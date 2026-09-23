@@ -74,6 +74,42 @@ pub fn is_fixed_iso8601(s: &str) -> bool {
             .all(|(i, c)| matches!(i, 4 | 7 | 10 | 13 | 16 | 19) || c.is_ascii_digit())
 }
 
+/// Canonical ISO-8601 week label (`YYYY-Www`) or `None` if `s` isn't one.
+/// Accepts a lowercase `w`, emits uppercase; rejects week 00 and weeks past
+/// the year's real count (52, or 53 when Jan 1 is a Thursday, or a Wednesday
+/// in a leap year).
+pub fn canonical_iso_week(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    if b.len() != 8 || b[4] != b'-' || !matches!(b[5], b'W' | b'w') {
+        return None;
+    }
+    let digits = |r: std::ops::Range<usize>| -> Option<u32> {
+        let part = &s[r];
+        part.bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| part.parse().ok())
+            .flatten()
+    };
+    let year = digits(0..4)?;
+    let week = digits(6..8)?;
+    if year < 1000 || week == 0 || week > iso_weeks_in_year(year) {
+        return None;
+    }
+    Some(format!("{year:04}-W{week:02}"))
+}
+
+fn iso_weeks_in_year(year: u32) -> u32 {
+    let y = year - 1;
+    // Day of week of Jan 1 (Gregorian), 0 = Sunday.
+    let jan1 = (1 + 5 * (y % 4) + 4 * (y % 100) + 6 * (y % 400)) % 7;
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    if jan1 == 4 || (leap && jan1 == 3) {
+        53
+    } else {
+        52
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +134,29 @@ mod tests {
     fn is_fixed_iso8601_rejects_bare_date() {
         assert!(!is_fixed_iso8601("2026-08-11"));
         assert!(is_fixed_iso8601("2026-08-11T00:00:00Z"));
+    }
+
+    #[test]
+    fn iso_week_labels_are_validated_and_canonicalized() {
+        assert_eq!(canonical_iso_week("2026-W42").as_deref(), Some("2026-W42"));
+        assert_eq!(canonical_iso_week("2026-w07").as_deref(), Some("2026-W07"));
+        // 2026 starts on a Thursday → 53 weeks; 2021 (Friday) → 52; 2020
+        // (leap, Wednesday) → 53.
+        assert!(canonical_iso_week("2026-W53").is_some());
+        assert!(canonical_iso_week("2021-W53").is_none());
+        assert!(canonical_iso_week("2020-W53").is_some());
+        for bad in [
+            "garbage",
+            "2026-W99",
+            "2026-W00",
+            "2026-42",
+            "2026W42",
+            "26-W42",
+            "2026-W4",
+            "２026-W42",
+            "2026-W+1",
+        ] {
+            assert!(canonical_iso_week(bad).is_none(), "{bad} must be rejected");
+        }
     }
 }
