@@ -15,9 +15,12 @@ requires_models: []
 requires_apis: []
 requires_deps: []
 
-# 只写真正用到的。Sin90 只要 events：它自己管数据目录，不用内核记忆
-# （design §5.3；这条决策继承自内核实现时代，未改变）。
-kernel_capabilities: [events]
+# 只写真正用到的（architecture.md「与内核的契约」）。T3.2.1 起加 memory/approval/
+# scheduler：memory 只用于复盘定稿的派生摘要（真相仍在 Sin90 自己的 SQLite，design
+# §5.3）；scheduler 把 Routine 的 cron 落到内核（T3.3.x）；approval 预留给需要内核级
+# 人工审批的动作。代码按「句柄可能不在」写：Offer.provides 没给对应前缀，对应的类型化
+# 客户端就是 None（T3.2.1，见 src/adapter_agent24/clients/）。
+kernel_capabilities: [events, memory, approval, scheduler]
 
 impl_kind: out_of_process_provider
 spawn:

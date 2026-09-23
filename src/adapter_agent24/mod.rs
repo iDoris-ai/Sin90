@@ -41,6 +41,7 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex, Semaphore};
 
 use crate::http::{EventSink, NullEventSink};
 
+pub mod clients;
 mod frame;
 mod transport;
 
@@ -152,12 +153,14 @@ pub fn manifest_digest(manifest_bytes: &[u8]) -> String {
 }
 
 /// Capability prefixes Sin90 has any use for, per the kernel contract table
-/// (`docs/agent/architecture.md` §"与内核的契约"). Only `events` is wired up
-/// today (`KernelEventSink`); `scheduler`/`memory` (private)/`approval` get
-/// typed clients in T3.2.1. `model` is deliberately NOT listed — Sin90 does
-/// not declare that capability this round (L4), and the `initialize`
-/// `capabilities` field below stays `["events"]` only; T3.2.1 is what
-/// expands both together.
+/// (`docs/agent/architecture.md` §"与内核的契约"). `events` is wired up via
+/// `KernelEventSink`; `scheduler`/`memory` (private)/`approval` have typed
+/// clients as of T3.2.1 (`clients::Clients`, built from an `Arc<KernelClients>`
+/// once the handshake is done — each one is `None` unless `Offer.provides`
+/// covers its own prefix, architecture.md 不可破边界 #7). `model` is
+/// deliberately NOT listed — Sin90 does not declare that capability this
+/// round (L4), and the `initialize` `capabilities` field below never lists
+/// it either.
 pub const SIN90_CAPABILITY_PREFIXES: &[&str] = &[
     "_a24/events/",
     "_a24/scheduler/",
@@ -298,7 +301,16 @@ async fn connect_and_initialize(
             "module": module,
             "manifest_digest": manifest_digest(manifest_bytes),
             "auth_token": auth_token,
-            "capabilities": ["events"],
+            // Kept in sync with `domain-os.yml`'s `kernel_capabilities` by
+            // hand (T3.2.1) — both list the same four names, in the same
+            // order, because they say the same thing to two different
+            // readers (the manifest is read at mount time; this is read at
+            // `initialize` time). Capability NAMES here, not the wire method
+            // prefixes in `SIN90_CAPABILITY_PREFIXES` — the kernel's `Grants`
+            // parses these against `agent24_domain::Capability::parse`
+            // (`events`/`memory`/`approval`/`scheduler`, snake_case), not
+            // against a `_a24/...` path.
+            "capabilities": ["events", "memory", "approval", "scheduler"],
         }
     });
     frame::write_frame(reader.get_mut(), &req).await?;
