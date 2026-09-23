@@ -85,6 +85,7 @@ fn map_err(err: StoreError) -> Response {
             &e.to_string(),
         ),
         StoreError::Conflict(m) => error_response(StatusCode::CONFLICT, "conflict", &m),
+        StoreError::Invalid(m) => error_response(StatusCode::BAD_REQUEST, "invalid_request", &m),
         StoreError::WeekNotOpen(m) => error_response(
             StatusCode::CONFLICT,
             "conflict",

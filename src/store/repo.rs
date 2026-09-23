@@ -192,31 +192,36 @@ fn slugify(title: &str) -> String {
     out
 }
 
+/// Collision-free slug under the caller's write transaction: the base slug,
+/// then `-2`, `-3`, ... Shared by direct `create_area` and the Proposal
+/// `CreateArea` op so both paths agree on collisions (the proposal path used
+/// to insert the bare slug and fail on the UNIQUE column).
+async fn allocate_area_slug(tx: &mut Tx<'_>, title: &str) -> Result<String> {
+    let base_slug = slugify(title);
+    let mut slug = base_slug.clone();
+    let mut n = 2u32;
+    loop {
+        let exists: i64 = sqlx::query("SELECT COUNT(*) AS n FROM sin90_areas WHERE slug = ?")
+            .bind(&slug)
+            .fetch_one(&mut **tx)
+            .await?
+            .get("n");
+        if exists == 0 {
+            return Ok(slug);
+        }
+        slug = format!("{base_slug}-{n}");
+        n += 1;
+    }
+}
+
 impl Sin90Store {
     // ----- Area (new, design §2 #1) -------------------------------------------
 
     pub async fn create_area(&self, title: &str) -> Result<Area> {
         let id = ulid();
         let now = now_iso8601();
-        let base_slug = slugify(title);
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
-        // Collision handling: try the base slug, then `-2`, `-3`, ... — a manual
-        // loop rather than a DB-generated suffix so the final slug is known
-        // before the INSERT (needed for the event payload).
-        let mut slug = base_slug.clone();
-        let mut n = 2u32;
-        loop {
-            let exists: i64 = sqlx::query("SELECT COUNT(*) AS n FROM sin90_areas WHERE slug = ?")
-                .bind(&slug)
-                .fetch_one(&mut *tx)
-                .await?
-                .get("n");
-            if exists == 0 {
-                break;
-            }
-            slug = format!("{base_slug}-{n}");
-            n += 1;
-        }
+        let slug = allocate_area_slug(&mut tx, title).await?;
         sqlx::query(
             "INSERT INTO sin90_areas (id, title, slug, status, sort_key, created_at, updated_at)
              VALUES (?, ?, ?, 'active', 0, ?, ?)",
@@ -369,9 +374,26 @@ impl Sin90Store {
     }
 
     pub async fn create_week(&self, iso_week: &str) -> Result<Week> {
+        let iso_week = crate::core::canonical_iso_week(iso_week).ok_or_else(|| {
+            StoreError::Invalid(format!(
+                "iso_week must be an ISO-8601 week like 2026-W42, got {iso_week:?}"
+            ))
+        })?;
+        let iso_week = iso_week.as_str();
         let id = ulid();
         let now = now_iso8601();
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        // One Week per calendar week. Checked here for a clean 409; the unique
+        // index (migration 0003) is the backstop.
+        let taken = sqlx::query("SELECT 1 FROM sin90_weeks WHERE iso_week = ?")
+            .bind(iso_week)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if taken.is_some() {
+            return Err(StoreError::Conflict(format!(
+                "week {iso_week} already exists"
+            )));
+        }
         sqlx::query(
             "INSERT INTO sin90_weeks (id, status, iso_week, created_at, updated_at)
              VALUES (?, 'planning', ?, ?, ?)",
@@ -489,9 +511,13 @@ impl Sin90Store {
     ///   a value specifically so a later edit or deletion can't rewrite what
     ///   already happened).
     pub async fn week_attention(&self, week_id: &str) -> Result<WeekAttention> {
+        // One read transaction = one database snapshot: without it a block
+        // created/completed between the queries could pair a stale plan with
+        // a fresh actual.
+        let mut tx = self.pool().begin().await?;
         let exists = sqlx::query("SELECT 1 FROM sin90_weeks WHERE id = ?")
             .bind(week_id)
-            .fetch_optional(self.pool())
+            .fetch_optional(&mut *tx)
             .await?;
         if exists.is_none() {
             return Err(StoreError::NotFound(format!("week {week_id}")));
@@ -503,7 +529,7 @@ impl Sin90Store {
              WHERE t.week_id = ?",
         )
         .bind(week_id)
-        .fetch_one(self.pool())
+        .fetch_one(&mut *tx)
         .await?
         .get("m");
         let actual_min: i64 = sqlx::query(
@@ -513,9 +539,10 @@ impl Sin90Store {
                AND json_extract(payload,'$.week_id') = ?",
         )
         .bind(week_id)
-        .fetch_one(self.pool())
+        .fetch_one(&mut *tx)
         .await?
         .get("m");
+        tx.commit().await?;
         Ok(WeekAttention {
             week_id: week_id.to_string(),
             planned_min,
@@ -757,6 +784,9 @@ impl Sin90Store {
         let Some(row) = row else {
             return Err(StoreError::NotFound(format!("task {id}")));
         };
+        // Same invariant the Proposal path enforces: a task in a reviewing or
+        // closed week is history and must not change through either path.
+        require_task_week_open(&mut tx, id).await?;
         let from: TaskStatus = from_wire(&row.get::<String, _>("status"))?;
         check_task_transition(from, to)?;
 
@@ -873,6 +903,9 @@ impl Sin90Store {
     ///   `CarryOverTask` it into next week.
     pub async fn today_view(&self) -> Result<TodayView> {
         let today_start = format!("{}T00:00:00Z", &now_iso8601()[..10]);
+        // All four sections from one read transaction (one snapshot), so a
+        // concurrent transition can't show a task in two sections at once.
+        let mut tx = self.pool().begin().await?;
 
         let must_do = sqlx::query(
             "SELECT id, direction_id, week_id, parent_task_id, title, status, kind, energy,
@@ -889,7 +922,7 @@ impl Sin90Store {
                created_at ASC
              LIMIT 3",
         )
-        .fetch_all(self.pool())
+        .fetch_all(&mut *tx)
         .await?
         .into_iter()
         .map(row_to_task)
@@ -902,7 +935,7 @@ impl Sin90Store {
              ORDER BY created_at ASC
              LIMIT 1",
         )
-        .fetch_optional(self.pool())
+        .fetch_optional(&mut *tx)
         .await?
         .map(|r| {
             Ok::<_, StoreError>(ScheduleBlock {
@@ -925,7 +958,7 @@ impl Sin90Store {
                AND status NOT IN ('done', 'dropped')
              ORDER BY created_at ASC",
         )
-        .fetch_all(self.pool())
+        .fetch_all(&mut *tx)
         .await?
         .into_iter()
         .map(row_to_task)
@@ -941,12 +974,13 @@ impl Sin90Store {
              ORDER BY created_at ASC",
         )
         .bind(&today_start)
-        .fetch_all(self.pool())
+        .fetch_all(&mut *tx)
         .await?
         .into_iter()
         .map(row_to_task)
         .collect::<Result<Vec<_>>>()?;
 
+        tx.commit().await?;
         Ok(TodayView {
             must_do,
             deep_block,
@@ -1329,7 +1363,7 @@ async fn apply_op(tx: &mut Tx<'_>, op: &Sin90Op, event_ids: &mut Vec<String>) ->
     match op {
         Sin90Op::CreateArea { title } => {
             let id = ulid();
-            let slug = slugify(title);
+            let slug = allocate_area_slug(tx, title).await?;
             sqlx::query(
                 "INSERT INTO sin90_areas (id, title, slug, status, sort_key, created_at, updated_at)
                  VALUES (?, ?, ?, 'active', 0, ?, ?)",
