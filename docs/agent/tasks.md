@@ -75,7 +75,7 @@
 - **优先级**：high
 - **目标**：`POST /routines`（require_human）、`GET /routines`、`GET /routines/{id}`、`PATCH /routines/{id}`（title/cron/tz/target_*）、`POST /routines/{id}/transition`。
 - **依赖**：T3.1.1
-- **验收命令**：`cargo test --lib http::routine`：自动化 key 直写 → 403（正对照：人类 key → 201）；未知字段 → 400。
+- **验收命令**：`cargo test --lib http::tests::routine`（测试放在 `http::tests::routine` 子模块；先 `-- --list` 确认 > 0）：自动化 key 直写 → 403（正对照：人类 key → 201）；未知字段 → 400。
 - **证据**：
 
 ### T3.2.0 回调通道多路复用 transport  `BACKLOG`
@@ -144,7 +144,7 @@
 - **开发范围**：`POST /rhythms`（require_human，直写，allocations 校验 pct 合计 ≤ 100、direction 存在）、`GET /rhythms`、`GET /rhythms/{id}`；
   调整 = 现有 `POST /proposals` 提交 `AdjustRhythm`（不新增 Op、不新增直写调整路由）。
 - **依赖**：T0.1
-- **验收命令**：`cargo test --lib http::rhythm`：建 → 提 AdjustRhythm → 人类 accept → 状态 `adjusted`；自动化 key accept → 403。
+- **验收命令**：`cargo test --lib http::tests::rhythm`（测试放在 `http::tests::rhythm` 子模块；先 `-- --list` 确认 > 0）：建 → 提 AdjustRhythm → 人类 accept → 状态 `adjusted`；自动化 key accept → 403。
 - **证据**：
 
 ### T3.5.1 M3 真实挂载验收  `BACKLOG`
@@ -167,7 +167,7 @@
 - **目标**：`POST /reviews`（kind + 期间：daily=日期、weekly=ISO 周、rhythm=rhythm_id）、`GET /reviews`、`GET /reviews/{id}`、`PATCH /reviews/{id}`（仅 draft）、`POST /reviews/{id}/finalize`。
 - **开发范围**：同期间同 kind 唯一；每个变化一条 `review.*` 事件；直写 require_human。
 - **依赖**：T3.5.1（避免与 M3 并行改同一批路由文件）
-- **验收命令**：`cargo test --lib http::review`：finalized 后 PATCH → 409；重复期间 → 409（正对照：不同期间 201）。
+- **验收命令**：`cargo test --lib http::tests::review`（测试放在 `http::tests::review` 子模块；先 `-- --list` 确认 > 0）：finalized 后 PATCH → 409；重复期间 → 409（正对照：不同期间 201）。
 - **证据**：
 
 ### T4.2.1 `body_ref` 单向 Markdown 外置  `BACKLOG`

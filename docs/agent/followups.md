@@ -11,3 +11,4 @@
 ## T0.4 Codex 补审
 
 （T0.4 执行时逐 commit 记录：结论 / 修复 PR / 转 followup）
+- [ ] SFU-6（C）Rhythm 的 allocation 能否指向 `achieved`/`abandoned` 的 Direction —— T3.4.1 评审 L2 · 需要用户定是否只允许非终态 Direction
