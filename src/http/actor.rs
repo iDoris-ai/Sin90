@@ -10,8 +10,56 @@
 //! distinguishes caller type", with anything stronger deferred until a real
 //! misuse is observed.
 
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::Path;
+
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+
+/// File name of the persisted keys, inside the module's data directory.
+pub const KEY_FILE: &str = "actor-keys.json";
+const ENV_HUMAN: &str = "SIN90_HUMAN_KEY";
+const ENV_AUTOMATION: &str = "SIN90_AUTOMATION_KEY";
+/// Generated keys are 48 hex chars; 32 is the floor for operator-supplied ones.
+const MIN_KEY_LEN: usize = 32;
+
+#[derive(Debug, thiserror::Error)]
+pub enum KeyError {
+    #[error("{0} key is too short (minimum {MIN_KEY_LEN} characters)")]
+    TooShort(&'static str),
+    #[error("{0} key must be printable ASCII with no spaces (it travels in an HTTP header)")]
+    NotHeaderSafe(&'static str),
+    #[error("human and automation keys must differ")]
+    Identical,
+    #[error("set both {ENV_HUMAN} and {ENV_AUTOMATION}, or neither")]
+    PartialEnv,
+    #[error("no key source: set {ENV_HUMAN}/{ENV_AUTOMATION}, or give a data directory")]
+    NoSource,
+    #[error(
+        "{path} is readable or writable by group/other (mode {mode:o}); run `chmod 600` on it"
+    )]
+    TooOpen { path: String, mode: u32 },
+    #[error("{path}: {source}")]
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("{path} is not a valid key file: {source}")]
+    Parse {
+        path: String,
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeyFile {
+    human: String,
+    automation: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Actor {
@@ -26,31 +74,43 @@ pub struct ActorKeys {
 }
 
 impl ActorKeys {
-    /// Load from `SIN90_HUMAN_KEY` / `SIN90_AUTOMATION_KEY`, generating and
-    /// printing (once, to stderr) any that are unset — a fresh install has
-    /// nowhere else to learn them from. Regenerating on every restart when
-    /// unset would silently invalidate whatever the operator copied down, so
-    /// an unset key always warns loudly rather than rotating quietly.
-    pub fn from_env_or_generate() -> Self {
-        let human = std::env::var("SIN90_HUMAN_KEY").unwrap_or_else(|_| {
-            let k = random_key();
-            eprintln!(
-                "sin90: SIN90_HUMAN_KEY not set — generated for this run: {k}\n\
-                 sin90: set SIN90_HUMAN_KEY to keep this stable across restarts."
-            );
-            k
-        });
-        let automation = std::env::var("SIN90_AUTOMATION_KEY").unwrap_or_else(|_| {
-            let k = random_key();
-            eprintln!(
-                "sin90: SIN90_AUTOMATION_KEY not set — generated for this run: {k}\n\
-                 sin90: set SIN90_AUTOMATION_KEY to keep this stable across restarts."
-            );
-            k
-        });
-        Self { human, automation }
+    /// Build from two explicit keys, rejecting any pair that would weaken the
+    /// human/automation boundary: a blank or short key (an empty
+    /// `x-sin90-actor-key` would otherwise authenticate), a key that cannot
+    /// travel in an HTTP header, or two identical keys (the human comparison
+    /// runs first, so identical keys silently promote automation to human).
+    pub fn new(human: String, automation: String) -> Result<Self, KeyError> {
+        validate_key("human", &human)?;
+        validate_key("automation", &automation)?;
+        if human == automation {
+            return Err(KeyError::Identical);
+        }
+        Ok(Self { human, automation })
     }
 
+    /// Resolve the two keys for a real process. Order:
+    ///
+    /// 1. `SIN90_HUMAN_KEY` + `SIN90_AUTOMATION_KEY` — both or neither.
+    /// 2. `<data_dir>/actor-keys.json`, created on first start with mode
+    ///    `0600` and reused afterwards. This is the only path that works under
+    ///    Agent24: its module launch passes a fixed env allowlist, never
+    ///    arbitrary `SIN90_*` variables, so env keys cannot reach a mounted
+    ///    module.
+    ///
+    /// Raw keys are never written to stdout/stderr — Agent24 re-logs every
+    /// module output line, so anything printed there is readable by anyone
+    /// who can read the daemon log. Only the key file's path is reported.
+    pub fn load(data_dir: Option<&Path>) -> Result<Self, KeyError> {
+        let human = std::env::var(ENV_HUMAN).ok();
+        let automation = std::env::var(ENV_AUTOMATION).ok();
+        match (human, automation) {
+            (Some(h), Some(a)) => return Self::new(h, a),
+            (None, None) => {}
+            _ => return Err(KeyError::PartialEnv),
+        }
+        let dir = data_dir.ok_or(KeyError::NoSource)?;
+        load_or_create_file(&dir.join(KEY_FILE))
+    }
     /// Identify the actor behind the `x-sin90-actor-key` header. `None` means
     /// no recognized key was presented at all (missing header, or a key that
     /// matches neither).
@@ -100,6 +160,81 @@ fn random_key() -> String {
     let mut bytes = [0u8; 24];
     rand::rng().fill_bytes(&mut bytes);
     hex::encode(bytes)
+}
+
+fn validate_key(which: &'static str, key: &str) -> Result<(), KeyError> {
+    if key.len() < MIN_KEY_LEN {
+        return Err(KeyError::TooShort(which));
+    }
+    if !key.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+        return Err(KeyError::NotHeaderSafe(which));
+    }
+    Ok(())
+}
+
+/// Create-if-absent without a window where the file exists half-written: the
+/// keys go to a private temp file first, then a hard link publishes it under
+/// the real name (atomic, and fails with `AlreadyExists` if another process
+/// won the race — in which case its keys are the ones to use).
+fn load_or_create_file(path: &Path) -> Result<ActorKeys, KeyError> {
+    if path.exists() {
+        return read_file(path);
+    }
+    let io = |p: &Path| {
+        let p = p.display().to_string();
+        move |source| KeyError::Io { path: p, source }
+    };
+    let dir = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir).map_err(io(dir))?;
+    let tmp = dir.join(format!(".{KEY_FILE}.{}.tmp", std::process::id()));
+    let keys = KeyFile {
+        human: random_key(),
+        automation: random_key(),
+    };
+    let body = serde_json::to_vec(&keys).expect("KeyFile serializes");
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(&body).and_then(|()| f.sync_all()));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(io(&tmp)(e));
+    }
+    let linked = std::fs::hard_link(&tmp, path);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => {
+            eprintln!(
+                "sin90: created actor keys at {} (mode 0600)",
+                path.display()
+            );
+            ActorKeys::new(keys.human, keys.automation)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => read_file(path),
+        Err(e) => Err(io(path)(e)),
+    }
+}
+
+fn read_file(path: &Path) -> Result<ActorKeys, KeyError> {
+    let io = |source| KeyError::Io {
+        path: path.display().to_string(),
+        source,
+    };
+    let mode = std::fs::metadata(path).map_err(io)?.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(KeyError::TooOpen {
+            path: path.display().to_string(),
+            mode,
+        });
+    }
+    let bytes = std::fs::read(path).map_err(io)?;
+    let keys: KeyFile = serde_json::from_slice(&bytes).map_err(|source| KeyError::Parse {
+        path: path.display().to_string(),
+        source,
+    })?;
+    ActorKeys::new(keys.human, keys.automation)
 }
 
 /// Standard rejection body for a missing/wrong/insufficiently-privileged key —
@@ -167,12 +302,100 @@ mod tests {
     fn generated_keys_are_not_reused_between_two_calls() {
         // Regression pin: a copy-paste bug that returned the same random buffer
         // for both keys would silently erase the human/automation distinction.
-        // Calls `random_key()` directly rather than `from_env_or_generate` so
+        // Calls `random_key()` directly rather than `load` so
         // this assertion holds regardless of the test process's environment.
         let h1 = random_key();
         let a1 = random_key();
         let h2 = random_key();
         assert_ne!(h1, a1, "human and automation keys must differ");
         assert_ne!(h1, h2, "two generation calls must not collide");
+    }
+
+    const H: &str = "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh";
+    const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "sin90-actor-{name}-{}-{}",
+            std::process::id(),
+            random_key()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn weak_or_identical_keys_are_refused() {
+        assert!(matches!(
+            ActorKeys::new(String::new(), A.into()),
+            Err(KeyError::TooShort("human"))
+        ));
+        assert!(matches!(
+            ActorKeys::new(H.into(), "short".into()),
+            Err(KeyError::TooShort("automation"))
+        ));
+        let spaced = format!("{} x", &H[..MIN_KEY_LEN]);
+        assert!(matches!(
+            ActorKeys::new(spaced, A.into()),
+            Err(KeyError::NotHeaderSafe("human"))
+        ));
+        assert!(matches!(
+            ActorKeys::new(H.into(), H.into()),
+            Err(KeyError::Identical)
+        ));
+        // Positive control: a valid distinct pair is accepted.
+        assert!(ActorKeys::new(H.into(), A.into()).is_ok());
+    }
+
+    #[test]
+    fn key_file_is_created_owner_only_and_reused_across_restarts() {
+        let dir = scratch_dir("reuse");
+        let path = dir.join(KEY_FILE);
+        let first = load_or_create_file(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "key file must be owner-only");
+        let second = load_or_create_file(&path).unwrap();
+        assert_eq!(first.human, second.human, "restart must not rotate keys");
+        assert_eq!(first.automation, second.automation);
+        assert_ne!(first.human, first.automation);
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != KEY_FILE)
+            .collect();
+        assert!(leftovers.is_empty(), "temp file left behind: {leftovers:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_group_readable_key_file_is_refused() {
+        let dir = scratch_dir("open");
+        let path = dir.join(KEY_FILE);
+        load_or_create_file(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(matches!(
+            load_or_create_file(&path),
+            Err(KeyError::TooOpen { .. })
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_key_file_with_identical_keys_is_refused() {
+        let dir = scratch_dir("same");
+        let path = dir.join(KEY_FILE);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap()
+            .write_all(format!(r#"{{"human":"{H}","automation":"{H}"}}"#).as_bytes())
+            .unwrap();
+        assert!(matches!(
+            load_or_create_file(&path),
+            Err(KeyError::Identical)
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -178,7 +178,7 @@ struct Daemon {
     token: String,
     /// Both streams, continuously drained — unlike a one-shot ready-line
     /// read, this test also needs to find a line Sin90 itself prints deep
-    /// into the run (see `wait_for_generated_key`), not just at startup.
+    /// into the run (see `read_actor_key`), not just at startup.
     stdout: Arc<Mutex<Vec<String>>>,
     stderr: Arc<Mutex<Vec<String>>>,
 }
@@ -190,51 +190,51 @@ impl Daemon {
         format!("--- stdout ---\n{out}\n--- stderr ---\n{err}")
     }
 
-    /// Sin90's `ActorKeys::from_env_or_generate` prints
-    /// `"...generated for this run: <key>"` to its OWN stderr on first use
-    /// when `SIN90_HUMAN_KEY` is unset — which it always is here, because
-    /// Agent24's module launch only inherits a fixed env allowlist
-    /// (`agent24_os_proto::launch::INHERITED_ENV`: PATH/HOME/LANG/TZ/TMPDIR/
-    /// USER) and does not pass arbitrary `SIN90_*` variables through. The
-    /// daemon pipes and re-logs every module stdout/stderr line
-    /// (`agent24_os_proto::launch::drain_output`), which is where this test
-    /// reads it back from — there is no other channel to learn it.
-    fn wait_for_generated_key(&self, which: &str, timeout: Duration) -> String {
-        let marker = format!("SIN90_{which}_KEY not set — generated for this run: ");
+    /// Sin90 persists its actor keys to `<A24_DATA_DIR>/actor-keys.json`
+    /// (Agent24's module launch passes only a fixed env allowlist, so
+    /// `SIN90_*` env keys can't reach a mounted module). The data dir lives
+    /// under this test's isolated `HOME`, so search there rather than
+    /// hard-coding Agent24's layout. Also asserts the key never reached the
+    /// daemon log — Agent24 re-logs every module output line, so a printed
+    /// key is readable by anyone with log access (Codex 2026-09-22, Medium).
+    fn read_actor_key(&self, home: &Path, which: &str, timeout: Duration) -> String {
         let deadline = Instant::now() + timeout;
-        loop {
-            for line in self
-                .stdout
-                .lock()
-                .unwrap()
-                .iter()
-                .chain(self.stderr.lock().unwrap().iter())
-            {
-                if let Some(pos) = line.find(&marker) {
-                    // The key itself has no internal whitespace, but the REST of
-                    // this log line does not end there: Agent24's daemon
-                    // re-logs each captured stdout/stderr line with its own
-                    // trailing `module="sin90" stream="stderr" cut=false`
-                    // tracing fields appended on the SAME line — `.trim()`
-                    // alone slurped those in as part of the "key", which then
-                    // failed every actor-key check downstream with no error
-                    // clearer than a generic 401/400. Take only the first
-                    // whitespace-delimited token after the marker.
-                    return line[pos + marker.len()..]
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or_default()
-                        .to_owned();
-                }
+        let path = loop {
+            if let Some(p) = find_file(home, "actor-keys.json") {
+                break p;
             }
             assert!(
                 Instant::now() < deadline,
-                "never saw a generated SIN90_{which}_KEY in the daemon's log; log:\n{}",
+                "sin90 never created actor-keys.json under {}; log:\n{}",
+                home.display(),
                 self.combined_log()
             );
             std::thread::sleep(Duration::from_millis(50));
+        };
+        let keys: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let key = keys[which].as_str().unwrap().to_owned();
+        assert!(
+            !self.combined_log().contains(&key),
+            "the raw {which} key leaked into the daemon log"
+        );
+        key
+    }
+}
+
+fn find_file(dir: &Path, name: &str) -> Option<std::path::PathBuf> {
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.file_name().is_some_and(|n| n == name) {
+            return Some(path);
+        }
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            if let Some(found) = find_file(&path, name) {
+                return Some(found);
+            }
         }
     }
+    None
 }
 
 fn drain_into(mut reader: impl std::io::Read + Send + 'static, sink: Arc<Mutex<Vec<String>>>) {
@@ -268,7 +268,7 @@ fn start_daemon(home: &Path, agent24d_bin: &Path) -> Daemon {
 
     // The ready line is the FIRST line of stdout — read it directly, then
     // hand the rest of the same stream to `drain_into` for continuous
-    // capture (needed for `wait_for_generated_key`).
+    // capture (the key-leak assertion in `read_actor_key` needs it).
     let mut first_line = Vec::new();
     loop {
         let mut byte = [0u8; 1];
@@ -450,7 +450,7 @@ fn sin90_mounts_under_a_real_agent24_daemon() {
     //    does not change that for a sample spanning every gate type this
     //    design distinguishes: no-gate (`today` above), `require_any_actor`
     //    (`/capture`), and `require_human` (`/areas`, `/tasks`).
-    let human_key = d2.wait_for_generated_key("HUMAN", Duration::from_secs(10));
+    let human_key = d2.read_actor_key(&home, "human", Duration::from_secs(10));
 
     let (status, body) = http_call(
         d2.port,
