@@ -13,10 +13,11 @@ use std::collections::HashMap;
 
 use crate::core::{
     check_alloc, check_area_transition, check_rhythm_transition, check_schedule_block_transition,
-    check_task_transition, check_week_transition, now_iso8601, ulid, validate, week_is_open, Alloc,
-    Area, AreaStatus, Direction, DirectionStatus, Energy, ProposalSource, ProposalStatus, Rhythm,
-    RhythmStatus, ScheduleBlock, ScheduleBlockStatus, Sin90Op, Sin90Proposal, Task, TaskKind,
-    TaskStatus, ValidationCtx, Week, WeekStatus,
+    check_task_transition, check_week_transition, now_iso8601, ulid, validate, validate_cron,
+    validate_tz, week_is_open, Alloc, Area, AreaStatus, Direction, DirectionStatus, Energy,
+    NewRoutine, ProposalSource, ProposalStatus, Rhythm, RhythmStatus, Routine, RoutineStatus,
+    ScheduleBlock, ScheduleBlockStatus, Sin90Op, Sin90Proposal, Task, TaskKind, TaskStatus,
+    ValidationCtx, Week, WeekStatus,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -135,6 +136,63 @@ fn row_to_rhythm(r: sqlx::sqlite::SqliteRow) -> Result<Rhythm> {
         created_at: r.get("created_at"),
         updated_at: r.get("updated_at"),
     })
+}
+
+/// Shared row→`Routine` mapping (M3, design §2 #6, §3.2) for `create_routine`/
+/// `get_routine`/`list_routines`/`update_routine`/`transition_routine`, all of
+/// which `SELECT` the same full column list.
+fn row_to_routine(r: sqlx::sqlite::SqliteRow) -> Result<Routine> {
+    Ok(Routine {
+        id: r.get("id"),
+        area_id: r.get("area_id"),
+        direction_id: r.get("direction_id"),
+        title: r.get("title"),
+        kind: from_wire(&r.get::<String, _>("kind"))?,
+        cron: r.get("cron"),
+        tz: r.get("tz"),
+        target_count: r
+            .get::<Option<i64>, _>("target_count")
+            .map(|n| i64_to_u32(n, "target_count"))
+            .transpose()?,
+        target_minutes: r
+            .get::<Option<i64>, _>("target_minutes")
+            .map(|n| i64_to_u32(n, "target_minutes"))
+            .transpose()?,
+        status: from_wire(&r.get::<String, _>("status"))?,
+        created_at: r.get("created_at"),
+        updated_at: r.get("updated_at"),
+    })
+}
+
+const ROUTINE_COLUMNS: &str = "id, area_id, direction_id, title, kind, cron, tz, \
+     target_count, target_minutes, status, created_at, updated_at";
+
+/// L3 (T3.1.1 review): an `i64` column value read back as `u32` goes through
+/// a checked conversion, not `as u32` — `as` silently truncates/wraps on
+/// overflow (e.g. a stray negative value would `as`-cast to a huge positive
+/// `u32` instead of erroring). A value this ever fails on is a broken
+/// invariant in `sin90.db` itself (this column is `CHECK (... > 0)` and only
+/// ever written from a `u32` in the first place), not the caller's fault —
+/// hence [`StoreError::Internal`], not [`StoreError::Invalid`].
+fn i64_to_u32(n: i64, field: &str) -> Result<u32> {
+    u32::try_from(n).map_err(|_| StoreError::Internal(format!("{field} out of u32 range: {n}")))
+}
+
+/// `target_count`/`target_minutes` must be positive when present (migration
+/// 0004's `CHECK` is the backstop; checked here first for a clean
+/// [`StoreError::Invalid`] instead of a raw SQLite constraint error — same
+/// convention as `create_week`'s `iso_week` check). Shared with
+/// `update_routine` (feat/t3.1.1-routine-store, layered on top of this
+/// branch) — defined here because `create_routine` needs it first.
+fn check_positive_target(value: Option<u32>, field: &str) -> Result<()> {
+    if let Some(v) = value {
+        if v == 0 {
+            return Err(StoreError::Invalid(format!(
+                "{field} must be > 0 when present, got 0"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// `GET /today`'s response shape (design M1). Every field is a plain read —
@@ -1070,6 +1128,161 @@ impl Sin90Store {
         })
     }
 
+    // ----- Routine create/get/list (new, M3, design §2 #6, §3.2, T3.1.1) -----
+    //
+    // `create` is a direct write (human UI path, same convention as
+    // Area/Task/Week above — M0 §6's "direct-write is for humans, Proposal
+    // is for AI" split; no `Sin90Op::CreateRoutine` variant exists, on
+    // purpose, until a real AI use case needs one). It runs inside
+    // `BEGIN IMMEDIATE` and appends exactly one self-contained event in the
+    // same transaction; `get`/`list` never open a write transaction and
+    // never call `append_event`, so `cargo test routine_` can assert "get/
+    // list are zero-event" as the positive control for "every mutation is
+    // exactly one event". `update`/`transition` (status changes and field
+    // edits) live in feat/t3.1.1-routine-store, layered on top of this
+    // branch — this branch is the read-plus-create half of the split.
+
+    /// Create a Routine from a [`NewRoutine`] (T3.1.1 review, "M2" — was a
+    /// long positional-argument list before). `tz` defaults to `"UTC"` when
+    /// absent; an EXPLICIT empty string is rejected rather than silently
+    /// treated as "use the default" (L2 — an empty string is more likely a
+    /// caller bug than an intentional default). `title` is trimmed and
+    /// rejected if blank (L4). `area_id`/`direction_id` existence is checked
+    /// explicitly (not left to the FK violation) so a bad reference comes
+    /// back as a clean [`StoreError::NotFound`] rather than a raw SQLite
+    /// error.
+    pub async fn create_routine(&self, new: &NewRoutine) -> Result<Routine> {
+        let title = new.title.trim();
+        if title.is_empty() {
+            return Err(StoreError::Invalid("title must not be blank".into()));
+        }
+        let tz: &str = match &new.tz {
+            None => "UTC",
+            Some(t) if t.is_empty() => {
+                return Err(StoreError::Invalid(
+                    "tz must not be an empty string (omit the field to default to UTC)".into(),
+                ))
+            }
+            Some(t) => t.as_str(),
+        };
+        validate_cron(&new.cron).map_err(StoreError::Invalid)?;
+        validate_tz(tz).map_err(StoreError::Invalid)?;
+        check_positive_target(new.target_count, "target_count")?;
+        check_positive_target(new.target_minutes, "target_minutes")?;
+
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(aid) = &new.area_id {
+            require_area_exists(&mut tx, aid).await?;
+        }
+        if let Some(did) = &new.direction_id {
+            require_direction_exists(&mut tx, did).await?;
+        }
+
+        let id = ulid();
+        let now = now_iso8601();
+        let kind_str = to_wire(&new.kind)?;
+        sqlx::query(
+            "INSERT INTO sin90_routines
+                 (id, area_id, direction_id, title, kind, cron, tz,
+                  target_count, target_minutes, status, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)",
+        )
+        .bind(&id)
+        .bind(&new.area_id)
+        .bind(&new.direction_id)
+        .bind(title)
+        .bind(&kind_str)
+        .bind(&new.cron)
+        .bind(tz)
+        .bind(new.target_count.map(i64::from))
+        .bind(new.target_minutes.map(i64::from))
+        .bind(&now)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        // Ad hoc (not a full-entity snapshot — see `update_routine`'s doc,
+        // feat/t3.1.1-routine-store, for why `updated` gets one and this
+        // doesn't) payload; the id key is `routine_id`, matching every other
+        // routine event (T3.1.1 review, "M5" — `created` used to be the one
+        // holdout using a bare `id`).
+        append_event(
+            &mut tx,
+            "routine",
+            &id,
+            "created",
+            None,
+            Some("active"),
+            &json!({
+                "routine_id": id, "area_id": new.area_id, "direction_id": new.direction_id,
+                "title": title, "kind": kind_str, "cron": new.cron, "tz": tz,
+                "target_count": new.target_count, "target_minutes": new.target_minutes,
+                "status": "active",
+            }),
+            &now,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Routine {
+            id,
+            area_id: new.area_id.clone(),
+            direction_id: new.direction_id.clone(),
+            title: title.to_string(),
+            kind: new.kind,
+            cron: new.cron.clone(),
+            tz: tz.to_string(),
+            target_count: new.target_count,
+            target_minutes: new.target_minutes,
+            status: RoutineStatus::Active,
+            created_at: now.clone(),
+            updated_at: now,
+        })
+    }
+
+    /// A read: no transaction, no event. Missing id is [`StoreError::NotFound`].
+    pub async fn get_routine(&self, id: &str) -> Result<Routine> {
+        let row = sqlx::query(&format!(
+            "SELECT {ROUTINE_COLUMNS} FROM sin90_routines WHERE id = ?"
+        ))
+        .bind(id)
+        .fetch_optional(self.pool())
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("routine {id}")))?;
+        row_to_routine(row)
+    }
+
+    /// A read: no transaction, no event.
+    pub async fn list_routines(
+        &self,
+        area_id: Option<&str>,
+        direction_id: Option<&str>,
+        status: Option<RoutineStatus>,
+    ) -> Result<Vec<Routine>> {
+        let mut sql = format!("SELECT {ROUTINE_COLUMNS} FROM sin90_routines WHERE 1=1");
+        if area_id.is_some() {
+            sql.push_str(" AND area_id = ?");
+        }
+        if direction_id.is_some() {
+            sql.push_str(" AND direction_id = ?");
+        }
+        if status.is_some() {
+            sql.push_str(" AND status = ?");
+        }
+        sql.push_str(" ORDER BY created_at DESC, rowid DESC");
+
+        let mut q = sqlx::query(&sql);
+        if let Some(a) = area_id {
+            q = q.bind(a);
+        }
+        if let Some(d) = direction_id {
+            q = q.bind(d);
+        }
+        if let Some(s) = status {
+            q = q.bind(to_wire(&s)?);
+        }
+        let rows = q.fetch_all(self.pool()).await?;
+        rows.into_iter().map(row_to_routine).collect()
+    }
+
     // ----- reads (list + detail) ---------------------------------------------
 
     pub async fn list_directions(&self) -> Result<Vec<Direction>> {
@@ -1851,6 +2064,34 @@ async fn require_task_week_open(tx: &mut Tx<'_>, task_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Existence check for `Routine.area_id` (M3, design §3.2) — checked
+/// explicitly under the write lock so a dangling reference comes back as a
+/// clean [`StoreError::NotFound`] instead of the FK violation's raw SQLite
+/// error (same convention as `create_task`'s `parent_task_id` check).
+async fn require_area_exists(tx: &mut Tx<'_>, id: &str) -> Result<()> {
+    let found = sqlx::query("SELECT 1 FROM sin90_areas WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    if found.is_none() {
+        return Err(StoreError::NotFound(format!("area {id}")));
+    }
+    Ok(())
+}
+
+/// Existence check for `Routine.direction_id` (M3, design §3.2) — see
+/// `require_area_exists`.
+async fn require_direction_exists(tx: &mut Tx<'_>, id: &str) -> Result<()> {
+    let found = sqlx::query("SELECT 1 FROM sin90_directions WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    if found.is_none() {
+        return Err(StoreError::NotFound(format!("direction {id}")));
+    }
+    Ok(())
+}
+
 async fn read_rhythm_status(tx: &mut Tx<'_>, id: &str) -> Result<RhythmStatus> {
     let row = sqlx::query("SELECT status FROM sin90_rhythms WHERE id = ?")
         .bind(id)
@@ -1858,4 +2099,319 @@ async fn read_rhythm_status(tx: &mut Tx<'_>, id: &str) -> Result<RhythmStatus> {
         .await?
         .ok_or_else(|| StoreError::NotFound(format!("rhythm {id}")))?;
     from_wire(&row.get::<String, _>("status"))
+}
+
+/// Routine `create`/`get`/`list` tests (T3.1.1 review split — H2/M3/M5/L1
+/// and the transition-dependent half of M4 live in feat/t3.1.1-routine-store,
+/// layered on top of this branch, which is why they aren't here).
+#[cfg(test)]
+mod routine_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::core::RoutineKind;
+    use crate::store::test_hooks;
+
+    async fn new_store() -> Sin90Store {
+        Sin90Store::open_memory().await.unwrap()
+    }
+
+    /// A `NewRoutine` with every optional field at its default (`None`) —
+    /// tests override only the fields they care about via struct-update
+    /// syntax (`NewRoutine { area_id: Some(..), ..nr(..) }`).
+    ///
+    /// Public within the crate (`pub(crate)`, not private) so
+    /// feat/t3.1.1-routine-store's tests, layered on top of this branch, can
+    /// reuse it instead of redefining an identical helper.
+    pub(crate) fn nr(title: &str, kind: RoutineKind, cron: &str) -> NewRoutine {
+        NewRoutine {
+            title: title.to_string(),
+            area_id: None,
+            direction_id: None,
+            kind,
+            cron: cron.to_string(),
+            tz: None,
+            target_count: None,
+            target_minutes: None,
+        }
+    }
+
+    /// Also `pub(crate)`: every routine test in feat/t3.1.1-routine-store
+    /// (update/transition) starts from a freshly created routine too.
+    pub(crate) async fn create_ok(store: &Sin90Store) -> Routine {
+        store
+            .create_routine(&NewRoutine {
+                target_count: Some(3),
+                target_minutes: Some(30),
+                ..nr("Morning run", RoutineKind::Exercise, "0 7 * * MON,WED,FRI")
+            })
+            .await
+            .unwrap()
+    }
+
+    // ----- creation validation ------------------------------------------
+
+    #[tokio::test]
+    async fn routine_create_rejects_invalid_cron() {
+        let store = new_store().await;
+        let err = store
+            .create_routine(&nr("Bad cron", RoutineKind::Other, "not a cron"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
+    }
+
+    /// H1 (T3.1.1 review): the store layer rejects a digit-based weekday
+    /// field too, not just `core::util::validate_cron` in isolation — this
+    /// is the actual path `POST /routines` (T3.1.2) will run through.
+    #[tokio::test]
+    async fn routine_create_rejects_posix_style_digit_weekday() {
+        let store = new_store().await;
+        let err = store
+            .create_routine(&nr(
+                "POSIX weekday digits",
+                RoutineKind::Other,
+                "0 7 * * 1-5",
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn routine_create_rejects_invalid_tz() {
+        let store = new_store().await;
+        let err = store
+            .create_routine(&NewRoutine {
+                tz: Some("Not/AZone".to_string()),
+                ..nr("Bad tz", RoutineKind::Other, "0 7 * * MON-FRI")
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
+    }
+
+    /// L2 (T3.1.1 review): an explicit empty `tz` string is a caller bug,
+    /// not "please default to UTC" — those are different inputs
+    /// (`routine_create_defaults_tz_to_utc_and_links_area_direction` below
+    /// is the positive control: omitting `tz` entirely DOES default).
+    #[tokio::test]
+    async fn routine_create_rejects_empty_tz_string() {
+        let store = new_store().await;
+        let err = store
+            .create_routine(&NewRoutine {
+                tz: Some(String::new()),
+                ..nr("Empty tz", RoutineKind::Other, "0 7 * * MON-FRI")
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
+    }
+
+    /// L4 (T3.1.1 review): a blank/whitespace-only title is rejected, same
+    /// as every other entity's title in this store.
+    #[tokio::test]
+    async fn routine_create_rejects_blank_title() {
+        let store = new_store().await;
+        for bad_title in ["", "   ", "\t\n"] {
+            let err = store
+                .create_routine(&nr(bad_title, RoutineKind::Other, "0 7 * * MON-FRI"))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, StoreError::Invalid(_)),
+                "{bad_title:?}: {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn routine_create_rejects_zero_target_count() {
+        let store = new_store().await;
+        let err = store
+            .create_routine(&NewRoutine {
+                target_count: Some(0),
+                ..nr("Zero target", RoutineKind::Other, "0 7 * * MON-FRI")
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn routine_create_rejects_zero_target_minutes() {
+        let store = new_store().await;
+        let err = store
+            .create_routine(&NewRoutine {
+                target_minutes: Some(0),
+                ..nr("Zero minutes", RoutineKind::Other, "0 7 * * MON-FRI")
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn routine_create_rejects_missing_area_and_direction() {
+        let store = new_store().await;
+        let err = store
+            .create_routine(&NewRoutine {
+                area_id: Some("no-such-area".to_string()),
+                ..nr("Ghost area", RoutineKind::Other, "0 7 * * MON-FRI")
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotFound(_)), "{err:?}");
+
+        let err = store
+            .create_routine(&NewRoutine {
+                direction_id: Some("no-such-direction".to_string()),
+                ..nr("Ghost direction", RoutineKind::Other, "0 7 * * MON-FRI")
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotFound(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn routine_create_defaults_tz_to_utc_and_links_area_direction() {
+        let store = new_store().await;
+        let area = store.create_area("Health").await.unwrap();
+        let direction = store
+            .create_direction("Q4 fitness", "2026-Q4", Some(&area.id))
+            .await
+            .unwrap();
+        let routine = store
+            .create_routine(&NewRoutine {
+                area_id: Some(area.id.clone()),
+                direction_id: Some(direction.id.clone()),
+                target_count: Some(3),
+                target_minutes: Some(30),
+                // tz omitted entirely -> defaults to UTC (contrast with
+                // `routine_create_rejects_empty_tz_string`'s explicit `""`).
+                ..nr("Morning run", RoutineKind::Exercise, "0 7 * * MON,WED,FRI")
+            })
+            .await
+            .unwrap();
+        assert_eq!(routine.tz, "UTC");
+        assert_eq!(routine.area_id.as_deref(), Some(area.id.as_str()));
+        assert_eq!(routine.direction_id.as_deref(), Some(direction.id.as_str()));
+        assert_eq!(routine.status, RoutineStatus::Active);
+        assert_eq!(routine.kind, RoutineKind::Exercise);
+    }
+
+    // ----- events: exactly one per mutation, zero on reads ----------------
+
+    #[tokio::test]
+    async fn routine_create_emits_exactly_one_created_event() {
+        let store = new_store().await;
+        let routine = create_ok(&store).await;
+        let n = test_hooks::event_count(&store, "routine", &routine.id)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    /// Positive control for "get/list are zero-event read paths": the SAME
+    /// routine, read both ways, must not add to the event count that
+    /// `routine_create_emits_exactly_one_created_event` established.
+    #[tokio::test]
+    async fn routine_get_and_list_emit_no_events() {
+        let store = new_store().await;
+        let routine = create_ok(&store).await;
+        let before = test_hooks::event_count(&store, "routine", &routine.id)
+            .await
+            .unwrap();
+
+        let _ = store.get_routine(&routine.id).await.unwrap();
+        let _ = store.list_routines(None, None, None).await.unwrap();
+        let _ = store
+            .list_routines(None, None, Some(RoutineStatus::Active))
+            .await
+            .unwrap();
+
+        let after = test_hooks::event_count(&store, "routine", &routine.id)
+            .await
+            .unwrap();
+        assert_eq!(before, after, "get/list must not append events");
+        assert_eq!(after, 1); // only the original `created`
+    }
+
+    // ----- list filters: positive controls (M4, area/direction half) --------
+    //
+    // The `status` filter's positive control needs `transition_routine`
+    // (to produce a non-`active` row) — that half lives in
+    // feat/t3.1.1-routine-store's `routine_list_filter_by_status_has_positive_control`.
+
+    /// M4 (T3.1.1 review): two routines in different areas/directions — the
+    /// `area_id`/`direction_id` filters must each return exactly the
+    /// matching routine, not "everything" or "nothing" (which would look
+    /// identical to a correct result if the filter silently did nothing).
+    #[tokio::test]
+    async fn routine_list_filters_by_area_and_direction_have_positive_controls() {
+        let store = new_store().await;
+        let area1 = store.create_area("Health").await.unwrap();
+        let area2 = store.create_area("Work").await.unwrap();
+        let dir1 = store
+            .create_direction("Q4 fitness", "2026-Q4", Some(&area1.id))
+            .await
+            .unwrap();
+
+        let r1 = store
+            .create_routine(&NewRoutine {
+                area_id: Some(area1.id.clone()),
+                direction_id: Some(dir1.id.clone()),
+                ..nr("Run", RoutineKind::Exercise, "0 7 * * MON,WED,FRI")
+            })
+            .await
+            .unwrap();
+        let r2 = store
+            .create_routine(&NewRoutine {
+                area_id: Some(area2.id.clone()),
+                ..nr("Deep work", RoutineKind::DeepWork, "0 9 * * MON-FRI")
+            })
+            .await
+            .unwrap();
+
+        let ids = |rs: &[Routine]| rs.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+
+        assert_eq!(
+            ids(&store
+                .list_routines(Some(&area1.id), None, None)
+                .await
+                .unwrap()),
+            vec![r1.id.clone()]
+        );
+        assert_eq!(
+            ids(&store
+                .list_routines(Some(&area2.id), None, None)
+                .await
+                .unwrap()),
+            vec![r2.id.clone()]
+        );
+        assert_eq!(
+            ids(&store
+                .list_routines(None, Some(&dir1.id), None)
+                .await
+                .unwrap()),
+            vec![r1.id.clone()]
+        );
+        // No filter -> both, positive control that the filters above aren't
+        // just "return everything regardless".
+        assert_eq!(
+            store.list_routines(None, None, None).await.unwrap().len(),
+            2
+        );
+        // Both are still `active` at this point (this branch has no
+        // `transition_routine`), so a `status` filter is a sanity check
+        // only, not yet a positive control — see the module doc above.
+        assert_eq!(
+            store
+                .list_routines(None, None, Some(RoutineStatus::Active))
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
 }
