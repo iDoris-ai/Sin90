@@ -8,7 +8,12 @@
 //!
 //! - [`core`]: pure domain — entities, state machines, Proposal validation.
 //!   Zero Agent24 dependency, zero I/O.
-//! - [`store`]: SQLite persistence over `core`.
+//! - [`ai`] (T5.1.1, design §11): the AI module — engine ladder, call
+//!   records, and the structural gate that keeps it from ever writing
+//!   `sin90.db` directly. Depends on NOTHING but `core` and itself — see
+//!   [`ai`]'s module doc.
+//! - [`store`]: SQLite persistence over `core`; implements `ai`'s two I/O
+//!   traits in `store::ai_port`.
 //! - [`http`]: business routes over `store`. Knows nothing about Agent24 —
 //!   only an [`http::EventSink`] trait for "someone may collect what I emit".
 //! - [`adapter_agent24`]: the ONLY module that knows Agent24 exists — the
@@ -16,6 +21,7 @@
 //!   forwards to `_a24/events/emit`.
 
 pub mod adapter_agent24;
+pub mod ai;
 pub mod core;
 pub mod http;
 pub mod store;
