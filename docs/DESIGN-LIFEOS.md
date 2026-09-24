@@ -761,6 +761,7 @@ T5.1.1 对 `ClientError` 的配套改动（在 adapter 里）：加 `Unavailable
 **原子性（M3）**：`run_item` 对产出的那一步**不写**调用行，把 `ok=1` 的 `AiCallRecord` 随 `Outcome::Produced` 返回；调用方把它和 `ProposalDraft` 一起交给 `AiSink::submit(cap, draft, rec)`，store 在**同一事务**里插提议、插调用行（`proposal_id = draft.id`）。所以「每条 AI 提议恰好对应一行 `ok=1` 调用记录」是事务保证，不是尽力而为。`submit` 被拒（`SinkError::Invalid`）→ 调用方改写这行为 `ok=0, error_kind='rejected_by_precheck'` 经 `record_call` 写入，继续下一条目（不降级——模型没错，是状态变了）。
 **`source` 由 store 推导**：`ProposalDraft` 没有 `source`、`status` 字段；store 用 `source_for(rec.engine, rec.served_tier)`（reflex → `rule`；`served_tier = remote` → `executive`；否则 `local_brain`）。ai 模块没有任何途径写入一个与调用记录不一致的 `source`。
 非产出步的 `record_call` 失败只 `warn!`，不阻断 run（R6）。
+**propose 的产出步是这条「一条产出对应一行」原则的例外（T5.4.1 实现时补，2026-09-24 review L-d）**：propose 一次决策可能同时拆成 carry/reorder/create 至多三条独立提议，一步最多写**三行**调用记录，具体记账规则见 §11.4.3 自己的小节。
 
 ### 11.4 三个能力的契约
 
@@ -781,7 +782,9 @@ T5.1.1 对 `ClientError` 的配套改动（在 adapter 里）：加 `Unavailable
   **试跑依赖的不变式（v2.1）**：`apply_op` 永远只做 `sin90.db` 内的读写，**不做任何非数据库副作用**——不写文件、不调内核、不外发事件、不改进程内状态。今天成立（`repo.rs:2594` 起的每个分支都只有 SQL 与 `append_event`）；定稿写 Markdown 在 `finalize_review` 里，不是 Op；内核副作用走 outbox（apply 只写 outbox 行，随回滚一起消失）。将来任何 Op 若需要非数据库副作用，必须放到 apply 之后（outbox 或 http 层），不许进 `apply_op`。J21b 钉住。
   任一步失败 → `SinkError::Invalid`，整个事务回滚，**不写任何行**。scratch `dryrun.rs` 在 sqlx 0.8 + SQLite 上实测了「嵌套事务 = SAVEPOINT、回滚后外层照常插入、试跑不留痕、非法重排整体拒绝」。accept 时照旧 validate + apply（状态可能已变）。人类/自动化 key 的 `POST /proposals` 不变（F-2）。
   **镜像事件（L1）**：`submit` 成功后，http 组装层（持有 `EventSink` 的那一层，不是 `ai/`）补发 `emit("proposal.submitted", {"id"})`，与 `POST /proposals` 同形（`http/mod.rs:623-626`）。
-- **去重（L3）**：触发时跳过已有**仍然有效**挂起提议的目标。「仍然有效」= 现在对那条挂起提议重跑提交前校验的第 1–3 步能通过。由 `AiSink::precheck(cap, &[ProposalDraft]) -> Vec<bool>` **批量**完成：每个 run 开头调用一次，一个 `BEGIN IMMEDIATE`、每条草稿一个 SAVEPOINT（试跑后 ROLLBACK TO），最后 ROLLBACK 整个事务——一次 run 只争一次写锁，不改变任何行。于是：任务已被归类、正文已被人改、目标 Direction 已 abandoned 的挂起提议都不再挡新 run——否则没有拒绝路由（Q6）时，一条过期提议会永久挡住它的目标。
+- **去重（L3）**：触发时跳过已有**仍然有效**挂起提议的目标。「仍然有效」= 现在对那条挂起提议重跑提交前校验的第 1–3 步能通过。由 `AiSink::precheck(cap, &[ProposalDraft]) -> Vec<bool>` **批量**完成：每个 run 开头调用一次，一个 `BEGIN IMMEDIATE`、每条草稿一个 SAVEPOINT（试跑后 ROLLBACK TO），最后 ROLLBACK 整个事务——一次 run 只争一次写锁，不改变任何行。于是：任务已被归类、正文已被人改、目标 Direction 已 abandoned 的挂起提议都不再挡新 run——否则没有拒绝路由（Q6）时，一条过期提议会永久挡住它的目标。**各能力可以在本节「仍然有效」的基础上收紧，见各自小节**（T5.4.1 实现时补，2026-09-24 review L-c）：
+  - **classify**：去重不区分挂起提议的来源——人类直接提交的一条同目标 `AssignTaskDirection` 提议，只要仍然有效，**照样挡住** AI 的再分类。这是**有意的**：人对同一个任务已经有一条挂起的分类判断时，不该让 AI 再提一条可能冲突的（两条都指向同一个 inbox 任务，接受一条就会让另一条在 accept 时因为 `NotInInbox` 而失败——避免这个竞争，比"只挡 AI 自己产出的"更保守也更安全，且分类这个能力的挂起提议本来就该只有一条）。
+  - **propose**：T5.4.1 走的是相反的口径——去重**只认 AI 自己产出的提议**（§11.4.3 自己的小节详述），人类/automation 直接提交的同形状提议不挡 AI。两个能力选了不同的口径，都是有意的：分类的挂起提议本来就该唯一，人类提交的一条已经"占住"了这个任务，AI 没有必要（也不应该）再抢着提一条冲突的；而 propose 一次周期里人和 AI 都可能各自调整 carry/reorder/create，人类的手工调整不该被当成"AI 已经处理过"从而拦住 AI 继续给建议。
 
 #### 11.4.1 classify（T5.2.1）
 
@@ -834,6 +837,15 @@ T5.1.1 对 `ClientError` 的配套改动（在 adapter 里）：加 `Unavailable
 - **非法建议在提交时被拒、不半应用**：每条提议先过 §11.4 公共的提交前校验（含 `apply_op` 试跑），所以「引用不存在/不在该周的任务的 `ReorderTasks`」「重复顺延」在 `submit` 就被拒、不写任何行（J21，确定断言）；accept 仍是单事务。
 - **事件 payload（M2，§2 #25）**：T5.4.1 同时给 `CreateTasks` 与 `CarryOverTask` 的 `task.created` payload **只加字段** `direction_id`（`CarryOverTask` 取源任务的归属），让 §11.2.1 的重放规则第 2 条对 propose 产出的任务成立。
 - **已知小瑕疵**：先批 reorder、再批 carry，顺延进来的任务 `sort_key = 0` 与排第一的并列（R9）。
+- **去重只认 AI 自己产出的提议（T5.4.1 实现时补，统筹设计澄清，第 2 轮 M-2）**：§11.4 公共「去重」检查的「仍然有效的挂起提议」范围限定为**这个能力自己产出的**——判据是 `sin90_ai_calls.proposal_id` 关联且 `task_kind = propose`（§11.4 公共「提议形状」原文：「是不是 AI 产出以 `sin90_ai_calls.proposal_id` 关联为准，J24」），**不是** `id` 前缀（`"ai-propose-<ulid>"` 只为人类可读，人类或 automation key 经 `POST /proposals` 直接提交时可以自选任意 id，包括恰好长得像这个前缀的）。人类或 automation key 直接提交的同形状提议（哪怕 carry/reorder/create 形状、覆盖范围都一样）**永远不挡** AI 的去重判断——按定义它们不在 `sin90_ai_calls` 里留痕。
+- **三类去重的粒度不同**：carry 是「按任务剔除」——已被某条仍然有效的挂起 carry 提议覆盖的源任务从候选集里去掉，其余未覆盖的源任务照常候选；reorder 与 create 是「整类跳过」——一旦判定为仍然有效，本轮直接不产出、不提交，不看候选内容。
+- **去重的 reorder 「仍然有效」判据（T5.4.1 实现时补，统筹设计澄清）**：不能只看 `AiSink::precheck` 的试跑结果——`precheck` 只验证挂起提议引用的任务确实在该周（关系约束），一个只覆盖 W 部分非终态任务的**旧**排序提议也能通过试跑，但已经不是「当前该怎么排」的正确答案。因此「仍然有效」在 precheck 通过之外，**额外要求**该挂起提议的 `order`（作为集合）恰好等于 W 当前全部非终态任务的 id 集合；**多一个、少一个都不算**「仍然有效」，会被当作过期提议放行本轮重新产出。这条判据**只看集合本身**，不看集合内任务的状态变化——一个仍在挂起提议 `order` 里的任务哪怕状态从 `planned` 变成了 `in_progress`（只要没离开非终态集合），并不会单独让这条挂起提议失效，这是有意接受的（§11.9 残余风险的同一类取舍：判据成本与精确度的折中）。
+- **去重的 create 「仍然有效」判据（T5.4.1 实现时补，统筹设计澄清，第 2 轮 M-2）**：precheck 通过之外，**额外要求**该挂起提议引用的**每一个** `direction_id` 仍然是**当前**的缺口 Direction——非终态、当前 rhythm 配额 `pct > 0`、W 里仍然没有它的任务；三者任一不满足（最典型：Direction 被 abandon/achieved），这条挂起提议就不再算「仍然有效」，本轮可以重新产出。
+- **一步多提议的 token 记账（T5.4.1 实现时补，统筹设计澄清）**：propose 一次决策（一次模型调用或一次 reflex 兜底）可能同时拆成 carry/reorder/create 至多三条独立提议，各自铸造自己的 `sin90_ai_calls` 行；若三行都各自完整记录 `prompt_tokens`/`completion_tokens`/`latency_ms`，会把**本 run 这一次模型调用的用量**重复计 2-3 遍——正确规则是**本 run 所有模型调用用量之和，每次调用只计一次**。做法：三条里**只有第一条被尝试提交的**（carry 优先于 reorder 优先于 create，按本节枚举顺序；因内容为空或被去重跳过而未被尝试的不算「尝试」）保留真实的 `prompt_tokens`/`completion_tokens`/`latency_ms`；其余兄弟行一律置 `NULL`/`NULL`/`0`，无论该行最终是 `ok=1` 还是被 `submit` 拒绝——即便发生部分被拒（`ok=1` 与 `rejected_by_precheck` 混合）的情况，也按同一条「首行保留、余下清零」规则处理，不因某一行被拒而重新指定谁是「首行」。按 `run_id` 对 `sin90_ai_calls.prompt_tokens` 求和应等于该次模型调用的真实用量，不是它的整数倍。**被拒首行的落地同样依赖 `record_call` 的尽力而为语义，但不是 R6 本身**（T5.4.1 实现时补，2026-09-24 review L-e）：§11.3.5 的 R6 限定的是**非产出步**的 `record_call`；被拒的首行原本是一次**真产出**的决策，只是 `submit` 的试跑事后判它不能落地，才被改写成失败记录——这里共享的是 R6 同一条「`record_call` 失败只 `warn!`、不阻断 run」的姿态，不是 R6 本条判据的适用范围本身。这一行万一因为 `record_call` 自己失败而丢失，是已知且接受的降级，不是这条 token 规则的例外。
+
+**决策已经产出、但三类都没有被尝试**（T5.4.1 实现时补，2026-09-24 review L-e，按代码真实条件表述）时，记恰好一行 `ok=1`、`proposal_id = NULL`、**保留** `prompt_tokens`/`completion_tokens`/`latency_ms`（真实值，不清零——它是且仅是这次决策的唯一一行，谈不上「首行/兄弟行」）。「三类都没有被尝试」不等于「三类各自内容都是空的」——三个原因各自独立、可以任意组合：carry 本身无候选可挑、reorder 算出来和 W 当前顺序相同、create 本身没有新任务；**或者** reorder/create 被去重整类跳过（`dedup.skip_reorder`/`dedup.skip_create` 为真）。只要三类各自因为其中某个原因都没有走到提交这一步，就记这一行。
+
+这与 L-4 的短路场景不同（且更早发生）：L-4 是**去重后 carry 候选为空、且 `skip_reorder`、`skip_create` 都为真**这三个条件**同时**成立时，`run_propose` 在决策产生**之前**就直接返回结果——不跑引擎梯、不调模型、连这一行 `ok=1` 的调用记录都不写，是比"决策已产出但都不用提交"更早、更彻底的短路。
 
 ### 11.5 结构约束：AI 模块只能提议（T5.1.1）
 
