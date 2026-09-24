@@ -28,6 +28,8 @@ $EDITOR domain-os.yml     # 改 name / route_namespace / event_module / data_dir
 cargo test
 ```
 
+每个 PR 由 `.github/workflows/ci.yml` 在 ubuntu + macos 上自动跑 `cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` / `cargo test`（挂载黑盒 `#[ignore]`，不进 CI）。
+
 写你自己的 OS：读 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md)，它按「现在能定的」和「必须等的」分开讲。
 
 ---
