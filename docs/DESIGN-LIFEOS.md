@@ -128,7 +128,7 @@ manifest 的 `impl_kind: out_of_process_provider` 必须**同时**带 `spawn: {c
 | 3 | 加 `Project` 层 | **改造** | 不做独立实体，用 `Task.parent_task_id` 自引用表达（Project = 有子任务的 Task）。理由：Project 与 Task 的生命周期状态几乎完全重合（backlog/planned/in_progress/done/dropped），一条自引用列换掉一整套实体。**复审触发条件**：出现 Project 独有且 Task 上放不下的字段（预算、干系人、里程碑）。 |
 | 4 | 加 `Execution` 实体 | **拒绝（已满足）** | `ScheduleBlock` 的 `planned→started→completed/skipped` 就是"实际发生"，`attention` 回放已经从 block 完成事件算 actual。加 `Execution` 是开第二套账，两套账必然对不上。 |
 | 5 | 加 `Review` 环节 | **已满足** | `Review{kind: daily/weekly/rhythm, status: draft/finalized}` 内核已有实体与状态机，只缺路由（M4 补）。 |
-| 6 | Rhythm 细分 `Routine` | **采纳** | 现有 `Rhythm` 只表达"Direction 间的注意力配额"（`Vec<Alloc>`），表达不了"每周 3 次 ×30 分钟"。`Routine` 是重复发生的执行模板，与 Rhythm 正交，不是它的子类。M3。 |
+| 6 | Rhythm 细分 `Routine` | **采纳** | 现有 `Rhythm` 只表达"Direction 间的注意力配额"（`Vec<Alloc>`），表达不了"每周 3 次 ×30 分钟"。`Routine` 是重复发生的执行模板，与 Rhythm 正交，不是它的子类；触发规则是 `cron` + `tz`（IANA 时区名，缺省 `UTC`——cron 本身不含时区，DST 边界必须显式）。M3。 |
 | 7 | Rhythm 细分 `ScheduleBlock` | **已满足** | 内核已有，含状态机与三条路由。 |
 | 8 | Rhythm 细分 `ReviewCycle` | **拒绝** | 复盘周期 = `Routine{kind: review}` + 已有的 `Review` 实体。第三个对象没有新增表达力。 |
 | 9 | Rhythm 细分 `Reminder` | **拒绝** | 提醒是内核 `agent24-scheduler` 的职责。Sin90 只在 `Routine` 上声明触发规则（cron 表达式），经 `sin90_outbox` 幂等对账落到内核。自建 Reminder 实体 = 重写内核已有的调度器。 |
@@ -175,7 +175,7 @@ Area（永久容器，无生命周期）
 | 实体 | 核心字段 | 状态机 |
 |---|---|---|
 | `Area` | `id, title, slug, sort_key, status, created_at, updated_at` | `active / archived`（两态，`active→archived→active` 均合法——归档一个人生领域再捡回来是正常的） |
-| `Routine`（M3） | `id, area_id?, direction_id?, title, kind(deep_work/exercise/review/read/other), cron, target_count, target_minutes, status` | `active / paused / retired` |
+| `Routine`（M3） | `id, area_id?, direction_id?, title, kind(deep_work/exercise/review/read/other), cron, tz(IANA，缺省 UTC), target_count, target_minutes, status` | `active / paused / retired` |
 
 **沿用内核（不改语义）**
 
@@ -207,7 +207,7 @@ CreateTask   { title, direction_id?, parent_task_id?, kind?, energy?, est_minute
 | 表 | 关键列 | 新/旧 |
 |---|---|---|
 | `sin90_areas` | `id PK, title, slug UNIQUE, sort_key, status, created_at, updated_at` | **新** |
-| `sin90_routines`（M3） | `id PK, area_id FK, direction_id FK, title, kind, cron, target_count, target_minutes, status, created_at, updated_at` | **新** |
+| `sin90_routines`（M3） | `id PK, area_id FK, direction_id FK, title, kind, cron, tz, target_count, target_minutes, status, created_at, updated_at` | **新** |
 | `sin90_directions` | + `area_id TEXT REFERENCES sin90_areas(id)` | 加列 |
 | `sin90_tasks` | + `parent_task_id TEXT REFERENCES sin90_tasks(id)`，+ `idx_sin90_task_parent` | 加列 |
 | `sin90_events` | `entity` 值域扩 `area` / `routine`；schema 不变 | 值域扩展 |

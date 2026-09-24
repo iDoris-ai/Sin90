@@ -17,6 +17,7 @@ pub type RhythmId = String;
 pub type ScheduleBlockId = String;
 pub type ReviewId = String;
 pub type AreaId = String;
+pub type RoutineId = String;
 
 // ---------------------------------------------------------------------------
 // Status enums (each has a state machine in `transitions.rs`)
@@ -85,6 +86,31 @@ pub enum RhythmStatus {
 pub enum ReviewStatus {
     Draft,
     Finalized,
+}
+
+/// New (design §2 #6, §3.2): a repeating execution template ("run every
+/// weekday at 7am"), orthogonal to `Rhythm` (Rhythm allocates attention
+/// *across* Directions; Routine is "do X on this cron"). `active <-> paused`
+/// is a two-way door (pausing a routine for a trip and resuming it later is
+/// normal); `retired` is the one-way exit — see `transitions.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutineStatus {
+    Active,
+    Paused,
+    Retired,
+}
+
+/// New (design §2 #6, §3.2): what kind of recurring activity a `Routine`
+/// represents. Descriptive, not a state machine (parallels `TaskKind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutineKind {
+    DeepWork,
+    Exercise,
+    Review,
+    Read,
+    Other,
 }
 
 /// Persistent proposal lifecycle (backs `sin90_proposals.status`); its state
@@ -234,6 +260,105 @@ pub struct Review {
     pub updated_at: String,
 }
 
+/// New (design §2 #6, §3.2, M3): a repeating execution template. `area_id`
+/// and `direction_id` are both optional and independent — a routine may hang
+/// off neither, either, or (rarely) both. `cron` is a bare 5-field expression
+/// (no seconds field, no embedded timezone — `tz` carries that) in the `cron`
+/// crate's OWN dialect, which is NOT POSIX: its day-of-week field is
+/// `1=Sun..7=Sat`, not POSIX's `0/7=Sun,1=Mon` (T3.1.1 review, "H1") — see
+/// `core::util::validate_cron`'s doc comment for why that means digits are
+/// refused there and only `*`/weekday names are accepted. This cron string
+/// is what eventually becomes `ScheduleSpec::Cron.expr` once T3.3.1's outbox
+/// upserts it into the kernel scheduler — Sin90 itself never computes a next
+/// firing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Routine {
+    pub id: RoutineId,
+    pub area_id: Option<AreaId>,
+    pub direction_id: Option<DirectionId>,
+    pub title: String,
+    pub kind: RoutineKind,
+    pub cron: String,
+    /// IANA timezone name (e.g. `"America/New_York"`); defaults to `"UTC"`.
+    pub tz: String,
+    pub target_count: Option<u32>,
+    pub target_minutes: Option<u32>,
+    pub status: RoutineStatus,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// The wire/store shape for creating a [`Routine`] (T3.1.1 review, "M2").
+/// `deny_unknown_fields`: this is client input (eventually the body of
+/// `POST /routines`, T3.1.2), so a stray/mistyped key must fail loudly, not
+/// silently drop it (same convention as [`Alloc`]/[`NewTask`]). `tz` is a
+/// single `Option`, unlike [`RoutinePatch`]'s: on CREATE there is no existing
+/// value to preserve, so "absent" can only ever mean "use the default
+/// (`UTC`)" — the absent-vs-null distinction only matters when a value could
+/// already be set, which is PATCH's problem, not POST's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewRoutine {
+    pub title: String,
+    #[serde(default)]
+    pub area_id: Option<AreaId>,
+    #[serde(default)]
+    pub direction_id: Option<DirectionId>,
+    pub kind: RoutineKind,
+    pub cron: String,
+    #[serde(default)]
+    pub tz: Option<String>,
+    #[serde(default)]
+    pub target_count: Option<u32>,
+    #[serde(default)]
+    pub target_minutes: Option<u32>,
+}
+
+/// The wire/store shape for a partial `Routine` update (T3.1.1 review, "M2";
+/// eventually `PATCH /routines/{id}`, T3.1.2). Status changes are NOT part of
+/// this shape — those go through the transition endpoint/`RoutineStatus`
+/// argument instead (design §3.2's `active⇄paused→retired` machine, not a
+/// field to overwrite).
+///
+/// Every field is `None` by default (an absent JSON key), meaning "leave
+/// this field unchanged" — a `RoutinePatch::default()` therefore updates
+/// nothing (`store::repo`'s L1: a no-op patch writes no event and does not
+/// touch `updated_at`). `target_count`/`target_minutes` are double
+/// `Option`s specifically so a `PATCH` body can tell "key absent" (`None`,
+/// don't touch) apart from `"target_count": null` (`Some(None)`, clear the
+/// column) apart from `"target_count": 3` (`Some(Some(3))`, set it) — see
+/// [`deserialize_double_option`].
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RoutinePatch {
+    pub title: Option<String>,
+    pub cron: Option<String>,
+    pub tz: Option<String>,
+    #[serde(deserialize_with = "deserialize_double_option")]
+    pub target_count: Option<Option<u32>>,
+    #[serde(deserialize_with = "deserialize_double_option")]
+    pub target_minutes: Option<Option<u32>>,
+}
+
+/// The standard serde "double `Option`" trick: applied to a field already
+/// typed `Option<Option<T>>`, it deserializes the INNER `Option<T>`
+/// normally (so a JSON `null` becomes `None`, a value becomes `Some(v)`) and
+/// wraps the result in `Some` — meaning this function only ever runs when
+/// the key was present at all. Paired with `#[serde(default)]` (on the
+/// field or, as here, the whole struct), a MISSING key keeps the outer
+/// `None` that `default()` set, never reaching this function. No extra
+/// crate (e.g. `serde_with`) needed — this is the same few-line pattern
+/// that crate's `serde_with::rust::double_option` module wraps.
+fn deserialize_double_option<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -262,6 +387,14 @@ mod tests {
             serde_json::to_string(&AreaStatus::Archived).unwrap(),
             "\"archived\""
         );
+        assert_eq!(
+            serde_json::to_string(&RoutineStatus::Retired).unwrap(),
+            "\"retired\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RoutineKind::DeepWork).unwrap(),
+            "\"deep_work\""
+        );
     }
 
     #[test]
@@ -270,5 +403,40 @@ mod tests {
         let j = serde_json::to_string(&s).unwrap();
         let back: TaskStatus = serde_json::from_str(&j).unwrap();
         assert_eq!(s, back);
+    }
+
+    #[test]
+    fn routine_patch_absent_key_leaves_none_and_unknown_key_is_rejected() {
+        let empty: RoutinePatch = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, RoutinePatch::default());
+        assert_eq!(empty.target_count, None);
+
+        let err = serde_json::from_str::<RoutinePatch>(r#"{"nope": 1}"#).unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    /// M2's whole point: a `PATCH` body must be able to tell "key absent"
+    /// (don't touch), `"target_count": null` (clear it), and
+    /// `"target_count": 3` (set it) apart — three JSON shapes, three
+    /// distinct `Option<Option<u32>>` values.
+    #[test]
+    fn routine_patch_double_option_distinguishes_absent_null_and_set() {
+        let absent: RoutinePatch = serde_json::from_str(r#"{"title":"x"}"#).unwrap();
+        assert_eq!(absent.target_count, None);
+
+        let cleared: RoutinePatch = serde_json::from_str(r#"{"target_count": null}"#).unwrap();
+        assert_eq!(cleared.target_count, Some(None));
+
+        let set: RoutinePatch = serde_json::from_str(r#"{"target_count": 3}"#).unwrap();
+        assert_eq!(set.target_count, Some(Some(3)));
+    }
+
+    #[test]
+    fn new_routine_rejects_unknown_fields() {
+        let err = serde_json::from_str::<NewRoutine>(
+            r#"{"title":"x","kind":"other","cron":"* * * * *","oops":true}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
     }
 }

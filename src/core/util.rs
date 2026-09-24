@@ -6,6 +6,7 @@
 //! chronological; ULIDs are lexically sortable by creation time).
 
 use rand::RngCore;
+use std::str::FromStr;
 
 pub fn ulid() -> String {
     const B32: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
@@ -114,6 +115,87 @@ pub fn canonical_iso_week(s: &str) -> Option<String> {
     Some(format!("{year:04}-W{week:02}"))
 }
 
+/// Validate a `Routine.cron` expression (design §3.2, M3) the same way
+/// Agent24's `agent24-scheduler` validates a `ScheduleSpec::Cron.expr`
+/// (`agent24-scheduler/src/next_fire.rs::normalize_cron`/`validate`): exactly
+/// 5 fields (`min hour dom month dow`, no seconds, no embedded year), checked
+/// by prepending a `0` seconds field and parsing with the `cron` crate.
+/// Sin90 never computes a next firing itself — that's the kernel scheduler's
+/// job once T3.3.1's outbox upserts this string — so this is syntax
+/// validation only, not a semantic "will this ever fire" check.
+///
+/// **H1 (T3.1.1 review)**: the day-of-week field is deliberately NOT POSIX.
+/// The `cron` crate this validator and the kernel scheduler both link
+/// (pinned in `Cargo.toml` — must move in lockstep with theirs) numbers
+/// weekdays `1..=7` with **`1 = Sunday`**
+/// (`cron-0.15.0/src/time_unit/days_of_week.rs::ordinal_from_name`'s
+/// `sun|sunday => 1`), not POSIX's `0` (or `7`) `= Sunday, 1 = Monday`. The
+/// exact same digit range therefore means a DIFFERENT set of days depending
+/// on which convention the person typing it has in their head —
+/// `"0 7 * * 1-5"`, read as POSIX "weekdays", is actually Sun..Thu here, a
+/// silent one-day-early bug that would only surface as "why did this fire on
+/// Sunday". So this validator refuses ANY digit in the day-of-week field
+/// outright and accepts only `*` or the English weekday names the crate
+/// itself parses case-insensitively (`mon`/`monday` .. `sun`/`sunday`, with
+/// ranges like `MON-FRI` and lists like `MON,WED,FRI`) — a name means the
+/// same day under either convention, so it can never be silently
+/// misinterpreted.
+pub fn validate_cron(expr: &str) -> Result<(), String> {
+    let fields: Vec<&str> = expr.split_whitespace().collect();
+    if fields.len() != 5 {
+        return Err(format!(
+            "cron must have exactly 5 fields (min hour dom month dow), got {}: {expr:?}",
+            fields.len()
+        ));
+    }
+    let dow = fields[4];
+    if dow.chars().any(|c| c.is_ascii_digit()) {
+        return Err(format!(
+            "day-of-week field must be '*' or weekday names (mon..sun, e.g. \
+             MON-FRI or MON,WED,FRI) — digits are ambiguous between POSIX \
+             (0/7=Sun, 1=Mon) and this cron crate's own 1=Sun..7=Sat \
+             ordinals, got {dow:?} in {expr:?}"
+        ));
+    }
+    // M4 (scheduler-callback design review, written into spec.md): when
+    // BOTH the day-of-month (field 2) and day-of-week (field 4) are
+    // restricted (neither is `*`), this `cron` crate ANDs them —
+    // `cron-0.15.0/src/schedule.rs:117-125` iterates candidate
+    // `day_of_month`s and then `continue`s past any that don't ALSO match
+    // `days_of_week`. POSIX cron ORs the same two fields in that situation
+    // (run on day-of-month 1 OR every Monday, whichever comes first) — the
+    // opposite semantics from the same string. `"0 7 1 * MON"` would read,
+    // under POSIX, as "7am on the 1st AND every Monday"; under this crate it
+    // silently becomes "7am on whichever Mondays happen to fall on the 1st"
+    // (i.e. almost never). Rather than pick a meaning, this validator
+    // refuses the ambiguous case outright: at least one of dom/dow must be
+    // `*`. (`validate_cron` does not special-case "dow names" here: this
+    // check runs on the raw field text, so a still-digit-bearing dow would
+    // already have been rejected above, and a `*` dow always passes.)
+    let dom = fields[2];
+    if dom != "*" && dow != "*" {
+        return Err(format!(
+            "day-of-month and day-of-week must not both be restricted (this \
+             cron crate ANDs them where POSIX ORs them — the same string \
+             would mean two different schedules); make one of them '*', \
+             got dom={dom:?} dow={dow:?} in {expr:?}"
+        ));
+    }
+    let normalized = format!("0 {expr}");
+    cron::Schedule::from_str(&normalized)
+        .map_err(|e| format!("invalid cron expression {expr:?}: {e}"))?;
+    Ok(())
+}
+
+/// Validate an IANA timezone name (`Routine.tz`, design §3.2 — defaults to
+/// `"UTC"`). A bare `TEXT` column has no way to enforce this at the SQLite
+/// level, so it's checked here before every write that sets `tz`.
+pub fn validate_tz(tz: &str) -> Result<(), String> {
+    chrono_tz::Tz::from_str(tz)
+        .map(|_| ())
+        .map_err(|_| format!("unknown IANA timezone: {tz:?}"))
+}
+
 fn iso_weeks_in_year(year: u32) -> u32 {
     let y = year - 1;
     // Day of week of Jan 1 (Gregorian), 0 = Sunday.
@@ -188,5 +270,110 @@ mod tests {
             "2026-09-22T00:00:00Z"
         );
         assert!(is_fixed_iso8601(&day_start_utc(now, &plus7)));
+    }
+
+    #[test]
+    fn routine_validate_cron_accepts_5_field_expressions_with_star_weekday() {
+        assert!(validate_cron("*/15 * * * *").is_ok());
+        assert!(validate_cron("0 7 * * *").is_ok());
+    }
+
+    #[test]
+    fn routine_validate_cron_rejects_wrong_field_count_and_garbage() {
+        for bad in [
+            "",
+            "0 7 * *",       // 4 fields
+            "0 0 7 * * MON", // 6 fields (seconds not accepted from a Routine)
+            // 5 whitespace-separated tokens, so it PASSES the field-count
+            // check — the point of this case is that `cron::Schedule` itself
+            // must still reject "not"/"a"/"cron"/"at" as field expressions.
+            "not a cron at all",
+        ] {
+            assert!(validate_cron(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    /// H1 (T3.1.1 review): a digit in the day-of-week field is ALWAYS
+    /// rejected, regardless of whether it happens to be in-range for this
+    /// crate's `1..=7` ordinals — `"0 7 * * 1-5"` reads as "weekdays" under
+    /// POSIX but is Sun..Thu under this crate's `1=Sun` convention, so
+    /// there's no way to accept it without silently picking one meaning.
+    #[test]
+    fn routine_validate_cron_rejects_any_digit_in_day_of_week() {
+        for bad in [
+            "0 7 * * 1-5",   // POSIX reads this as weekdays; this crate as Sun..Thu
+            "0 7 * * 1,3,5", // same ambiguity via a list
+            "0 7 * * 0",     // POSIX Sunday; not a valid ordinal at all here (0 is out of 1..=7)
+            "0 7 * * 7",     // POSIX Sunday-as-7; this crate's Saturday — opposite days
+            "99 99 99 99 99",
+        ] {
+            assert!(validate_cron(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn routine_validate_cron_accepts_weekday_abbreviations_ranges_and_lists() {
+        assert!(validate_cron("0 7 * * MON").is_ok());
+        assert!(validate_cron("0 7 * * MON-FRI").is_ok());
+        assert!(validate_cron("0 7 * * MON,WED,FRI").is_ok());
+        // Case-insensitive: matches the `cron` crate's own
+        // `name.to_lowercase()` in `ordinal_from_name`.
+        assert!(validate_cron("0 7 * * mon-fri").is_ok());
+        assert!(validate_cron("0 7 * * Sun,Sat").is_ok());
+    }
+
+    /// M4 (scheduler-callback design review): this `cron` crate ANDs a
+    /// restricted day-of-month with a restricted day-of-week
+    /// (`cron-0.15.0/src/schedule.rs:117-125`), where POSIX ORs them — the
+    /// same string means two different schedules depending on which
+    /// convention the reader has in mind, so both restricted at once is
+    /// rejected outright. Positive controls: either field alone restricted
+    /// (the other `*`) is accepted.
+    #[test]
+    fn routine_validate_cron_rejects_both_dom_and_dow_restricted() {
+        assert!(validate_cron("0 7 1 * MON").is_err());
+        assert!(validate_cron("0 7 1 * *").is_ok());
+        assert!(validate_cron("0 7 * * MON").is_ok());
+    }
+
+    /// H1's actual payoff: prove the accepted named form fires on the
+    /// weekday it says, not on whatever a shifted digit ordinal would mean.
+    /// Fixed starting point (a known Saturday) — deliberately NOT
+    /// `Utc::now()`/`Schedule::upcoming`, which reads the wall clock and
+    /// would make this test's outcome depend on what day it happens to run;
+    /// `Schedule::after(&fixed_start)` is the crate's own "same as
+    /// `upcoming`, but you name the start instant" method.
+    #[test]
+    fn routine_named_weekday_range_fires_on_the_intended_weekday() {
+        use chrono::{Datelike, TimeZone, Weekday};
+
+        // 2026-01-10 is a Saturday (verified independently via `date`/python,
+        // not derived from this code).
+        let start = chrono::Utc.with_ymd_and_hms(2026, 1, 10, 12, 0, 0).unwrap();
+        let schedule = cron::Schedule::from_str("0 0 7 * * MON-FRI").unwrap();
+        let next = schedule
+            .after(&start)
+            .next()
+            .expect("a weekday schedule always has a next fire");
+        assert_eq!(
+            next.weekday(),
+            Weekday::Mon,
+            "got {next}, expected a Monday"
+        );
+        assert_eq!(
+            next.date_naive(),
+            chrono::NaiveDate::from_ymd_opt(2026, 1, 12).unwrap(),
+            "next weekday fire after Saturday 2026-01-10 must be Monday 2026-01-12"
+        );
+    }
+
+    #[test]
+    fn routine_validate_tz_accepts_iana_names_and_rejects_everything_else() {
+        assert!(validate_tz("UTC").is_ok());
+        assert!(validate_tz("America/New_York").is_ok());
+        assert!(validate_tz("Asia/Shanghai").is_ok());
+        for bad in ["", "Not/AZone", "GMT+8", "UTC+8", "shanghai"] {
+            assert!(validate_tz(bad).is_err(), "{bad:?} must be rejected");
+        }
     }
 }

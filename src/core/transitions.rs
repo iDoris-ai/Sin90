@@ -10,8 +10,8 @@
 //! a one-way door).
 
 use crate::core::types::{
-    AreaStatus, DirectionStatus, ProposalStatus, ReviewStatus, RhythmStatus, ScheduleBlockStatus,
-    TaskStatus, WeekStatus,
+    AreaStatus, DirectionStatus, ProposalStatus, ReviewStatus, RhythmStatus, RoutineStatus,
+    ScheduleBlockStatus, TaskStatus, WeekStatus,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -46,6 +46,11 @@ pub enum TransitionError {
     Review {
         from: ReviewStatus,
         to: ReviewStatus,
+    },
+    #[error("illegal routine transition: {from:?} -> {to:?}")]
+    Routine {
+        from: RoutineStatus,
+        to: RoutineStatus,
     },
 }
 
@@ -255,6 +260,37 @@ pub fn review_is_terminal(s: ReviewStatus) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Routine (M3, design §2 #6, §3.2): active <-> paused (both edges legal —
+// pausing/resuming a routine is a normal, repeatable action, same shape as
+// Area); active|paused -> retired is the one-way exit. Unlike Rhythm's
+// `adjusted -> adjusted` self-loop, Routine has no self-loop: an edit that
+// doesn't change status is `update_routine`, not a transition.
+// ---------------------------------------------------------------------------
+
+pub fn routine_transition_allowed(from: RoutineStatus, to: RoutineStatus) -> bool {
+    use RoutineStatus::*;
+    matches!(
+        (from, to),
+        (Active, Paused) | (Paused, Active) | (Active, Retired) | (Paused, Retired)
+    )
+}
+
+pub fn check_routine_transition(
+    from: RoutineStatus,
+    to: RoutineStatus,
+) -> Result<(), TransitionError> {
+    if routine_transition_allowed(from, to) {
+        Ok(())
+    } else {
+        Err(TransitionError::Routine { from, to })
+    }
+}
+
+pub fn routine_is_terminal(s: RoutineStatus) -> bool {
+    matches!(s, RoutineStatus::Retired)
+}
+
+// ---------------------------------------------------------------------------
 // Proposal lifecycle: pending → applying → applied ; {pending, applying} →
 // rejected. The store CLAIMS pending → applying with a CAS; a failed apply
 // rolls the whole tx back (an implicit return to pending), which is a database
@@ -325,6 +361,11 @@ mod tests {
         RhythmStatus::Retired,
     ];
     const REVIEW_ALL: [ReviewStatus; 2] = [ReviewStatus::Draft, ReviewStatus::Finalized];
+    const ROUTINE_ALL: [RoutineStatus; 3] = [
+        RoutineStatus::Active,
+        RoutineStatus::Paused,
+        RoutineStatus::Retired,
+    ];
 
     #[test]
     fn area_matrix_both_edges_legal() {
@@ -476,6 +517,41 @@ mod tests {
     }
 
     #[test]
+    fn routine_matrix() {
+        use RoutineStatus::*;
+        let legal = [
+            (Active, Paused),
+            (Paused, Active),
+            (Active, Retired),
+            (Paused, Retired),
+        ];
+        let mut count = 0;
+        for from in ROUTINE_ALL {
+            for to in ROUTINE_ALL {
+                let expected = legal.contains(&(from, to));
+                assert_eq!(
+                    routine_transition_allowed(from, to),
+                    expected,
+                    "({from:?} -> {to:?})"
+                );
+                assert_eq!(check_routine_transition(from, to).is_ok(), expected);
+                if expected {
+                    count += 1;
+                }
+            }
+        }
+        assert_eq!(count, legal.len());
+        // Retired is terminal: no outgoing edges, including the illegal
+        // retired -> active the task explicitly calls out.
+        for to in ROUTINE_ALL {
+            assert!(!routine_transition_allowed(Retired, to));
+        }
+        assert!(routine_is_terminal(Retired));
+        assert!(!routine_is_terminal(Active));
+        assert!(!routine_is_terminal(Paused));
+    }
+
+    #[test]
     fn proposal_matrix() {
         use ProposalStatus::*;
         const ALL: [ProposalStatus; 4] = [Pending, Applying, Applied, Rejected];
@@ -527,6 +603,13 @@ mod tests {
         for s in RHYTHM_ALL {
             if rhythm_is_terminal(s) {
                 assert!(RHYTHM_ALL.iter().all(|&t| !rhythm_transition_allowed(s, t)));
+            }
+        }
+        for s in ROUTINE_ALL {
+            if routine_is_terminal(s) {
+                assert!(ROUTINE_ALL
+                    .iter()
+                    .all(|&t| !routine_transition_allowed(s, t)));
             }
         }
     }
