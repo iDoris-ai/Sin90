@@ -18,8 +18,8 @@ Agent24 的 ME-3 专项（进程外领域 OS）已于 2026-09-20 整体收口：
 |---|---|
 | 业务半边（HTTP 路由 + 自己的存储） | ✅ 能写，形状已定 |
 | 作为 `out_of_process_provider` 被 Agent24 装载 | ✅ **通道已通** —— 内核不再硬拒 out-of-process 包 |
-| 握手 / 回调通道（`initialize`、事件上报） | ✅ 协议已定稿并有实测形状；⚠️ **但没有 Rust SDK**，本仓要自己实现（见下） |
-| 本仓库的 `src/*` | ⚠️ 仍是**桩** —— 真正的实现来自 Agent24 内核的 `agent24-sin90{,-store,-os}` 搬家，M0 的事 |
+| 握手 / 回调通道（`initialize`、事件上报） | ✅ 已在 `src/adapter_agent24/mod.rs` 自己实现；⚠️ **仍没有 Rust SDK**（见下） |
+| 本仓库的 `src/*` | ✅ 不再是桩 —— `core/store/http/adapter_agent24` 四层已齐备，M0/M1/M2 已合入（见 `DESIGN-LIFEOS.md` 进度表） |
 
 ## 进程外模块的对接契约（实测形状，2026-09-20）
 
@@ -49,14 +49,13 @@ manifest 双向规则在 `rust/crates/agent24-domain/src/lib.rs` 的 `match (raw
 
 **`agent24-os-sdk` 这个 crate 今天不存在。** Agent24 的 T13（模块侧 SDK）与 T14（wire 文档 + 非 Rust 参考实现）都未开工——`ls rust/crates | grep os-sdk` 空。
 
-所以本仓的 `src/handshake.rs` 不再是"等协议定稿"，而是"协议已定稿、要么自己实现要么等 SDK"。
-[`DESIGN-LIFEOS.md`](DESIGN-LIFEOS.md) §7.2 把这条列为开放问题，倾向**自己实现**（约 200 行），
-因为 `src/adapter_agent24/` 这一层已经把返工范围钉死在一个目录里。
+本仓已经选择**自己实现**（而不是等 SDK）：`src/adapter_agent24/mod.rs`（约 450 行）已经实现了
+`initialize` 握手与事件上报，返工范围也如预期地钉死在这一个目录里。
 
 跟踪：Agent24 `docs/agent/PLAN-OOP-OS-AND-BACKLOG.md` 的 T13 / T14。
 
 ## 下一刀
 
-**M0：可加载的最基础个人 OS**——验收标准见 [`DESIGN-LIFEOS.md`](DESIGN-LIFEOS.md) §6。
-对应 Agent24 计划表的 **T11**（Sin90 迁出内核 → 独立仓库，七条路由行为不变）。
+M0/M1/M2 已合入 main。**下一刀是 M3（Routine & Rhythm）**——进度与阻塞见
+[`DESIGN-LIFEOS.md`](DESIGN-LIFEOS.md) 顶部的进度表。
 </content>
