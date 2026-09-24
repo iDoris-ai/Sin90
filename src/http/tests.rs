@@ -761,8 +761,8 @@ async fn today_carry_over_candidates_are_in_progress_tasks_started_before_today(
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
-    // Backdate it to yesterday (UTC) — a real day boundary, not a sleep.
-    crate::store::test_hooks::set_task_created_at(&store, old_id, "2020-01-01T00:00:00Z")
+    // Backdate when it STARTED — a real day boundary, not a sleep.
+    crate::store::test_hooks::set_task_started_at(&store, old_id, "2020-01-01T00:00:00Z")
         .await
         .unwrap();
 
@@ -1354,4 +1354,163 @@ async fn week_labels_are_validated_canonicalized_and_unique() {
     );
     let weeks = body_json(app.oneshot(get_req("/weeks")).await.unwrap()).await;
     assert_eq!(weeks["weeks"].as_array().unwrap().len(), 1);
+}
+
+// ============================================================================
+// Codex 2026-09-22 review — carry-over (Medium #8, #9)
+// ============================================================================
+
+/// Medium #8: the rule used `created_at`, so a months-old backlog item
+/// started TODAY was immediately offered as carry-over.
+#[tokio::test]
+async fn an_old_task_started_today_is_not_a_carry_over_candidate() {
+    let (app, _sink, store) = test_app_with_store().await;
+    let direction = body_json(
+        app.clone()
+            .oneshot(human_req(
+                "POST",
+                "/directions",
+                json!({"title": "d", "target_window": "2026-Q4"}),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let task = body_json(
+        app.clone()
+            .oneshot(human_req(
+                "POST",
+                "/tasks",
+                json!({"title": "old backlog item", "direction_id": direction["id"]}),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let id = task["id"].as_str().unwrap();
+    crate::store::test_hooks::set_task_created_at(&store, id, "2020-01-01T00:00:00Z")
+        .await
+        .unwrap();
+    for to in ["planned", "in_progress"] {
+        assert_eq!(
+            app.clone()
+                .oneshot(human_req(
+                    "PATCH",
+                    &format!("/tasks/{id}"),
+                    json!({"to": to})
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+    let today = body_json(app.clone().oneshot(get_req("/today")).await.unwrap()).await;
+    assert!(
+        today["carry_over_candidates"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "started today → not a carry-over candidate, however old: {today}"
+    );
+
+    // Control: once its start is on an earlier day, it IS a candidate.
+    crate::store::test_hooks::set_task_started_at(&store, id, "2020-01-02T00:00:00Z")
+        .await
+        .unwrap();
+    let today = body_json(app.oneshot(get_req("/today")).await.unwrap()).await;
+    assert_eq!(today["carry_over_candidates"][0]["id"], id);
+}
+
+/// Medium #9: the carried copy hard-coded kind=other, energy=mid,
+/// est_minutes=NULL, parent_task_id=NULL.
+#[tokio::test]
+async fn carry_over_keeps_kind_energy_estimate_and_project() {
+    let (app, _sink) = test_app().await;
+    let (direction_id, _week1) = area_direction_and_open_week(&app).await;
+    let project = body_json(
+        app.clone()
+            .oneshot(human_req(
+                "POST",
+                "/tasks",
+                json!({"title": "project", "direction_id": direction_id}),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let child = body_json(
+        app.clone()
+            .oneshot(human_req(
+                "POST",
+                "/tasks",
+                json!({
+                    "title": "write the design", "direction_id": direction_id,
+                    "parent_task_id": project["id"], "kind": "deep_work",
+                    "energy": "high", "est_minutes": 90
+                }),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let child_id = child["id"].as_str().unwrap().to_string();
+    // Only planned/in-progress work can be carried over (transition matrix).
+    assert_eq!(
+        app.clone()
+            .oneshot(human_req(
+                "PATCH",
+                &format!("/tasks/{child_id}"),
+                json!({"to": "planned"})
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let week2 = body_json(
+        app.clone()
+            .oneshot(human_req("POST", "/weeks", json!({"iso_week": "2026-W43"})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let submit = app
+        .clone()
+        .oneshot(automation_proposal(json!({
+            "id": "p-carry-meta", "status": "pending", "source": "local_brain",
+            "ops": [{"op": "carry_over_task", "task_id": child_id, "to_week": week2["id"]}],
+            "rationale": null
+        })))
+        .await
+        .unwrap();
+    assert_eq!(submit.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        app.clone()
+            .oneshot(accept_req("p-carry-meta"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let tasks = body_json(
+        app.oneshot(get_req(&format!("/tasks?direction_id={direction_id}")))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let new = tasks["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["carried_from"] == child_id.as_str())
+        .expect("the carried copy exists");
+    assert_eq!(new["kind"], "deep_work");
+    assert_eq!(new["energy"], "high");
+    assert_eq!(new["est_minutes"], 90);
+    assert_eq!(
+        new["parent_task_id"], project["id"],
+        "stays in the same project"
+    );
+    assert_eq!(new["week_id"], week2["id"]);
 }

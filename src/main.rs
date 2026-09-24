@@ -94,7 +94,7 @@ async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .any(|p| "_a24/events/emit".starts_with(p.as_str()) || p.starts_with("_a24/events/"))
     {
-        Arc::new(KernelEventSink(Arc::new(channel)))
+        Arc::new(KernelEventSink::spawn(Arc::new(channel)))
     } else {
         // Not granted events — degrade, don't fail (design §5.3).
         tracing::warn!("sin90: events not offered by kernel; running with events dropped");

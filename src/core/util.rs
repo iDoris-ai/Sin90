@@ -56,6 +56,22 @@ pub fn now_iso8601() -> String {
     iso8601_at(epoch_secs())
 }
 
+/// Start of the user's current local day, as a fixed-width UTC timestamp
+/// comparable with event `at` values. "Local" is the system timezone (`TZ`,
+/// which Agent24 passes to modules, else `/etc/localtime`); a personal OS's
+/// "today" is the user's calendar day, not UTC's.
+pub fn local_day_start_utc() -> String {
+    day_start_utc(jiff::Timestamp::now(), &jiff::tz::TimeZone::system())
+}
+
+pub(crate) fn day_start_utc(now: jiff::Timestamp, tz: &jiff::tz::TimeZone) -> String {
+    let start = now
+        .to_zoned(tz.clone())
+        .start_of_day()
+        .expect("every civil day has a start");
+    start.timestamp().strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
 /// A fixed-width `YYYY-MM-DDThh:mm:ssZ` (20 chars) — the exact shape
 /// [`now_iso8601`] stamps events with, so a lexical window compare is
 /// chronological. Deliberately not a full RFC3339 parser: we only need to
@@ -158,5 +174,19 @@ mod tests {
         ] {
             assert!(canonical_iso_week(bad).is_none(), "{bad} must be rejected");
         }
+    }
+
+    #[test]
+    fn day_start_follows_the_local_calendar_day_not_utc() {
+        let now: jiff::Timestamp = "2026-09-22T20:00:00Z".parse().unwrap();
+        // 03:00 on Sep 23 in UTC+7: the local day began at 17:00 UTC on Sep 22.
+        let plus7 = jiff::tz::TimeZone::fixed(jiff::tz::offset(7));
+        assert_eq!(day_start_utc(now, &plus7), "2026-09-22T17:00:00Z");
+        // Control: in UTC it is still Sep 22.
+        assert_eq!(
+            day_start_utc(now, &jiff::tz::TimeZone::UTC),
+            "2026-09-22T00:00:00Z"
+        );
+        assert!(is_fixed_iso8601(&day_start_utc(now, &plus7)));
     }
 }

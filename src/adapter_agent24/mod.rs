@@ -24,6 +24,13 @@ use crate::http::EventSink;
 /// NDJSON frame bound (design/`docs/STATUS.md`: matches Agent24's
 /// `agent24_os_proto::frame::MAX_FRAME_BYTES`).
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
+/// Upper bound on one callback round trip (reconnect, or write + read the
+/// reply). A kernel that accepts but never answers must not wedge the event
+/// worker — and with it every later event — forever.
+const DEFAULT_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Events waiting for the worker. Past this, new events are dropped and
+/// counted rather than buffered without bound.
+const DEFAULT_EVENT_QUEUE: usize = 1024;
 
 /// This module's declared protocol range. `min == max == 1`: Sin90 speaks
 /// exactly the one version `me3f_blackbox.rs` exercises; there is nothing yet
@@ -105,6 +112,7 @@ pub struct CallbackChannel {
     module: String,
     manifest_bytes: Vec<u8>,
     auth_token: String,
+    io_timeout: std::time::Duration,
 }
 
 impl CallbackChannel {
@@ -126,6 +134,7 @@ impl CallbackChannel {
                 module: module.to_string(),
                 manifest_bytes: manifest_bytes.to_vec(),
                 auth_token: auth_token.to_string(),
+                io_timeout: DEFAULT_IO_TIMEOUT,
             },
             provides,
         ))
@@ -140,17 +149,20 @@ impl CallbackChannel {
     pub async fn emit(&self, kind: &str, payload: Map<String, Value>) {
         let mut conn = self.conn.lock().await;
         if conn.is_none() {
-            match connect_and_initialize(
+            let reconnect = connect_and_initialize(
                 &self.sock_path,
                 &self.module,
                 &self.manifest_bytes,
                 &self.auth_token,
-            )
-            .await
-            {
-                Ok((reader, _provides)) => *conn = Some(reader),
-                Err(e) => {
+            );
+            match tokio::time::timeout(self.io_timeout, reconnect).await {
+                Ok(Ok((reader, _provides))) => *conn = Some(reader),
+                Ok(Err(e)) => {
                     tracing::warn!(error = %e, kind, "sin90: could not reconnect to emit events/emit");
+                    return;
+                }
+                Err(_) => {
+                    tracing::warn!(kind, "sin90: reconnect for events/emit timed out");
                     return;
                 }
             }
@@ -169,27 +181,38 @@ impl CallbackChannel {
         // trusted (we don't know how much of a frame the kernel received, or
         // whether the reader's position matches a frame boundary) — drop the
         // connection so the NEXT `emit()` reconnects rather than continuing
-        // to read a desynced stream.
+        // to read a desynced stream. A timeout counts: the late reply would
+        // otherwise be read as the answer to the next request.
         let reader = conn.as_mut().expect("just ensured Some above");
-        if let Err(e) = write_frame(reader.get_mut(), &req).await {
-            tracing::warn!(error = %e, kind, "sin90: failed to write events/emit frame");
-            *conn = None;
-            return;
-        }
-        match read_frame(reader).await {
-            Ok(line) => match serde_json::from_slice::<Value>(&line) {
-                Ok(resp) => {
-                    if let Some(err) = resp.get("error") {
-                        tracing::warn!(kind, ?err, "sin90: events/emit rejected by kernel");
-                    }
+        let round_trip = async {
+            write_frame(reader.get_mut(), &req).await?;
+            read_frame(reader).await
+        };
+        let line = match tokio::time::timeout(self.io_timeout, round_trip).await {
+            Ok(Ok(line)) => line,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, kind, "sin90: events/emit round trip failed");
+                *conn = None;
+                return;
+            }
+            Err(_) => {
+                tracing::warn!(kind, "sin90: events/emit timed out");
+                *conn = None;
+                return;
+            }
+        };
+        match serde_json::from_slice::<Value>(&line) {
+            Ok(resp) if resp["id"].as_str() != Some(id.as_str()) => {
+                tracing::warn!(kind, sent = %id, got = %resp["id"], "sin90: events/emit reply id mismatch");
+                *conn = None;
+            }
+            Ok(resp) => {
+                if let Some(err) = resp.get("error") {
+                    tracing::warn!(kind, ?err, "sin90: events/emit rejected by kernel");
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, kind, "sin90: events/emit response was not valid JSON");
-                    *conn = None;
-                }
-            },
+            }
             Err(e) => {
-                tracing::warn!(error = %e, kind, "sin90: no response to events/emit");
+                tracing::warn!(error = %e, kind, "sin90: events/emit response was not valid JSON");
                 *conn = None;
             }
         }
@@ -249,16 +272,59 @@ async fn connect_and_initialize(
 
 /// Adapts [`CallbackChannel`] to [`crate::http::EventSink`]. `http` never
 /// sees this type — only the trait.
-pub struct KernelEventSink(pub Arc<CallbackChannel>);
+///
+/// One worker drains a bounded queue, so events reach the kernel in the order
+/// they were emitted and a stalled kernel costs at most the queue, not one
+/// suspended task per mutation (Codex 2026-09-22 review, Medium #6). When the
+/// queue is full the event is dropped and counted — events are best-effort by
+/// design (§5.3), a committed write must not wait on them.
+pub struct KernelEventSink {
+    tx: tokio::sync::mpsc::Sender<(String, Map<String, Value>)>,
+    dropped: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl KernelEventSink {
+    /// Must be called inside a Tokio runtime (spawns the worker).
+    pub fn spawn(chan: Arc<CallbackChannel>) -> Self {
+        Self::with_capacity(chan, DEFAULT_EVENT_QUEUE)
+    }
+
+    pub fn with_capacity(chan: Arc<CallbackChannel>, capacity: usize) -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, Map<String, Value>)>(capacity);
+        tokio::spawn(async move {
+            while let Some((kind, payload)) = rx.recv().await {
+                chan.emit(&kind, payload).await;
+            }
+        });
+        Self {
+            tx,
+            dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// Events dropped so far because the queue was full (or the worker gone).
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 impl EventSink for KernelEventSink {
     fn emit(&self, kind: &str, payload: Map<String, Value>) {
-        let chan = self.0.clone();
-        let kind = kind.to_string();
-        // Fire-and-forget: `EventSink::emit` is a sync trait method called from
-        // inside an async handler that must not block on the callback round
-        // trip for the HTTP response itself (design §5.3's "degrade, don't
-        // fail" — the caller's write already committed).
-        tokio::spawn(async move { chan.emit(&kind, payload).await });
+        if self.tx.try_send((kind.to_string(), payload)).is_err() {
+            let n = self
+                .dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            // Log the 1st, 2nd, 4th, 8th... drop: visible, but a stalled
+            // kernel can't turn this into a log flood.
+            if n.is_power_of_two() {
+                tracing::warn!(
+                    kind,
+                    dropped_total = n,
+                    "sin90: event queue full, dropping event"
+                );
+            }
+        }
     }
 }
 
@@ -437,6 +503,86 @@ mod tests {
             chan.conn.lock().await.is_none(),
             "emit() against a hung-up connection must clear `conn`, not leave a desynced reader in place for the next call to reuse"
         );
+    }
+
+    /// A kernel that completes the handshake, then reads every later frame
+    /// and never answers — reporting each received method on `seen`.
+    async fn silent_kernel(
+        sock_path: &std::path::Path,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<String> {
+        let listener = tokio::net::UnixListener::bind(sock_path).unwrap();
+        let (seen_tx, seen) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut buf = Vec::new();
+            reader.read_until(b'\n', &mut buf).await.unwrap();
+            let req: Value = serde_json::from_slice(&buf).unwrap();
+            let resp = json!({
+                "jsonrpc": "2.0", "id": req["id"],
+                "result": { "protocol_version": 1, "offer": { "provides": ["_a24/events/"] } }
+            });
+            let mut bytes = serde_json::to_vec(&resp).unwrap();
+            bytes.push(b'\n');
+            reader.get_mut().write_all(&bytes).await.unwrap();
+            loop {
+                buf.clear();
+                if reader.read_until(b'\n', &mut buf).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                let req: Value = serde_json::from_slice(&buf).unwrap();
+                let _ = seen_tx.send(req["method"].as_str().unwrap_or_default().to_string());
+            }
+        });
+        seen
+    }
+
+    /// Medium #6: a kernel that accepts but never replies used to hold the
+    /// connection mutex forever. The round trip is now bounded and the
+    /// connection is dropped so a late reply can't be misread later.
+    #[tokio::test]
+    async fn emit_times_out_and_drops_the_connection_when_the_kernel_never_replies() {
+        let dir = tempdir();
+        let sock_path = dir.join("cb.sock");
+        let _seen = silent_kernel(&sock_path).await;
+        let (mut chan, _) = CallbackChannel::handshake(&sock_path, "sin90", b"x", "t")
+            .await
+            .unwrap();
+        chan.io_timeout = std::time::Duration::from_millis(100);
+        let started = std::time::Instant::now();
+        chan.emit("test.silent", Map::new()).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "emit must give up after its timeout, took {:?}",
+            started.elapsed()
+        );
+        assert!(chan.conn.lock().await.is_none());
+    }
+
+    /// Medium #6: every mutation used to spawn its own task, each waiting
+    /// behind the stuck one. Now one worker and a bounded queue: overflow is
+    /// dropped and counted.
+    #[tokio::test]
+    async fn event_queue_is_bounded_and_counts_drops_while_the_kernel_is_stuck() {
+        let dir = tempdir();
+        let sock_path = dir.join("cb.sock");
+        let mut seen = silent_kernel(&sock_path).await;
+        let (chan, _) = CallbackChannel::handshake(&sock_path, "sin90", b"x", "t")
+            .await
+            .unwrap();
+        let sink = KernelEventSink::with_capacity(Arc::new(chan), 4);
+
+        // First event: wait until the kernel has it, so the worker is known
+        // to be parked inside that (never-answered) round trip.
+        sink.emit("e0", Map::new());
+        assert_eq!(seen.recv().await.as_deref(), Some("_a24/events/emit"));
+
+        for i in 1..=14 {
+            sink.emit(&format!("e{i}"), Map::new());
+        }
+        assert_eq!(sink.dropped(), 10, "4 queued, the other 10 dropped");
+        // Positive control: nothing else reached the kernel while it's stuck.
+        assert!(seen.try_recv().is_err());
     }
 
     fn tempdir() -> std::path::PathBuf {

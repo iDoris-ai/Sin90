@@ -185,6 +185,20 @@ pub mod test_hooks {
         Ok(())
     }
 
+    /// Backdate when a task last moved into `in_progress` (its transition
+    /// event's `at`) — what `today_view`'s carry-over rule keys off.
+    pub async fn set_task_started_at(store: &Sin90Store, id: &str, at: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE sin90_events SET at = ?
+             WHERE entity = 'task' AND entity_id = ? AND to_state = 'in_progress'",
+        )
+        .bind(at)
+        .bind(id)
+        .execute(store.pool())
+        .await?;
+        Ok(())
+    }
+
     pub async fn proposal_status(store: &Sin90Store, id: &str) -> Result<Option<String>> {
         Ok(
             sqlx::query("SELECT status FROM sin90_proposals WHERE id = ?")
