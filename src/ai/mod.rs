@@ -107,6 +107,7 @@
 pub mod classify;
 pub mod ladder;
 pub mod ports;
+pub mod propose;
 
 // `self::`-prefixed, not bare (`use ladder::…`): the boundary checker
 // (`tests/ai_boundary.rs`, J7) deliberately does not trust a bare `use`
