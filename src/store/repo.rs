@@ -1131,14 +1131,56 @@ impl Sin90Store {
     /// identical: re-submitting the same id with a DIFFERENT batch is a
     /// `Conflict`, not a silent no-op that would later apply the stale ops the
     /// caller thinks they replaced.
+    ///
+    /// SFU-10: a genuinely NEW submission is validated against a snapshot of
+    /// current state (same `build_snapshot` + `validate` pair `apply_proposal`
+    /// uses) BEFORE anything is written — a structurally invalid batch never
+    /// lands as a `pending` row; the caller gets 422 (`StoreError::Proposal`)
+    /// and the store is untouched. `accept`/`apply_proposal` still re-runs
+    /// `validate` against the state AT APPLY TIME: this submit-time check is a
+    /// strict, additional gate, not a replacement — state referenced here
+    /// (e.g. a week's open/closed status) can legitimately change between
+    /// submit and accept, and only the apply-time check is allowed to decide
+    /// the outcome that actually commits.
+    ///
+    /// An idempotent REPLAY (same id, same ops already stored) is intentionally
+    /// NOT re-validated here: it was already validated (successfully) the
+    /// first time it was submitted, this call writes nothing new, and
+    /// re-validating a batch that was already accepted as `pending` against
+    /// possibly-drifted state would make a pure idempotency check start
+    /// failing for reasons unrelated to the replay itself.
     pub async fn submit_proposal(&self, p: &Sin90Proposal) -> Result<()> {
         let now = now_iso8601();
         let ops_json = serde_json::to_string(&p.ops)?;
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
-        let affected = sqlx::query(
+
+        let existing: Option<String> = sqlx::query("SELECT ops FROM sin90_proposals WHERE id = ?")
+            .bind(&p.id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(|r| r.get::<String, _>("ops"));
+
+        match existing {
+            Some(existing_ops) if existing_ops == ops_json => {
+                // Idempotent replay: identical batch already persisted (and
+                // already validated, on its first submission). No-op.
+                return Ok(());
+            }
+            Some(_) => {
+                return Err(StoreError::Conflict(format!(
+                    "proposal {} already exists with different ops",
+                    p.id
+                )));
+            }
+            None => {
+                let snapshot = build_snapshot(&mut tx, &p.ops).await?;
+                validate(p, &snapshot)?; // Err -> tx drops -> rollback -> nothing written
+            }
+        }
+
+        sqlx::query(
             "INSERT INTO sin90_proposals (id, status, source, ops, rationale, created_at)
-             VALUES (?, 'pending', ?, ?, ?, ?)
-             ON CONFLICT(id) DO NOTHING",
+             VALUES (?, 'pending', ?, ?, ?, ?)",
         )
         .bind(&p.id)
         .bind(to_wire(&p.source)?)
@@ -1146,22 +1188,7 @@ impl Sin90Store {
         .bind(&p.rationale)
         .bind(&now)
         .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        if affected == 0 {
-            let existing: String = sqlx::query("SELECT ops FROM sin90_proposals WHERE id = ?")
-                .bind(&p.id)
-                .fetch_one(&mut *tx)
-                .await?
-                .get("ops");
-            if existing != ops_json {
-                return Err(StoreError::Conflict(format!(
-                    "proposal {} already exists with different ops",
-                    p.id
-                )));
-            }
-            return Ok(());
-        }
+        .await?;
         append_event(
             &mut tx,
             "proposal",

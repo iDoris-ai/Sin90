@@ -36,8 +36,14 @@ pub struct NewTask {
 }
 
 /// One atomic change. A proposal is an ordered batch of these.
+///
+/// `deny_unknown_fields` (SFU-9): on an internally tagged enum (`tag = "op"`)
+/// this attribute placed on the enum itself IS honored per-variant by serde —
+/// confirmed by a standalone repro (`/tmp/serde_probe`) against this repo's
+/// serde version before relying on it here; there is no need to duplicate the
+/// attribute on each variant's fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Sin90Op {
     /// New (design §3.3): an AI-proposed Area. Direct creation (used by the
     /// human-facing HTTP route) does not go through this — only the AI path
@@ -726,6 +732,94 @@ mod tests {
     fn deny_unknown_fields_on_new_task() {
         let err = serde_json::from_str::<NewTask>(r#"{"title":"x","typo":1}"#);
         assert!(err.is_err(), "unknown field must be rejected");
+    }
+
+    /// SFU-9: `Sin90Op` is internally tagged (`tag = "op"`); serde's
+    /// `deny_unknown_fields` on that enum IS honored per-variant (confirmed
+    /// with a standalone repro against this repo's serde version — see the
+    /// doc comment on `Sin90Op`). Table-driven so every one of the 8 variants
+    /// is independently pinned: an 9th op added later that forgets a field
+    /// in its legal shape here fails loudly at `cases.len()`, not silently.
+    #[test]
+    fn deny_unknown_fields_covers_every_sin90_op_variant() {
+        let cases: Vec<(&str, serde_json::Value)> = vec![
+            (
+                "create_area",
+                serde_json::json!({"op": "create_area", "title": "Work"}),
+            ),
+            (
+                "create_task",
+                serde_json::json!({
+                    "op": "create_task",
+                    "title": "x",
+                    "direction_id": null,
+                    "parent_task_id": null,
+                    "kind": null,
+                    "energy": null,
+                    "est_minutes": null
+                }),
+            ),
+            (
+                "create_direction",
+                serde_json::json!({
+                    "op": "create_direction",
+                    "title": "x",
+                    "target_window": "2026-Q4"
+                }),
+            ),
+            (
+                "transition_task",
+                serde_json::json!({"op": "transition_task", "task_id": "t1", "to": "in_progress"}),
+            ),
+            (
+                "create_tasks",
+                serde_json::json!({
+                    "op": "create_tasks",
+                    "week_id": "w1",
+                    "tasks": [{"title": "x", "direction_id": null}]
+                }),
+            ),
+            (
+                "reorder_tasks",
+                serde_json::json!({"op": "reorder_tasks", "week_id": "w1", "order": ["t1", "t2"]}),
+            ),
+            (
+                "adjust_rhythm",
+                serde_json::json!({
+                    "op": "adjust_rhythm",
+                    "rhythm_id": "r1",
+                    "new_alloc": [{"direction_id": "d1", "pct": 50}]
+                }),
+            ),
+            (
+                "carry_over_task",
+                serde_json::json!({"op": "carry_over_task", "task_id": "t1", "to_week": "w2"}),
+            ),
+        ];
+
+        assert_eq!(cases.len(), 8, "must cover every Sin90Op variant");
+
+        for (op_name, good) in cases {
+            // Positive control: the clean shape parses as the expected op.
+            let parsed: Sin90Op = serde_json::from_value(good.clone())
+                .unwrap_or_else(|e| panic!("{op_name}: legal shape must parse, got {e}"));
+            let round = serde_json::to_value(&parsed).unwrap();
+            assert_eq!(
+                round["op"], op_name,
+                "{op_name}: op tag round-trip mismatch"
+            );
+
+            // The assertion: adding one unknown field must be rejected.
+            let mut bad = good;
+            bad.as_object_mut()
+                .unwrap()
+                .insert("typo_field".into(), serde_json::json!(1));
+            let err = serde_json::from_value::<Sin90Op>(bad);
+            assert!(
+                err.is_err(),
+                "{op_name}: an unknown field must be rejected, got {err:?}"
+            );
+        }
     }
 
     #[test]

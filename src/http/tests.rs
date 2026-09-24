@@ -478,6 +478,136 @@ async fn automation_can_submit_but_not_accept_its_own_proposal() {
     assert_eq!(areas["areas"].as_array().unwrap().len(), 1);
 }
 
+// ---- SFU-10: submit_proposal validates before persisting -------------------
+
+/// SFU-10: a proposal with no ops is structurally invalid (`ProposalError::
+/// Empty`). This used to be caught only at accept time (the proposal landed
+/// as `pending` and only failed later); it must now be caught at SUBMIT time,
+/// with nothing persisted.
+#[tokio::test]
+async fn submit_proposal_with_no_ops_is_422_and_nothing_is_persisted() {
+    let (app, _sink) = test_app().await;
+    let resp = app
+        .clone()
+        .oneshot(automation_proposal(json!({
+            "id": "p-empty", "status": "pending", "source": "local_brain",
+            "ops": [], "rationale": null
+        })))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Nothing was persisted — the id must not exist at all, not even `pending`.
+    let get = app
+        .clone()
+        .oneshot(get_req("/proposals/p-empty"))
+        .await
+        .unwrap();
+    assert_eq!(get.status(), StatusCode::NOT_FOUND);
+}
+
+/// SFU-10: an op referencing an entity that does not exist (`ProposalError::
+/// UnknownEntity` — the class `apply_proposal` used to be the ONLY place that
+/// caught) is also rejected at submit time.
+#[tokio::test]
+async fn submit_proposal_referencing_an_unknown_task_is_422_and_nothing_is_persisted() {
+    let (app, _sink) = test_app().await;
+    let resp = app
+        .clone()
+        .oneshot(automation_proposal(json!({
+            "id": "p-ghost", "status": "pending", "source": "local_brain",
+            "ops": [{"op": "transition_task", "task_id": "ghost", "to": "in_progress"}],
+            "rationale": null
+        })))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let get = app
+        .clone()
+        .oneshot(get_req("/proposals/p-ghost"))
+        .await
+        .unwrap();
+    assert_eq!(get.status(), StatusCode::NOT_FOUND);
+}
+
+/// SFU-10: a blank-title `create_area` op (`ProposalError::BlankField`,
+/// structural — no DB lookup needed to catch it) is also caught at submit
+/// time.
+#[tokio::test]
+async fn submit_proposal_with_a_blank_title_op_is_422_and_nothing_is_persisted() {
+    let (app, _sink) = test_app().await;
+    let resp = app
+        .clone()
+        .oneshot(automation_proposal(json!({
+            "id": "p-blank", "status": "pending", "source": "local_brain",
+            "ops": [{"op": "create_area", "title": "   "}], "rationale": null
+        })))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let get = app
+        .clone()
+        .oneshot(get_req("/proposals/p-blank"))
+        .await
+        .unwrap();
+    assert_eq!(get.status(), StatusCode::NOT_FOUND);
+}
+
+/// Positive control for the three tests above: a structurally legal proposal
+/// still gets 202 and lands as `pending` — submit-time validation must not be
+/// stricter than the existing (accept-time) rule it reuses.
+#[tokio::test]
+async fn submit_proposal_that_is_structurally_valid_is_still_202() {
+    let (app, _sink) = test_app().await;
+    let resp = app
+        .clone()
+        .oneshot(automation_proposal(json!({
+            "id": "p-valid", "status": "pending", "source": "local_brain",
+            "ops": [{"op": "create_area", "title": "Health"}], "rationale": null
+        })))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    let get = body_json(
+        app.clone()
+            .oneshot(get_req("/proposals/p-valid"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(get["status"], "pending");
+}
+
+/// A rejected (invalid) submission never lands, so re-submitting the exact
+/// same id+ops afterward is NOT the "idempotent replay" path — there is
+/// nothing stored to replay against, so it is validated again and rejected
+/// again (not silently accepted, and not a spurious `Conflict`).
+#[tokio::test]
+async fn resubmitting_the_same_invalid_proposal_is_422_again_not_a_silent_conflict() {
+    let (app, _sink) = test_app().await;
+    let body = json!({
+        "id": "p-empty2", "status": "pending", "source": "local_brain",
+        "ops": [], "rationale": null
+    });
+    for _ in 0..2 {
+        let resp = app
+            .clone()
+            .oneshot(automation_proposal(body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    let get = app
+        .clone()
+        .oneshot(get_req("/proposals/p-empty2"))
+        .await
+        .unwrap();
+    assert_eq!(get.status(), StatusCode::NOT_FOUND);
+}
+
 // ---- Area archive/reactivate round-trip (design §3.2: both edges legal) ----
 
 #[tokio::test]
