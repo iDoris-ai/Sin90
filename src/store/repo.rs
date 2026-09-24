@@ -12,11 +12,11 @@
 use std::collections::HashMap;
 
 use crate::core::{
-    check_area_transition, check_rhythm_transition, check_schedule_block_transition,
-    check_task_transition, check_week_transition, now_iso8601, ulid, validate, week_is_open, Area,
-    AreaStatus, Direction, DirectionStatus, Energy, ProposalSource, ProposalStatus, RhythmStatus,
-    ScheduleBlock, ScheduleBlockStatus, Sin90Op, Sin90Proposal, Task, TaskKind, TaskStatus,
-    ValidationCtx, Week, WeekStatus,
+    check_alloc, check_area_transition, check_rhythm_transition, check_schedule_block_transition,
+    check_task_transition, check_week_transition, now_iso8601, ulid, validate, week_is_open, Alloc,
+    Area, AreaStatus, Direction, DirectionStatus, Energy, ProposalSource, ProposalStatus, Rhythm,
+    RhythmStatus, ScheduleBlock, ScheduleBlockStatus, Sin90Op, Sin90Proposal, Task, TaskKind,
+    TaskStatus, ValidationCtx, Week, WeekStatus,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -119,6 +119,19 @@ fn row_to_task(r: sqlx::sqlite::SqliteRow) -> Result<Task> {
         energy: from_wire(&r.get::<String, _>("energy"))?,
         est_minutes: r.get::<Option<i64>, _>("est_minutes").map(|m| m as u32),
         carried_from: r.get("carried_from"),
+        created_at: r.get("created_at"),
+        updated_at: r.get("updated_at"),
+    })
+}
+
+/// Shared row→`Rhythm` mapping for `list_rhythms`/`get_rhythm`/`create_rhythm`'s
+/// read-back — `allocations` is stored as a JSON `TEXT` column (migration
+/// 0001), so this is the one place that (de)serializes it.
+fn row_to_rhythm(r: sqlx::sqlite::SqliteRow) -> Result<Rhythm> {
+    Ok(Rhythm {
+        id: r.get("id"),
+        status: from_wire(&r.get::<String, _>("status"))?,
+        allocations: serde_json::from_str(&r.get::<String, _>("allocations"))?,
         created_at: r.get("created_at"),
         updated_at: r.get("updated_at"),
     })
@@ -368,6 +381,68 @@ impl Sin90Store {
             title: title.to_string(),
             status: DirectionStatus::Draft,
             target_window: target_window.to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+        })
+    }
+
+    /// `POST /rhythms` (spec.md "Rhythm 路由", T3.4.1) — direct write, human
+    /// gate: creating a Rhythm is a planning-ritual action, same convention as
+    /// `create_area`/`create_direction`/`create_week`.
+    ///
+    /// Structural checks (non-empty, pct range, duplicate direction, sum <=
+    /// 100) are `core::check_alloc` — the SAME function `AdjustRhythm`'s pure
+    /// `validate` calls (Opus 2026-09-23 review H1: the two paths used to
+    /// each carry their own, divergent copy) — run BEFORE the transaction so
+    /// a structurally bad request never takes the write lock, and mapped to
+    /// `Invalid` (400) here instead of the `Proposal` variant `?` would give
+    /// (422, the AdjustRhythm path's code — direct writes use 400 for a
+    /// validation failure everywhere else in this file).
+    ///
+    /// Direction existence is checked INSIDE the transaction by
+    /// `require_directions_exist` — again the SAME helper `AdjustRhythm`'s
+    /// apply arm calls — and reported as `NotFound` (404), consistent with
+    /// `create_task`/`create_block`'s "referenced entity does not exist" 404
+    /// convention (Opus 2026-09-23 review M2; this used to be a 400 here,
+    /// diverging from that convention).
+    ///
+    /// Adjusting an existing Rhythm does NOT go through this store method —
+    /// only `Sin90Op::AdjustRhythm` via `POST /proposals` + human accept does
+    /// (design §7.1's proposal gate; T3.4.1 adds no new Op and no direct
+    /// adjust route).
+    pub async fn create_rhythm(&self, allocations: &[Alloc]) -> Result<Rhythm> {
+        check_alloc(allocations).map_err(|e| StoreError::Invalid(e.to_string()))?;
+
+        let id = ulid();
+        let now = now_iso8601();
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        require_directions_exist(&mut tx, allocations).await?;
+        sqlx::query(
+            "INSERT INTO sin90_rhythms (id, status, allocations, created_at, updated_at)
+             VALUES (?, 'active', ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(serde_json::to_string(allocations)?)
+        .bind(&now)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        append_event(
+            &mut tx,
+            "rhythm",
+            &id,
+            "created",
+            None,
+            Some("active"),
+            &json!({"id": id, "status": "active", "allocations": allocations}),
+            &now,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Rhythm {
+            id,
+            status: RhythmStatus::Active,
+            allocations: allocations.to_vec(),
             created_at: now.clone(),
             updated_at: now,
         })
@@ -1020,6 +1095,31 @@ impl Sin90Store {
             .collect()
     }
 
+    pub async fn list_rhythms(&self) -> Result<Vec<Rhythm>> {
+        let rows = sqlx::query(
+            "SELECT id, status, allocations, created_at, updated_at
+             FROM sin90_rhythms
+             ORDER BY created_at DESC, rowid DESC",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter().map(row_to_rhythm).collect()
+    }
+
+    /// One Rhythm by id. A missing id is `NotFound` (→ 404), same shape as
+    /// `get_proposal`.
+    pub async fn get_rhythm(&self, id: &str) -> Result<Rhythm> {
+        let row = sqlx::query(
+            "SELECT id, status, allocations, created_at, updated_at
+             FROM sin90_rhythms WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(self.pool())
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("rhythm {id}")))?;
+        row_to_rhythm(row)
+    }
+
     pub async fn list_blocks(&self) -> Result<Vec<ScheduleBlock>> {
         let rows = sqlx::query(
             "SELECT id, direction_id, task_id, status, planned_minutes, created_at, updated_at
@@ -1391,6 +1491,31 @@ async fn load_rhythm(tx: &mut Tx<'_>, id: &str, snap: &mut DbSnapshot) -> Result
     Ok(())
 }
 
+/// Shared by `Sin90Store::create_rhythm` (direct write) and `AdjustRhythm`'s
+/// apply arm below (Opus 2026-09-23 review H1): every `direction_id` in
+/// `allocations` must reference a live `sin90_directions` row, checked under
+/// the SAME `BEGIN IMMEDIATE` write lock as the insert/update that follows —
+/// not a pure/`ValidationCtx` check (module doc's scope note: existence
+/// against live rows is a relational check, the store's job). A missing
+/// direction is `NotFound` (404), the same "referenced entity does not
+/// exist" convention `create_task`/`create_block` already use.
+async fn require_directions_exist(tx: &mut Tx<'_>, allocations: &[Alloc]) -> Result<()> {
+    for a in allocations {
+        let exists: i64 = sqlx::query("SELECT COUNT(*) AS n FROM sin90_directions WHERE id = ?")
+            .bind(&a.direction_id)
+            .fetch_one(&mut **tx)
+            .await?
+            .get("n");
+        if exists == 0 {
+            return Err(StoreError::NotFound(format!(
+                "direction {}",
+                a.direction_id
+            )));
+        }
+    }
+    Ok(())
+}
+
 async fn apply_op(tx: &mut Tx<'_>, op: &Sin90Op, event_ids: &mut Vec<String>) -> Result<()> {
     let now = now_iso8601();
     match op {
@@ -1586,6 +1711,10 @@ async fn apply_op(tx: &mut Tx<'_>, op: &Sin90Op, event_ids: &mut Vec<String>) ->
             rhythm_id,
             new_alloc,
         } => {
+            // Opus 2026-09-23 review H1: `new_alloc`'s directions must exist,
+            // same as `create_rhythm`'s — checked under this SAME write lock,
+            // via the SAME helper, so the two paths cannot drift apart again.
+            require_directions_exist(tx, new_alloc).await?;
             let from = read_rhythm_status(tx, rhythm_id).await?;
             check_rhythm_transition(from, RhythmStatus::Adjusted)?;
             sqlx::query(
