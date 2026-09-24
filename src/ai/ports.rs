@@ -12,7 +12,7 @@ use std::future::Future;
 
 use serde_json::{Map, Value};
 
-use crate::core::{DirectionId, DirectionStatus, Review, Sin90Op, Task, WeekId};
+use crate::core::{Alloc, DirectionId, DirectionStatus, Review, Sin90Op, Task, Week, WeekId};
 
 // ---------------------------------------------------------------- vocabulary
 
@@ -370,6 +370,20 @@ pub trait AiReadModel: SettingsRead {
         &self,
         limit: u32,
     ) -> impl Future<Output = Result<Vec<DirectionCandidate>, ReadError>> + Send;
+    /// New (T5.4.1, 2026-09-24 review L1): a precise single-id lookup —
+    /// `propose`'s "缺口 Direction" only ever needs to resolve specific ids
+    /// already named by the rhythm's allocation, not a whole capped/ordered
+    /// listing (`direction_candidates`'s 40-ish-candidate cap and
+    /// `updated_at DESC` ordering exist for classify's different "browse
+    /// many, pick one" need, and could silently drop a real allocation
+    /// target past that cap). `Ok(None)` if the id does not exist at all —
+    /// UNLIKE `direction_candidates`, this does NOT itself exclude terminal
+    /// (achieved/abandoned) Directions; the caller decides whether a
+    /// terminal Direction still counts (propose does not).
+    fn direction(
+        &self,
+        id: &DirectionId,
+    ) -> impl Future<Output = Result<Option<DirectionCandidate>, ReadError>> + Send;
     fn title_history(
         &self,
         normalized: &str,
@@ -379,4 +393,27 @@ pub trait AiReadModel: SettingsRead {
         &self,
         week_id: &WeekId,
     ) -> impl Future<Output = Result<Vec<Task>, ReadError>> + Send;
+    /// New (T5.4.1, §11.4.3's "输入"): does this Week exist, and if so its
+    /// status/`iso_week` — `propose`'s target W is checked against this
+    /// (`Ok(None)` → 404; `week_is_open(status)` false → 409).
+    fn week(&self, id: &WeekId) -> impl Future<Output = Result<Option<Week>, ReadError>> + Send;
+    /// New (T5.4.1, §11.4.3's "P", 2026-09-24 review H1): the SINGLE NEAREST
+    /// Week (by `iso_week`, regardless of status) strictly before
+    /// `iso_week` (§11.6/`canonical_iso_week`'s fixed-width `YYYY-Www`
+    /// format makes lexicographic and chronological order coincide) — `Ok`
+    /// with that week ONLY if it is currently OPEN (`week_is_open`).
+    /// `Ok(None)` covers BOTH "no week exists before `iso_week` at all" AND
+    /// "the nearest one exists but is not open" — this does NOT keep
+    /// searching further back for an older still-open week once it finds a
+    /// closed nearest one (§11.4.3: "P 不存在或已关就没有顺延建议" — a
+    /// closed nearest week means there simply is no P, not "look past it").
+    fn previous_open_week(
+        &self,
+        iso_week: &str,
+    ) -> impl Future<Output = Result<Option<Week>, ReadError>> + Send;
+    /// New (T5.4.1, §11.4.3): the CURRENT rhythm's allocation — the most
+    /// recently created `sin90_rhythms` row that is NOT `retired`'s
+    /// `allocations`; an empty `Vec` if no such row exists (§11.4.3: "Rhythm
+    /// 当前配额（非 retired 的最新一条）").
+    fn rhythm_alloc(&self) -> impl Future<Output = Result<Vec<Alloc>, ReadError>> + Send;
 }

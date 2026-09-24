@@ -498,4 +498,80 @@ pub mod test_hooks {
             .await?;
         Ok(())
     }
+
+    // ----- Whole-database snapshot (2026-09-24 review M4: moved here from
+    // `store::ai_port`'s own test module so `ai::propose`'s tests can reuse
+    // it too, instead of keeping a second copy) -----------------------------
+
+    /// Every table in the db, one canonical string per row (SQLite's own
+    /// `quote()` — handles NULL/INTEGER/TEXT/BLOB uniformly), ordered by
+    /// `rowid` so insertion order is stable. Schema-agnostic on purpose: a
+    /// caller must not need to update this every time a column is added
+    /// elsewhere. `sin90_events` is split into TWO keys —
+    /// `entity = 'proposal'` rows and everything else — so a caller can
+    /// assert the narrower, actually-designed claim "only the
+    /// `proposal.submitted` mirror row changed" instead of just "some event,
+    /// somewhere, changed" (`store::ai_port`'s own J8 judgement first needed
+    /// this split; `ai::propose`'s J21 table-diff test reuses it verbatim).
+    pub async fn snapshot_all_tables(
+        pool: &sqlx::SqlitePool,
+    ) -> std::collections::BTreeMap<String, Vec<String>> {
+        let tables: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+             ORDER BY name",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let mut out = std::collections::BTreeMap::new();
+        for t in tables {
+            let cols: Vec<String> =
+                sqlx::query_scalar(&format!("SELECT name FROM pragma_table_info('{t}')"))
+                    .fetch_all(pool)
+                    .await
+                    .unwrap();
+            let expr = cols
+                .iter()
+                .map(|c| format!("quote({c})"))
+                .collect::<Vec<_>>()
+                .join(" || '|' || ");
+            if t == "sin90_events" {
+                for (key, where_clause) in [
+                    ("sin90_events(entity=proposal)", "WHERE entity = 'proposal'"),
+                    (
+                        "sin90_events(entity<>proposal)",
+                        "WHERE entity <> 'proposal'",
+                    ),
+                ] {
+                    let rows: Vec<String> = sqlx::query_scalar(&format!(
+                        "SELECT {expr} AS r FROM {t} {where_clause} ORDER BY rowid"
+                    ))
+                    .fetch_all(pool)
+                    .await
+                    .unwrap();
+                    out.insert(key.to_string(), rows);
+                }
+                continue;
+            }
+            let rows: Vec<String> =
+                sqlx::query_scalar(&format!("SELECT {expr} AS r FROM {t} ORDER BY rowid"))
+                    .fetch_all(pool)
+                    .await
+                    .unwrap();
+            out.insert(t, rows);
+        }
+        out
+    }
+
+    /// The keys whose snapshotted value differs between `before` and `after`.
+    pub fn diff_snapshot_keys(
+        before: &std::collections::BTreeMap<String, Vec<String>>,
+        after: &std::collections::BTreeMap<String, Vec<String>>,
+    ) -> Vec<String> {
+        before
+            .keys()
+            .filter(|k| before.get(*k) != after.get(*k))
+            .cloned()
+            .collect()
+    }
 }

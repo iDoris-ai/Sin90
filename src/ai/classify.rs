@@ -382,7 +382,17 @@ fn build_rationale(engine: Engine, reason: &str) -> String {
 /// (that table is `ai::summarize`'s deliverable, T5.3.1, per design
 /// §11.4.2's `normalize`) — just the characters relevant to a plain-text
 /// rationale string with no markup semantics of its own.
-fn is_cf_format_char(c: char) -> bool {
+///
+/// `pub` (2026-09-24 review, T5.4.1 H2 — plain `pub`, not `pub(crate)`:
+/// `pub(crate)`'s own `Path` is just `crate` with no further segment, which
+/// trips the J7 boundary checker's "a `crate`-rooted path must go through
+/// `core` or `ai`" rule — same convention `normalize_title`/`ItemResult`/
+/// every other cross-module-reused item in this file already uses): `ai::
+/// propose` reuses this SAME function for its own `rationale` and new-task
+/// `title` cleaning rather than keeping a second, driftable copy — a fix to
+/// this table (e.g. widening the bidi-override range) then applies to every
+/// capability that strips Cf characters from AI-produced plain text at once.
+pub fn is_cf_format_char(c: char) -> bool {
     matches!(c as u32,
         0x00AD              // soft hyphen
         | 0x061C            // Arabic letter mark
