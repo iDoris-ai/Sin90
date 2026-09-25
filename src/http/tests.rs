@@ -510,6 +510,441 @@ async fn automation_can_submit_but_not_accept_its_own_proposal() {
     assert_eq!(areas["areas"].as_array().unwrap().len(), 1);
 }
 
+// ---- T5.7.1: POST /proposals/{id}/reject + rejection log -------------------
+
+/// `POST /proposals/{id}/reject`, optional JSON body `{"reason"?: string}`
+/// (`deny_unknown_fields`) — `None`/absent body maps to `reason: None`
+/// (`reject_req(.., None)` sends `Body::empty()`, exactly like `accept_req`).
+fn reject_req(id: &str, key: &str, body: Option<Value>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(format!("/proposals/{id}/reject"))
+        .header("x-sin90-actor-key", key);
+    let body = match body {
+        Some(v) => {
+            builder = builder.header(header::CONTENT_TYPE, "application/json");
+            Body::from(v.to_string())
+        }
+        None => Body::empty(),
+    };
+    builder.body(body).unwrap()
+}
+
+/// Submits a structurally-valid, directly-authored (not AI-produced)
+/// `create_area` proposal with the given id/rationale via the automation
+/// key — the shape every reject test below starts from, since `reject`
+/// itself doesn't care what the ops are, only that the proposal exists and
+/// is `pending`.
+async fn submit_plain_proposal(app: &axum::Router, id: &str, rationale: Option<&str>) {
+    let resp = app
+        .clone()
+        .oneshot(automation_proposal(json!({
+            "id": id, "status": "pending", "source": "local_brain",
+            "ops": [{"op": "create_area", "title": "x"}], "rationale": rationale
+        })))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "setup: submit must succeed"
+    );
+}
+
+/// Positive control + the core judgement: a human rejecting a `pending`
+/// proposal moves it to `rejected`, drops it out of the pending list (so it
+/// can never be `accept`ed or re-block dedup), writes exactly one complete
+/// `sin90_proposal_rejections` row (including `proposal_source` copied
+/// verbatim from the submitted proposal, Opus review M1, and `proposed_at`
+/// equal to the proposal's own `created_at`, Opus review L3), mirrors
+/// exactly one `proposal.rejected` event to `EventSink` carrying
+/// `ops_summary` too (Opus review L1), and appends exactly one INTERNAL
+/// `sin90_events` row (`entity = proposal`, `kind = rejected`, Opus review
+/// L3) — tasks.md T5.7.1's acceptance line, all in one test since they are
+/// one atomic outcome of one call.
+#[tokio::test]
+async fn proposal_reject_by_human_marks_rejected_hides_from_pending_and_logs_and_emits_event() {
+    let (app, sink, store) = test_app_with_store().await;
+    submit_plain_proposal(&app, "p-reject-1", Some("AI thought this was worth doing")).await;
+    // Backdate created_at to a value distinct from "now" — `now_iso8601()`
+    // is second-resolution, so without this a submit-then-reject in the
+    // same test could coincidentally produce identical timestamps and mask
+    // a `proposed_at` bug (see `set_proposal_created_at`'s doc).
+    crate::store::test_hooks::set_proposal_created_at(&store, "p-reject-1", "2020-01-01T00:00:00Z")
+        .await
+        .unwrap();
+    let submitted = store.get_proposal("p-reject-1").await.unwrap();
+    assert_eq!(submitted.created_at, "2020-01-01T00:00:00Z");
+
+    let resp = app
+        .clone()
+        .oneshot(reject_req(
+            "p-reject-1",
+            HUMAN,
+            Some(json!({"reason": "duplicate of an existing Area"})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["id"], "p-reject-1");
+    assert_eq!(body["status"], "rejected");
+
+    // Status is `rejected`...
+    let status = crate::store::test_hooks::proposal_status(&store, "p-reject-1")
+        .await
+        .unwrap();
+    assert_eq!(status.as_deref(), Some("rejected"));
+
+    // ...and gone from the pending list (accept-eligibility AND dedup both
+    // key off this exact query, `repo.rs::list_pending_proposals`).
+    let pending = store.list_pending_proposals().await.unwrap();
+    assert!(
+        pending.iter().all(|p| p.id != "p-reject-1"),
+        "a rejected proposal must not appear in the pending list: {pending:?}"
+    );
+
+    // Exactly one complete rejection-log row.
+    let rows = crate::store::test_hooks::proposal_rejection_rows(&store, "p-reject-1")
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let row = &rows[0];
+    assert_eq!(row.proposal_id, "p-reject-1");
+    assert_eq!(
+        row.capability_source, "direct",
+        "no sin90_ai_calls row references this proposal — a human/automation \
+         client submitted it directly, not via /ai/classify or /ai/propose"
+    );
+    assert_eq!(
+        row.proposal_source, "local_brain",
+        "copied verbatim from the submitted proposal's own `source` field"
+    );
+    assert_eq!(row.ops_summary, "create_area x1");
+    assert_eq!(
+        row.rationale.as_deref(),
+        Some("AI thought this was worth doing")
+    );
+    assert_eq!(row.reason.as_deref(), Some("duplicate of an existing Area"));
+    assert_eq!(
+        row.proposed_at, submitted.created_at,
+        "proposed_at must mirror the proposal's own created_at"
+    );
+    assert!(!row.rejected_at.is_empty());
+
+    // Exactly one `proposal.rejected` event mirrored to EventSink.
+    let rejected_events: Vec<_> = sink
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(kind, _)| kind == "proposal.rejected")
+        .cloned()
+        .collect();
+    assert_eq!(rejected_events.len(), 1, "{rejected_events:?}");
+    assert_eq!(rejected_events[0].1["proposal_id"], "p-reject-1");
+    assert_eq!(rejected_events[0].1["capability_source"], "direct");
+    assert_eq!(rejected_events[0].1["ops_summary"], "create_area x1");
+
+    // Exactly one INTERNAL sin90_events row for this proposal being rejected.
+    let events = store
+        .list_events(Some("proposal"), Some("p-reject-1"), None, None)
+        .await
+        .unwrap();
+    let rejected_internal: Vec<_> = events.iter().filter(|e| e.kind == "rejected").collect();
+    assert_eq!(rejected_internal.len(), 1, "{events:?}");
+    assert_eq!(rejected_internal[0].payload["proposal_id"], "p-reject-1");
+}
+
+/// The automation key must not be able to reject a Proposal — reject
+/// commits a terminal state change, same reasoning `accept_proposal`'s own
+/// human-only gate documents (Codex 2026-09-22 review, High). Asserts the
+/// negative (403) AND that the store is left completely untouched: still
+/// `pending`, still in the pending list, no rejection-log row, no event.
+#[tokio::test]
+async fn proposal_reject_by_automation_key_is_403_and_nothing_changes() {
+    let (app, sink, store) = test_app_with_store().await;
+    submit_plain_proposal(&app, "p-reject-auto", None).await;
+
+    let resp = app
+        .clone()
+        .oneshot(reject_req("p-reject-auto", AUTOMATION, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let status = crate::store::test_hooks::proposal_status(&store, "p-reject-auto")
+        .await
+        .unwrap();
+    assert_eq!(status.as_deref(), Some("pending"), "must be untouched");
+    let pending = store.list_pending_proposals().await.unwrap();
+    assert!(pending.iter().any(|p| p.id == "p-reject-auto"));
+    let rows = crate::store::test_hooks::proposal_rejection_rows(&store, "p-reject-auto")
+        .await
+        .unwrap();
+    assert!(rows.is_empty(), "no log row must be written: {rows:?}");
+    assert!(
+        sink.0
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(k, _)| k != "proposal.rejected"),
+        "no event must be emitted"
+    );
+
+    // Positive control: the human key CAN reject the same, still-pending proposal.
+    let resp2 = app
+        .clone()
+        .oneshot(reject_req("p-reject-auto", HUMAN, None))
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+}
+
+/// An already-`applied` proposal cannot be rejected — 409, and the
+/// rejection log gains no row for it (the CAS never claims a non-`pending`
+/// row, `Sin90Store::reject_proposal`'s doc).
+#[tokio::test]
+async fn proposal_reject_of_an_applied_proposal_is_409() {
+    let (app, _sink, store) = test_app_with_store().await;
+    submit_plain_proposal(&app, "p-reject-applied", None).await;
+    let accept_resp = app
+        .clone()
+        .oneshot(accept_req("p-reject-applied"))
+        .await
+        .unwrap();
+    assert_eq!(accept_resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(reject_req("p-reject-applied", HUMAN, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    let rows = crate::store::test_hooks::proposal_rejection_rows(&store, "p-reject-applied")
+        .await
+        .unwrap();
+    assert!(rows.is_empty(), "{rows:?}");
+}
+
+/// An already-`rejected` proposal cannot be rejected again — 409, and the
+/// log keeps exactly the ONE row the first (successful) reject wrote, not
+/// two.
+#[tokio::test]
+async fn proposal_reject_of_an_already_rejected_proposal_is_409() {
+    let (app, _sink, store) = test_app_with_store().await;
+    submit_plain_proposal(&app, "p-reject-twice", None).await;
+    let first = app
+        .clone()
+        .oneshot(reject_req("p-reject-twice", HUMAN, None))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = app
+        .clone()
+        .oneshot(reject_req("p-reject-twice", HUMAN, None))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::CONFLICT);
+
+    let rows = crate::store::test_hooks::proposal_rejection_rows(&store, "p-reject-twice")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "a second reject must not add a second row: {rows:?}"
+    );
+}
+
+/// The `reason` field is genuinely optional: omitting the body entirely
+/// records `reason: NULL`, giving one explicitly records it — both are
+/// legal, distinguished outcomes, not one masking a bug in the other.
+#[tokio::test]
+async fn proposal_reject_reason_is_optional_and_recorded_when_given() {
+    let (app, _sink, store) = test_app_with_store().await;
+    submit_plain_proposal(&app, "p-reason-none", None).await;
+    submit_plain_proposal(&app, "p-reason-some", None).await;
+
+    let r1 = app
+        .clone()
+        .oneshot(reject_req("p-reason-none", HUMAN, None))
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    let r2 = app
+        .clone()
+        .oneshot(reject_req(
+            "p-reason-some",
+            HUMAN,
+            Some(json!({"reason": "wrong direction"})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+
+    let none_rows = crate::store::test_hooks::proposal_rejection_rows(&store, "p-reason-none")
+        .await
+        .unwrap();
+    assert_eq!(none_rows[0].reason, None);
+    let some_rows = crate::store::test_hooks::proposal_rejection_rows(&store, "p-reason-some")
+        .await
+        .unwrap();
+    assert_eq!(some_rows[0].reason.as_deref(), Some("wrong direction"));
+}
+
+/// `deny_unknown_fields`: a stray key in the reject body is a 400, and the
+/// proposal is left completely untouched (same "reject nothing written"
+/// posture the automation-key test above pins).
+#[tokio::test]
+async fn proposal_reject_with_unknown_field_is_400_and_nothing_changes() {
+    let (app, _sink, store) = test_app_with_store().await;
+    submit_plain_proposal(&app, "p-reject-badbody", None).await;
+
+    let resp = app
+        .clone()
+        .oneshot(reject_req(
+            "p-reject-badbody",
+            HUMAN,
+            Some(json!({"reason": "x", "typo_field": 1})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let status = crate::store::test_hooks::proposal_status(&store, "p-reject-badbody")
+        .await
+        .unwrap();
+    assert_eq!(status.as_deref(), Some("pending"));
+    let rows = crate::store::test_hooks::proposal_rejection_rows(&store, "p-reject-badbody")
+        .await
+        .unwrap();
+    assert!(rows.is_empty());
+}
+
+/// Opus review L3: rejecting an id that does not exist at all is 404 (not
+/// 409 — `Sin90Store::reject_proposal`'s `NotFound` branch, same distinction
+/// `accept_proposal` already makes between "missing" and "wrong status").
+#[tokio::test]
+async fn proposal_reject_of_an_unknown_id_is_404() {
+    let (app, _sink) = test_app().await;
+    let resp = app
+        .clone()
+        .oneshot(reject_req("p-does-not-exist", HUMAN, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// Opus review L3: a `summarize`-sourced rejection is deliberately NOT
+// tested here. `store::ai_port::allowed_ops(Capability::Summarize)` always
+// returns `false` for every op (`ai_port.rs:425` — "which `Sin90Op`
+// variants a capability's proposals may contain"), so `AiSink::submit(..,
+// Capability::Summarize, ..)` always fails with `SinkError::Invalid` before
+// it ever writes a `sin90_ai_calls` row with `proposal_id` set: there is no
+// real production code path today that can create a `summarize`-attributed
+// pending proposal (T5.3.1, which would give `summarize` its own allowed
+// ops, has not landed). Faking one by hand-inserting a raw `sin90_ai_calls`
+// row would only re-prove that `reject_proposal`'s capability_source SQL
+// join is a plain string lookup — already established by the `classify` and
+// `propose` variants of this same test
+// (`proposal_reject_of_classify_proposal_unblocks_dedup_for_same_task`,
+// `proposal_reject_of_propose_carry_unblocks_next_run_for_same_target`, both
+// of which assert `capability_source` on a REAL `AiSink::submit`-produced
+// row) — it would not exercise anything summarize-specific. Once T5.3.1
+// gives `summarize` real ops, add the third variant here.
+
+/// Opus review L2: `reason` is trimmed; a value that trims to empty is
+/// treated exactly like "no reason given" (`None`), not persisted as an
+/// empty string.
+#[tokio::test]
+async fn proposal_reject_reason_is_trimmed_and_whitespace_only_becomes_none() {
+    let (app, _sink, store) = test_app_with_store().await;
+    submit_plain_proposal(&app, "p-reason-trim", None).await;
+
+    let resp = app
+        .clone()
+        .oneshot(reject_req(
+            "p-reason-trim",
+            HUMAN,
+            Some(json!({"reason": "  duplicate  "})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let rows = crate::store::test_hooks::proposal_rejection_rows(&store, "p-reason-trim")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows[0].reason.as_deref(),
+        Some("duplicate"),
+        "surrounding whitespace must be trimmed off"
+    );
+
+    submit_plain_proposal(&app, "p-reason-blank", None).await;
+    let resp2 = app
+        .clone()
+        .oneshot(reject_req(
+            "p-reason-blank",
+            HUMAN,
+            Some(json!({"reason": "   "})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let rows2 = crate::store::test_hooks::proposal_rejection_rows(&store, "p-reason-blank")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows2[0].reason, None,
+        "a whitespace-only reason must be recorded as no reason at all"
+    );
+}
+
+/// Opus review L2: a `reason` over 1000 characters is a 400 and nothing is
+/// written; exactly 1000 characters is the positive-control boundary that
+/// must still succeed.
+#[tokio::test]
+async fn proposal_reject_reason_over_1000_chars_is_400_positive_control_at_1000_is_ok() {
+    let (app, _sink, store) = test_app_with_store().await;
+    submit_plain_proposal(&app, "p-reason-too-long", None).await;
+    let too_long = "x".repeat(1001);
+    let resp = app
+        .clone()
+        .oneshot(reject_req(
+            "p-reason-too-long",
+            HUMAN,
+            Some(json!({"reason": too_long})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let status = crate::store::test_hooks::proposal_status(&store, "p-reason-too-long")
+        .await
+        .unwrap();
+    assert_eq!(status.as_deref(), Some("pending"), "must be untouched");
+
+    // Positive control: exactly at the limit still succeeds.
+    submit_plain_proposal(&app, "p-reason-at-limit", None).await;
+    let exactly_1000 = "x".repeat(1000);
+    let resp2 = app
+        .clone()
+        .oneshot(reject_req(
+            "p-reason-at-limit",
+            HUMAN,
+            Some(json!({"reason": exactly_1000.clone()})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let rows = crate::store::test_hooks::proposal_rejection_rows(&store, "p-reason-at-limit")
+        .await
+        .unwrap();
+    assert_eq!(rows[0].reason.as_deref(), Some(exactly_1000.as_str()));
+}
+
 // ---- SFU-10: submit_proposal validates before persisting -------------------
 
 /// SFU-10: a proposal with no ops is structurally invalid (`ProposalError::
@@ -4544,6 +4979,81 @@ mod ai_classify {
         assert!(skipped2.is_empty());
     }
 
+    /// T5.7.1 / T5.2.1's own dependency: a REJECTED classify
+    /// (`AssignTaskDirection`) proposal must stop blocking `dedup_targets`
+    /// for its target task — mirrors the test above, but invalidates the
+    /// pending proposal via `reject_proposal` instead of abandoning the
+    /// target Direction, pinning that THIS path (not just precheck's own
+    /// dry-run failing) unblocks dedup.
+    #[tokio::test]
+    async fn proposal_reject_of_classify_proposal_unblocks_dedup_for_same_task() {
+        let (_app, _sink, store) = test_app_with_store().await;
+        let direction = store
+            .create_direction("Side quest", "2026-Q4", None)
+            .await
+            .unwrap();
+        let task = store
+            .create_task(
+                "Ambiguous task",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let draft = crate::ai::ProposalDraft {
+            id: "p-dedup-reject-1".into(),
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task.id.clone(),
+                direction_id: direction.id.clone(),
+            }],
+            rationale: None,
+        };
+        crate::ai::AiSink::submit(&store, Capability::Classify, draft, call_rec("c-reject-1"))
+            .await
+            .unwrap();
+
+        // Negative control: still pending — blocks dedup.
+        let (kept, skipped) =
+            crate::http::ai_classify::dedup_targets(&store, std::slice::from_ref(&task))
+                .await
+                .unwrap();
+        assert!(
+            kept.is_empty(),
+            "the pending proposal must still block this task"
+        );
+        assert_eq!(skipped, vec![task.id.clone()]);
+
+        // Reject it (store level directly — the actor gate is an HTTP-layer
+        // concern, pinned separately by `proposal_reject_by_automation_key_
+        // is_403_and_nothing_changes`).
+        store
+            .reject_proposal("p-dedup-reject-1", None)
+            .await
+            .unwrap();
+
+        // The judgement: dedup no longer blocks the task.
+        let (kept2, skipped2) =
+            crate::http::ai_classify::dedup_targets(&store, std::slice::from_ref(&task))
+                .await
+                .unwrap();
+        assert_eq!(
+            kept2.len(),
+            1,
+            "a rejected proposal must no longer block its target from dedup"
+        );
+        assert!(skipped2.is_empty());
+
+        // The rejection log correctly attributes this to `classify`.
+        let rows = crate::store::test_hooks::proposal_rejection_rows(&store, "p-dedup-reject-1")
+            .await
+            .unwrap();
+        assert_eq!(rows[0].capability_source, "classify");
+    }
+
     // ---- M4: a panicking run releases the single-flight slot --------------
 
     #[tokio::test]
@@ -5190,6 +5700,115 @@ mod ai_propose {
         let (state3, items3) = poll_run_to_done(&app, run3["run_id"].as_str().unwrap()).await;
         assert_eq!(state3, "done");
         assert_eq!(item_result(&items3, "propose.carry"), "proposed");
+    }
+
+    /// T5.7.1 / T5.2.1's dependency, the `propose` half: rejecting a pending
+    /// `carry` proposal that was blocking dedup lets the NEXT `/ai/propose`
+    /// run for the same week reproduce a proposal for the SAME candidate
+    /// task (unlike the accept-based positive control above — accepting
+    /// actually carries the source task over, so that test needs a SECOND
+    /// seed task for its "round 3"; rejecting leaves the original task
+    /// exactly where it was, so the same target reappears).
+    #[tokio::test]
+    async fn proposal_reject_of_propose_carry_unblocks_next_run_for_same_target() {
+        let (app, _sink, store) = test_app_with_store().await;
+        let prev = store.create_week("2026-W50").await.unwrap();
+        store
+            .transition_week(&prev.id, WeekStatus::Active)
+            .await
+            .unwrap();
+        let seed = crate::core::Sin90Proposal {
+            id: "seed-reject-prev-task".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![Sin90Op::CreateTasks {
+                week_id: prev.id.clone(),
+                tasks: vec![NewTask {
+                    title: "carryable".into(),
+                    direction_id: None,
+                }],
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&seed).await.unwrap();
+        store.apply_proposal(&seed.id).await.unwrap();
+        let target = store.create_week("2026-W51").await.unwrap();
+
+        // Round 1: produces a carry proposal.
+        let run1 = body_json(
+            app.clone()
+                .oneshot(automation_req(
+                    "POST",
+                    "/ai/propose",
+                    json!({"week_id": target.id}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let (state1, items1) = poll_run_to_done(&app, run1["run_id"].as_str().unwrap()).await;
+        assert_eq!(state1, "done");
+        assert_eq!(item_result(&items1, "propose.carry"), "proposed");
+        let pending_after_round1 = store.list_pending_proposals().await.unwrap();
+        assert_eq!(pending_after_round1.len(), 1, "{pending_after_round1:?}");
+
+        // Round 2 (nothing decided yet): still blocked by the still-valid pending proposal.
+        let run2 = body_json(
+            app.clone()
+                .oneshot(automation_req(
+                    "POST",
+                    "/ai/propose",
+                    json!({"week_id": target.id}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let (state2, items2) = poll_run_to_done(&app, run2["run_id"].as_str().unwrap()).await;
+        assert_eq!(state2, "done");
+        assert_eq!(item_result(&items2, "propose.carry"), "nothing");
+
+        // Reject round 1's proposal instead of accepting it.
+        let reject_resp = app
+            .clone()
+            .oneshot(super::reject_req(
+                &pending_after_round1[0].id,
+                super::HUMAN,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(reject_resp.status(), StatusCode::OK);
+        let pending_after_reject = store.list_pending_proposals().await.unwrap();
+        assert!(pending_after_reject.is_empty(), "{pending_after_reject:?}");
+
+        // Round 3: the SAME original candidate is uncovered again (it was
+        // never carried over — rejecting, unlike accepting, leaves it
+        // untouched).
+        let run3 = body_json(
+            app.clone()
+                .oneshot(automation_req(
+                    "POST",
+                    "/ai/propose",
+                    json!({"week_id": target.id}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let (state3, items3) = poll_run_to_done(&app, run3["run_id"].as_str().unwrap()).await;
+        assert_eq!(state3, "done");
+        assert_eq!(
+            item_result(&items3, "propose.carry"),
+            "proposed",
+            "a rejected proposal must not permanently block its target"
+        );
+
+        let rows =
+            crate::store::test_hooks::proposal_rejection_rows(&store, &pending_after_round1[0].id)
+                .await
+                .unwrap();
+        assert_eq!(rows[0].capability_source, "propose");
     }
 
     /// H3's coordinator-clarified nuance (`docs/DESIGN-LIFEOS.md` §11.4.3,
