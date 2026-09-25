@@ -18,7 +18,7 @@ pub mod packs;
 pub mod repo;
 pub mod weekly_draft;
 
-pub use ai_port::AiReader;
+pub use ai_port::{AiCallSummary, AiReader};
 pub use attention::{AttentionRow, WeekAttention};
 pub use packs::{five_life_systems, SeedArea};
 pub use repo::{

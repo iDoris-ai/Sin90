@@ -590,6 +590,59 @@ impl Sin90Store {
             executive_enabled: value,
         })
     }
+
+    /// New (2026-09-24 review, M5): every `sin90_ai_calls` row for one run —
+    /// `GET /ai/runs/{run_id}`'s `calls` field. Reads the DURABLE record
+    /// (unlike the in-memory `RunRegistry`), so this still answers something
+    /// useful even for a run evicted from the 64-entry log or one from
+    /// before a process restart (§11.9 R11) — only `items`/`state` are lost
+    /// in those cases, not the call history.
+    pub async fn list_ai_calls_for_run(&self, run_id: &str) -> StoreResult<Vec<AiCallSummary>> {
+        let rows = sqlx::query(
+            "SELECT id, task_kind, engine, fallback_from, served_tier, model_id, ok, \
+             error_kind, latency_ms, proposal_id, at
+             FROM sin90_ai_calls WHERE run_id = ? ORDER BY at ASC, rowid ASC",
+        )
+        .bind(run_id)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| AiCallSummary {
+                id: r.get("id"),
+                task_kind: r.get("task_kind"),
+                engine: r.get("engine"),
+                fallback_from: r.get("fallback_from"),
+                served_tier: r.get("served_tier"),
+                model_id: r.get("model_id"),
+                ok: r.get("ok"),
+                error_kind: r.get("error_kind"),
+                latency_ms: r.get("latency_ms"),
+                proposal_id: r.get("proposal_id"),
+                at: r.get("at"),
+            })
+            .collect())
+    }
+}
+
+/// One `sin90_ai_calls` row, as `GET /ai/runs/{run_id}` serializes it
+/// (2026-09-24 review, M5). Deliberately its OWN shape, not
+/// `ai::AiCallRecord` — that type's `task_kind`/`engine`/`served_tier` are
+/// typed enums meant for the `ai` module's internal use, not a wire format,
+/// and `ai::ports` types must not leak `sqlx` row-mapping concerns.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AiCallSummary {
+    pub id: String,
+    pub task_kind: String,
+    pub engine: String,
+    pub fallback_from: Option<String>,
+    pub served_tier: Option<String>,
+    pub model_id: Option<String>,
+    pub ok: bool,
+    pub error_kind: Option<String>,
+    pub latency_ms: i64,
+    pub proposal_id: Option<String>,
+    pub at: String,
 }
 
 #[cfg(test)]

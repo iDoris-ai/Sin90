@@ -766,7 +766,7 @@ T5.1.1 对 `ClientError` 的配套改动（在 adapter 里）：加 `Unavailable
 
 **公共部分**：
 - **触发**：三条路由，全部 `require_any_actor`（触发本身只写 `sin90_proposals` 的 `pending` 行与 `sin90_ai_calls`，不改业务状态），返回 `202 {"run_id", "capability"}`，run 在后台跑：
-  `POST /ai/classify {"task_ids"?: [...]}`、`POST /ai/summarize {"review_id"}`、`POST /ai/propose {"week_id"}`；`GET /ai/runs/{run_id}` 返回 `{run_id, capability, state: running|done|aborted|unknown, items: [{target, result: proposed|nothing|deferred|rejected|skipped}], calls: [...]}`（运行态在进程内存，上限 64 条 LRU ⚖️；重启后只剩 `calls`，`state = unknown`）。
+  `POST /ai/classify {"task_ids"?: [...]}`、`POST /ai/summarize {"review_id"}`、`POST /ai/propose {"week_id"}`；`GET /ai/runs/{run_id}` 返回 `{run_id, capability, state: running|done|aborted|unknown, items: [{target, result: proposed|nothing|deferred|rejected|skipped|aborted}], calls: [...]}`（运行态在进程内存，上限 64 条 LRU ⚖️；重启后只剩 `calls`，`state = unknown`）。*T5.2.1 实现时补*：`aborted` = 该条目因 run 中止（绊线/总时限/panic）未处理，与去重导致的 `skipped` 区分；淘汰只淘汰非 `running` 的 run（`running` 的由 `BusyGuard` 的 `Drop` 保证最终 `finish`，不另设超时）。
   standalone 模式同样注册（port 为 `None`，只有 reflex）。**不在** `/_a24/*` 下。
 - **为什么后台跑、不绑 `request_id`**：被代理请求的总时限是 30s（§11.1 第 12 条），一次本地推理可以到 120s；绑上就会被截断（`RequestNotInFlight`）。所以模型调用**不带 `request_id`**，run 属于 Sin90 进程；进程退出时在途 run 丢弃（已提交的提议与已写的调用记录保留）。
 - **限流（Sin90 这一侧）**：每个能力**单飞**（再触发 → `409 {"code":"ai_busy","run_id"}`）；进程内模型调用信号量 = 2（= 内核每模块在途上限）；`_a24/model/complete` 用 `call_with_timeout(125s)` ⚖️；每 run 调用预算 20、总时限 600s（§11.3.4）。

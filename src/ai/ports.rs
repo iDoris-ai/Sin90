@@ -16,7 +16,9 @@ use crate::core::{DirectionId, DirectionStatus, Review, Sin90Op, Task, WeekId};
 
 // ---------------------------------------------------------------- vocabulary
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `Hash` (2026-09-24 review): `http::ai_runs::RunRegistry` keys its
+/// per-capability single-flight slot by `Capability`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Capability {
     Classify,
     Summarize,

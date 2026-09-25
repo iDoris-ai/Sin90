@@ -6,6 +6,7 @@ use axum::http::HeaderMap;
 use axum::response::Response;
 
 use crate::http::actor::{forbidden, Actor, ActorKeys};
+use crate::http::ai_runs::SharedRunRegistry;
 use crate::store::Sin90Store;
 
 /// Where emitted events go. `adapter_agent24` implements this by forwarding to
@@ -30,6 +31,12 @@ pub struct Sin90State {
     pub store: Sin90Store,
     pub sink: Arc<dyn EventSink>,
     pub actor_keys: Arc<ActorKeys>,
+    /// New (T5.2.1, design §11.4 公共): the in-process, in-memory observation
+    /// window `GET /ai/runs/{run_id}` reads and `POST /ai/classify` (today
+    /// the only trigger route) writes. Not a constructor parameter — nothing
+    /// outside this module needs to configure it, and every `Sin90State`
+    /// starts with an empty registry.
+    pub ai_runs: SharedRunRegistry,
 }
 
 impl Sin90State {
@@ -38,6 +45,7 @@ impl Sin90State {
             store,
             sink,
             actor_keys: Arc::new(actor_keys),
+            ai_runs: SharedRunRegistry::default(),
         }
     }
 

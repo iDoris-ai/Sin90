@@ -4016,3 +4016,830 @@ mod fired {
         );
     }
 }
+
+// ---- POST /ai/classify + GET /ai/runs/{id} (T5.2.1, design §11.4 公共) -----
+
+mod ai_classify {
+    use super::*;
+    use crate::ai::Capability;
+    use crate::core::{Energy, TaskKind};
+
+    fn no_key_req(method: &str, uri: &str, body: Value) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn trigger_classify_requires_an_actor_key() {
+        let (app, _sink) = test_app().await;
+        let resp = app
+            .oneshot(no_key_req("POST", "/ai/classify", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// Positive control for the 400 below: the automation key alone is
+    /// enough to trigger (design §11.4 公共's `require_any_actor`, same gate
+    /// `POST /proposals` uses).
+    #[tokio::test]
+    async fn trigger_classify_automation_key_is_accepted() {
+        let (app, _sink) = test_app().await;
+        let resp = app
+            .oneshot(automation_req("POST", "/ai/classify", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn trigger_classify_over_limit_task_ids_is_400() {
+        let (app, _sink) = test_app().await;
+        let ids: Vec<String> = (0..21).map(|i| format!("t{i}")).collect();
+        let resp = app
+            .oneshot(automation_req(
+                "POST",
+                "/ai/classify",
+                json!({"task_ids": ids}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn trigger_classify_unknown_field_is_400() {
+        let (app, _sink) = test_app().await;
+        let resp = app
+            .oneshot(automation_req(
+                "POST",
+                "/ai/classify",
+                json!({"oops": true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn trigger_classify_task_id_not_in_inbox_is_400() {
+        let (app, _sink) = test_app().await;
+        let resp = app
+            .oneshot(automation_req(
+                "POST",
+                "/ai/classify",
+                json!({"task_ids": ["does-not-exist"]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Pre-seeds the registry directly (rather than racing two real requests,
+    /// which would be flaky against a background `tokio::spawn`) to pin the
+    /// single-flight 409 shape.
+    #[tokio::test]
+    async fn trigger_classify_busy_returns_409_with_existing_run_id() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let state = Sin90State::new(
+            store,
+            Arc::new(RecordingSink::default()),
+            crate::http::ActorKeys {
+                human: HUMAN.into(),
+                automation: AUTOMATION.into(),
+            },
+        );
+        state
+            .ai_runs
+            .lock()
+            .unwrap()
+            .start(Capability::Classify, "run-already-going");
+        let app = router(state, false);
+        let resp = app
+            .oneshot(automation_req("POST", "/ai/classify", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "ai_busy");
+        assert_eq!(body["run_id"], "run-already-going");
+    }
+
+    #[tokio::test]
+    async fn get_ai_run_unknown_id_is_200_state_unknown() {
+        let (app, _sink) = test_app().await;
+        let resp = app
+            .oneshot(get_req("/ai/runs/does-not-exist"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["state"], "unknown");
+    }
+
+    /// (2026-09-24 review, round 2, low): even when the run's registry entry
+    /// is gone (evicted, or lost on a process restart), `GET /ai/runs/{id}`
+    /// still reports `capability` — derived from the durable
+    /// `sin90_ai_calls` rows' `task_kind`, since every row for one run
+    /// shares it (J9). Mutation target: drop the
+    /// `calls.first().map(|c| c.task_kind.clone())` derivation (hardcode
+    /// `None`) and this goes red.
+    #[tokio::test]
+    async fn get_ai_run_unknown_registry_entry_still_reports_capability_from_calls() {
+        let (app, _sink, store) = test_app_with_store().await;
+        let rec = crate::ai::AiCallRecord {
+            id: "orphan-call".into(),
+            run_id: "run-orphaned".into(),
+            task_kind: Capability::Classify,
+            engine: crate::ai::Engine::Reflex,
+            fallback_from: None,
+            served_tier: None,
+            model_id: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            latency_ms: 0,
+            ok: false,
+            error_kind: Some("undecided"),
+            proposal_id: None,
+            at: "2026-09-24T00:00:00Z".into(),
+        };
+        crate::ai::AiSink::record_call(&store, rec).await.unwrap();
+
+        let resp = app.oneshot(get_req("/ai/runs/run-orphaned")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["state"], "unknown");
+        assert_eq!(body["capability"], "classify");
+    }
+
+    /// End-to-end through the real router: `202` → background run → polled
+    /// to completion via `GET /ai/runs/{id}`. Production has no real
+    /// `ModelPort` wired yet (T5.1.2), so this only exercises reflex — the
+    /// task's title is crafted to overlap the Direction's title (R2) so the
+    /// item deterministically ends `proposed`, not `nothing`.
+    #[tokio::test]
+    async fn trigger_classify_runs_in_background_and_is_pollable_to_done() {
+        let (app, sink, store) = test_app_with_store().await;
+        store
+            .create_direction("Marketing Launch", "2026-Q4", None)
+            .await
+            .unwrap();
+        store
+            .create_task(
+                "Marketing Launch checklist",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let resp = app
+            .clone()
+            .oneshot(automation_req("POST", "/ai/classify", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body = body_json(resp).await;
+        assert_eq!(body["capability"], "classify");
+        let run_id = body["run_id"].as_str().unwrap().to_string();
+
+        // 2026-09-24 review (L6): a bounded WALL-CLOCK deadline, not a fixed
+        // iteration count — this run should finish in well under a second
+        // (in-memory SQLite, one item, reflex-only), but a wide 5s ceiling
+        // means a slow CI box doesn't turn a real pass into a flaky failure.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut state_str = "running".to_string();
+        let mut items = Value::Null;
+        let mut calls = Value::Null;
+        while tokio::time::Instant::now() < deadline {
+            let r = body_json(
+                app.clone()
+                    .oneshot(get_req(&format!("/ai/runs/{run_id}")))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            state_str = r["state"].as_str().unwrap().to_string();
+            items = r["items"].clone();
+            calls = r["calls"].clone();
+            if state_str != "running" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(state_str, "done", "run never finished: items={items:?}");
+        let items = items.as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["result"], "proposed");
+        // M5: `calls` is read from the durable `sin90_ai_calls` table.
+        let calls = calls.as_array().unwrap();
+        assert!(
+            !calls.is_empty(),
+            "the produced proposal's call row must be listed"
+        );
+        assert!(calls.iter().any(|c| c["ok"] == true));
+
+        // H2 (design §11.4 公共's L1): the run must have mirrored exactly one
+        // `proposal.submitted` event through the SAME `EventSink` the
+        // human `POST /proposals` path uses — one per produced proposal.
+        let submitted: Vec<_> = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(kind, _)| kind == "proposal.submitted")
+            .cloned()
+            .collect();
+        assert_eq!(
+            submitted.len(),
+            1,
+            "one proposal.submitted mirror per produced proposal: {submitted:?}"
+        );
+        assert!(submitted[0].1["id"].is_string());
+    }
+
+    // ---- Medium #1 (2026-09-24 review, round 2): immediate mirroring -----
+
+    /// Panics on the Nth call to `submit` — composed AROUND an
+    /// `EmittingSink` to prove that sink's emission happens per-`submit`
+    /// (synchronously, before the next item is even attempted), not
+    /// collected and flushed once at the very end of `run_classify`.
+    struct PanicOnNth<S> {
+        inner: S,
+        panic_at: u32,
+        count: std::sync::atomic::AtomicU32,
+    }
+    impl<S: crate::ai::AiSink> crate::ai::AiSink for PanicOnNth<S> {
+        async fn submit(
+            &self,
+            cap: Capability,
+            draft: crate::ai::ProposalDraft,
+            rec: crate::ai::AiCallRecord,
+        ) -> Result<(), crate::ai::SinkError> {
+            let n = self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if n == self.panic_at {
+                panic!("simulated mid-run crash on submit #{n}");
+            }
+            self.inner.submit(cap, draft, rec).await
+        }
+        async fn record_call(
+            &self,
+            rec: crate::ai::AiCallRecord,
+        ) -> Result<(), crate::ai::SinkError> {
+            self.inner.record_call(rec).await
+        }
+        async fn precheck(
+            &self,
+            cap: Capability,
+            drafts: &[crate::ai::ProposalDraft],
+        ) -> Vec<bool> {
+            self.inner.precheck(cap, drafts).await
+        }
+    }
+
+    /// Medium #1: `EmittingSink::submit` mirrors `proposal.submitted`
+    /// IMMEDIATELY on its own successful commit — proven by panicking on the
+    /// SECOND of two items and confirming the FIRST item's event already
+    /// landed in the sink despite the run never reaching its normal end.
+    /// Both items are made R1-decisive (a matching classification history)
+    /// so no model is needed. Mutation target: move the `self.sink.emit(...)`
+    /// call in `EmittingSink::submit` to run AFTER `run_classify` returns
+    /// (i.e. revert to the old post-hoc loop) and this test's event-count
+    /// assertion goes red (0 events recorded, since the run panics before
+    /// reaching that point).
+    #[tokio::test]
+    async fn emitting_sink_emits_immediately_even_if_run_panics_on_a_later_item() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let direction = store
+            .create_direction("Work", "2026-Q4", None)
+            .await
+            .unwrap();
+        store
+            .create_task(
+                "Write the report",
+                Some(&direction.id),
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+        let task_a = store
+            .create_task(
+                "Write the Report",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+        let task_b = store
+            .create_task(
+                "write THE report",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let recording = RecordingSink::default();
+        let store_for_task = store.clone();
+        let recording_for_task = recording.clone();
+        let handle = tokio::spawn(async move {
+            let store = &store_for_task;
+            let reader = store.ai_reader();
+            let emitting = crate::http::ai_classify::EmittingSink {
+                store,
+                sink: std::sync::Arc::new(recording_for_task),
+            };
+            let panicking = PanicOnNth {
+                inner: emitting,
+                panic_at: 2,
+                count: std::sync::atomic::AtomicU32::new(0),
+            };
+            crate::ai::classify::run_classify(
+                "run-panic-mid",
+                &[task_a, task_b],
+                crate::ai::ModelAccess::LocalOnly,
+                None::<&crate::ai::NoModelPort>,
+                &panicking,
+                &reader,
+            )
+            .await
+        });
+        let joined = handle.await;
+        assert!(joined.is_err(), "the simulated crash must have panicked");
+
+        let events = recording.0.lock().unwrap();
+        let submitted: Vec<_> = events
+            .iter()
+            .filter(|(kind, _)| kind == "proposal.submitted")
+            .collect();
+        assert_eq!(
+            submitted.len(),
+            1,
+            "the FIRST item's proposal must already have its event mirrored, \
+             even though the run crashed before reaching the second: {events:?}"
+        );
+    }
+
+    /// L2 (2026-09-24 review, round 3): the negative control
+    /// `emitting_sink_emits_immediately_...` above was missing — a `submit`
+    /// that FAILS its dry run (the task is already classified, so
+    /// `AssignTaskDirection`'s A3 rejects it) must return `Err` AND must NOT
+    /// emit `proposal.submitted` at all. Mutation target: change
+    /// `EmittingSink::submit`'s `if result.is_ok()` to `if true` and this
+    /// goes red (an event gets recorded for a failed submit).
+    #[tokio::test]
+    async fn emitting_sink_does_not_emit_when_submit_fails_its_dry_run() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let direction = store
+            .create_direction("Work", "2026-Q4", None)
+            .await
+            .unwrap();
+        // Already classified — ANY `AssignTaskDirection` targeting it fails
+        // A3 ("not in inbox") during `submit`'s dry-run `validate`.
+        let task = store
+            .create_task(
+                "Already classified",
+                Some(&direction.id),
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let recording = RecordingSink::default();
+        let emitting = crate::http::ai_classify::EmittingSink {
+            store: &store,
+            sink: std::sync::Arc::new(recording.clone()),
+        };
+        let draft = crate::ai::ProposalDraft {
+            id: "p-conflict".into(),
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task.id.clone(),
+                direction_id: direction.id.clone(),
+            }],
+            rationale: None,
+        };
+        let result = crate::ai::AiSink::submit(
+            &emitting,
+            Capability::Classify,
+            draft,
+            call_rec("call-conflict"),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "submit must fail its dry run: the task is already classified (A3)"
+        );
+
+        let events = recording.0.lock().unwrap();
+        assert!(
+            events.is_empty(),
+            "a failed submit must not emit proposal.submitted: {events:?}"
+        );
+    }
+
+    // ---- J14: dedup skips/reprocesses (2026-09-24 review) ----------------
+
+    fn call_rec(id: &str) -> crate::ai::AiCallRecord {
+        crate::ai::AiCallRecord {
+            id: id.into(),
+            run_id: "run-dedup-http".into(),
+            task_kind: Capability::Classify,
+            engine: crate::ai::Engine::Reflex,
+            fallback_from: None,
+            served_tier: None,
+            model_id: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            latency_ms: 0,
+            ok: true,
+            error_kind: None,
+            proposal_id: None,
+            at: "2026-09-24T00:00:00Z".into(),
+        }
+    }
+
+    /// J14: `dedup_targets` (now `pub(crate)`) skips a task with a still-valid
+    /// PENDING `AssignTaskDirection` proposal, and stops skipping it once
+    /// that proposal is no longer valid (positive control: the target
+    /// Direction gets abandoned — same mechanism `ai::classify`'s own
+    /// `precheck_reflects_inbox_and_direction_closure` pins at the
+    /// `AiSink::precheck` layer; this test pins it at the HTTP layer's own
+    /// `dedup_targets` wrapper instead).
+    #[tokio::test]
+    async fn dedup_skips_valid_pending_then_reprocesses_after_direction_abandoned() {
+        let (_app, _sink, store) = test_app_with_store().await;
+        let direction = store
+            .create_direction("Side quest", "2026-Q4", None)
+            .await
+            .unwrap();
+        let task = store
+            .create_task(
+                "Ambiguous task",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let draft = crate::ai::ProposalDraft {
+            id: "p-dedup-http-1".into(),
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task.id.clone(),
+                direction_id: direction.id.clone(),
+            }],
+            rationale: None,
+        };
+        crate::ai::AiSink::submit(&store, Capability::Classify, draft, call_rec("c1"))
+            .await
+            .unwrap();
+
+        let (kept, skipped) =
+            crate::http::ai_classify::dedup_targets(&store, std::slice::from_ref(&task))
+                .await
+                .unwrap();
+        assert!(
+            kept.is_empty(),
+            "the still-valid pending proposal must skip this task"
+        );
+        assert_eq!(skipped, vec![task.id.clone()]);
+
+        // Positive control: abandon the target Direction — the pending
+        // proposal's dry-run now fails A5, so it no longer blocks anything.
+        sqlx::query("UPDATE sin90_directions SET status = 'abandoned' WHERE id = ?")
+            .bind(&direction.id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let (kept2, skipped2) =
+            crate::http::ai_classify::dedup_targets(&store, std::slice::from_ref(&task))
+                .await
+                .unwrap();
+        assert_eq!(
+            kept2.len(),
+            1,
+            "an invalidated pending proposal must no longer block it"
+        );
+        assert!(skipped2.is_empty());
+    }
+
+    // ---- M4: a panicking run releases the single-flight slot --------------
+
+    #[tokio::test]
+    async fn busy_guard_releases_slot_on_panic() {
+        use crate::http::ai_runs::{BusyGuard, RunRegistry};
+        let runs: crate::http::ai_runs::SharedRunRegistry =
+            std::sync::Arc::new(std::sync::Mutex::new(RunRegistry::default()));
+        {
+            let mut reg = runs.lock().unwrap();
+            reg.start(Capability::Classify, "run-panicking");
+        }
+        let guard_runs = runs.clone();
+        let handle = tokio::spawn(async move {
+            let _guard = BusyGuard::new(guard_runs, Capability::Classify, "run-panicking".into());
+            panic!("simulated background task failure");
+        });
+        let joined = handle.await;
+        assert!(joined.is_err(), "the spawned task must have panicked");
+
+        // The slot must be free — a NEW run can claim it immediately.
+        let busy = runs.lock().unwrap().busy_run(Capability::Classify);
+        assert_eq!(
+            busy, None,
+            "a panicking run must not leave the slot stuck busy forever"
+        );
+        let rec = runs.lock().unwrap().get("run-panicking");
+        assert_eq!(rec.map(|r| r.state), Some("aborted"));
+    }
+
+    // ---- M3 round 2: auto-select paging + explicit-id dedup regressions --
+
+    /// M3(a) (2026-09-24 review, round 2): with the OLDEST 20 inbox tasks
+    /// all already covered by a valid pending proposal, auto-select
+    /// (`task_ids` omitted) must keep paging past them to find the 21st,
+    /// untouched task — not silently return a short/empty target list.
+    /// Mutation target: collapse `auto_select_targets` back to a single
+    /// `inbox(MAX_CLASSIFY_TASK_IDS)` fetch (the pre-fix shape) and this
+    /// goes red (the 21st task is never found).
+    #[tokio::test]
+    async fn auto_select_pages_past_a_fully_blocked_first_page() {
+        let (_app, _sink, store) = test_app_with_store().await;
+        let direction = store
+            .create_direction("Work", "2026-Q4", None)
+            .await
+            .unwrap();
+
+        let mut blocked_ids = Vec::new();
+        for i in 0..20 {
+            let t = store
+                .create_task(
+                    &format!("blocked {i}"),
+                    None,
+                    None,
+                    TaskKind::Other,
+                    Energy::Mid,
+                    None,
+                )
+                .await
+                .unwrap();
+            let draft = crate::ai::ProposalDraft {
+                id: format!("p-block-{i}"),
+                ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                    task_id: t.id.clone(),
+                    direction_id: direction.id.clone(),
+                }],
+                rationale: None,
+            };
+            crate::ai::AiSink::submit(
+                &store,
+                Capability::Classify,
+                draft,
+                call_rec(&format!("call-block-{i}")),
+            )
+            .await
+            .unwrap();
+            blocked_ids.push(t.id);
+        }
+        let open_task = store
+            .create_task("still open", None, None, TaskKind::Other, Energy::Mid, None)
+            .await
+            .unwrap();
+
+        let reader = store.ai_reader();
+        let targets = crate::http::ai_classify::auto_select_targets(&store, &reader).await;
+        let target_ids: Vec<String> = targets.iter().map(|t| t.id.clone()).collect();
+        assert!(
+            target_ids.contains(&open_task.id),
+            "the untouched 21st task must be found: {target_ids:?}"
+        );
+        for blocked in &blocked_ids {
+            assert!(
+                !target_ids.contains(blocked),
+                "a blocked task must not be selected: {blocked}"
+            );
+        }
+    }
+
+    /// M3(b) (2026-09-24 review, round 2): an EXPLICITLY given `task_ids`
+    /// entry that already has a valid pending proposal is deduped just like
+    /// the auto-select path — the run's `items` report it `"skipped"`, not
+    /// silently dropped or reprocessed. Mutation target: skip the
+    /// `dedup_targets` call for the explicit-ids path and this item's result
+    /// flips to `"nothing"`/`"proposed"` instead of `"skipped"`.
+    #[tokio::test]
+    async fn trigger_classify_explicit_task_id_already_pending_shows_skipped() {
+        let (app, _sink, store) = test_app_with_store().await;
+        let direction = store
+            .create_direction("Work", "2026-Q4", None)
+            .await
+            .unwrap();
+        let task = store
+            .create_task(
+                "Ambiguous task",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+        let draft = crate::ai::ProposalDraft {
+            id: "p-explicit-skip".into(),
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task.id.clone(),
+                direction_id: direction.id.clone(),
+            }],
+            rationale: None,
+        };
+        crate::ai::AiSink::submit(
+            &store,
+            Capability::Classify,
+            draft,
+            call_rec("call-explicit-skip"),
+        )
+        .await
+        .unwrap();
+
+        let resp = app
+            .clone()
+            .oneshot(automation_req(
+                "POST",
+                "/ai/classify",
+                json!({"task_ids": [task.id]}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let run_id = body_json(resp).await["run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut state_str = "running".to_string();
+        let mut items = Value::Null;
+        while tokio::time::Instant::now() < deadline {
+            let r = body_json(
+                app.clone()
+                    .oneshot(get_req(&format!("/ai/runs/{run_id}")))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            state_str = r["state"].as_str().unwrap().to_string();
+            items = r["items"].clone();
+            if state_str != "running" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(state_str, "done", "run never finished: items={items:?}");
+        let items = items.as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["target"], task.id);
+        assert_eq!(items[0]["result"], "skipped");
+    }
+
+    // ---- run registry eviction must not drop a still-running entry -------
+
+    /// (2026-09-24 review, round 2, low): eviction must skip over an entry
+    /// whose `state` is still `"running"` — naive FIFO would evict the
+    /// OLDEST entry regardless, which here is the still-running one.
+    /// Mutation target: revert `evict_one_non_running` to a plain
+    /// `order.pop_front()` and this goes red (`run-still-going` disappears).
+    #[test]
+    fn run_registry_eviction_skips_still_running_entries() {
+        use crate::http::ai_runs::RunRegistry;
+        let mut reg = RunRegistry::default();
+        reg.start(Capability::Classify, "run-still-going"); // oldest, never finished
+        for i in 0..63 {
+            let id = format!("run-done-{i}");
+            reg.start(Capability::Classify, &id);
+            reg.finish(Capability::Classify, &id, "done", Vec::new());
+        }
+        // 64 entries total (== MAX_TRACKED_RUNS), "run-still-going" is the
+        // OLDEST by insertion order. One more `start` forces an eviction.
+        reg.start(Capability::Classify, "run-final");
+        assert!(
+            reg.get("run-still-going").is_some(),
+            "the oldest entry, still running, must survive eviction"
+        );
+        assert!(
+            reg.get("run-done-0").is_none(),
+            "the oldest DONE entry should have been evicted instead"
+        );
+    }
+
+    // ---- J11 negative control: automation key cannot accept an AI proposal
+
+    /// J11 negative control (2026-09-24 review, round 2): an AI-produced
+    /// `AssignTaskDirection` proposal is exactly as automation-proof as any
+    /// other proposal (design §7.1's actor-key gate, already generically
+    /// pinned by `automation_key_cannot_write_directly_but_can_submit_a_
+    /// proposal` for a hand-built `CreateArea` proposal) — accepting one
+    /// classify itself produced still requires the human key, and a
+    /// rejected accept leaves the task in the inbox. Positive control (human
+    /// key succeeds) already lives in `ai::classify::classify_stub_
+    /// proposes_and_data_unchanged`.
+    #[tokio::test]
+    async fn ai_produced_proposal_cannot_be_accepted_by_automation_key() {
+        let (app, _sink, store) = test_app_with_store().await;
+        store
+            .create_direction("Marketing Launch", "2026-Q4", None)
+            .await
+            .unwrap();
+        let task = store
+            .create_task(
+                "Marketing Launch checklist",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let resp = app
+            .clone()
+            .oneshot(automation_req("POST", "/ai/classify", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let run_id = body_json(resp).await["run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut state_str = "running".to_string();
+        while tokio::time::Instant::now() < deadline && state_str == "running" {
+            let r = body_json(
+                app.clone()
+                    .oneshot(get_req(&format!("/ai/runs/{run_id}")))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            state_str = r["state"].as_str().unwrap().to_string();
+            if state_str == "running" {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+        assert_eq!(state_str, "done");
+
+        let proposals = store.list_proposals().await.unwrap();
+        let proposal = proposals
+            .iter()
+            .find(|p| {
+                matches!(
+                    p.ops.as_slice(),
+                    [crate::core::Sin90Op::AssignTaskDirection { task_id, .. }] if *task_id == task.id
+                )
+            })
+            .expect("classify must have produced exactly one AssignTaskDirection proposal");
+
+        let resp = app
+            .clone()
+            .oneshot(automation_req(
+                "POST",
+                &format!("/proposals/{}/accept", proposal.id),
+                Value::Null,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // The task must still be in the inbox — the rejected accept applied nothing.
+        let today = body_json(app.oneshot(get_req("/today")).await.unwrap()).await;
+        let inbox_ids: Vec<&str> = today["inbox"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect();
+        assert!(inbox_ids.contains(&task.id.as_str()));
+    }
+}

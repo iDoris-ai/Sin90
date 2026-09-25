@@ -22,6 +22,8 @@
 //! grow one for this).
 
 pub mod actor;
+mod ai_classify;
+pub mod ai_runs;
 pub mod state;
 
 use axum::body::Bytes;
@@ -165,7 +167,12 @@ pub fn router(state: Sin90State, mounted: bool) -> axum::Router {
         .route("/reviews/{id}", get(get_review).patch(update_review))
         .route("/reviews/{id}/finalize", post(finalize_review))
         .route("/review/weekly/draft", get(weekly_review_draft))
-        .route("/settings/ai", get(get_ai_settings).put(put_ai_settings));
+        .route("/settings/ai", get(get_ai_settings).put(put_ai_settings))
+        // New (T5.2.1, design §11.4 公共): NOT under `/_a24/*` — registered in
+        // both standalone and mounted mode ("standalone 模式同样注册（port
+        // 为 `None`，只有 reflex）").
+        .route("/ai/classify", post(ai_classify::trigger_classify))
+        .route("/ai/runs/{run_id}", get(ai_runs::get_ai_run));
     if mounted {
         r = r.route("/_a24/scheduler/fired", post(scheduler_fired));
     }

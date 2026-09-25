@@ -2263,6 +2263,23 @@ impl Sin90Store {
         rows.iter().map(row_to_proposal).collect()
     }
 
+    /// New (2026-09-24 review, M3): `PENDING`-only, for `http::ai_classify`'s
+    /// dedup step — that call site only ever cares about pending proposals,
+    /// so filtering in SQL (rather than `list_proposals()` + a Rust-side
+    /// `.filter`) avoids loading every applied/rejected proposal ever made
+    /// just to throw most of them away.
+    pub async fn list_pending_proposals(&self) -> Result<Vec<StoredProposal>> {
+        let rows = sqlx::query(
+            "SELECT id, status, source, ops, rationale, result, created_at, decided_at
+             FROM sin90_proposals
+             WHERE status = 'pending'
+             ORDER BY created_at DESC, rowid DESC",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(row_to_proposal).collect()
+    }
+
     /// One proposal by id (with its ops and — once applied — the receipt). A
     /// missing id is `NotFound` (→ 404), the same shape the accept path uses.
     pub async fn get_proposal(&self, id: &str) -> Result<StoredProposal> {
