@@ -3036,6 +3036,421 @@ mod routine {
     }
 }
 
+// ---- T4.1.1: Review three-kind routes ---------------------------------------
+
+mod review {
+    use super::*;
+
+    fn new_review_body(kind: &str, period: &str) -> Value {
+        json!({"kind": kind, "period": period})
+    }
+
+    // ---- actor-key gate: automation -> 403, human -> 2xx (positive control) --
+
+    #[tokio::test]
+    async fn create_review_requires_human_key() {
+        let (app, _sink) = test_app().await;
+        let resp = app
+            .clone()
+            .oneshot(automation_req(
+                "POST",
+                "/reviews",
+                new_review_body("daily", "2026-09-24"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Positive control: the human key succeeds with the same body.
+        let resp = app
+            .oneshot(human_req(
+                "POST",
+                "/reviews",
+                new_review_body("daily", "2026-09-24"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn update_review_requires_human_key() {
+        let (app, _sink) = test_app().await;
+        let created = body_json(
+            app.clone()
+                .oneshot(human_req(
+                    "POST",
+                    "/reviews",
+                    new_review_body("daily", "2026-09-24"),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let id = created["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .clone()
+            .oneshot(automation_req(
+                "PATCH",
+                &format!("/reviews/{id}"),
+                json!({"body": "hacked"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Positive control: the human key succeeds with the same body.
+        let resp = app
+            .oneshot(human_req(
+                "PATCH",
+                &format!("/reviews/{id}"),
+                json!({"body": "notes"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn finalize_review_requires_human_key() {
+        let (app, _sink) = test_app().await;
+        let created = body_json(
+            app.clone()
+                .oneshot(human_req(
+                    "POST",
+                    "/reviews",
+                    new_review_body("daily", "2026-09-24"),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let id = created["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .clone()
+            .oneshot(automation_req(
+                "POST",
+                &format!("/reviews/{id}/finalize"),
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Positive control: the human key succeeds.
+        let resp = app
+            .oneshot(human_req(
+                "POST",
+                &format!("/reviews/{id}/finalize"),
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ---- 400: unknown field, illegal period; positive control: legal period --
+
+    #[tokio::test]
+    async fn create_review_rejects_unknown_field() {
+        let (app, _sink) = test_app().await;
+        let mut body = new_review_body("daily", "2026-09-24");
+        body["nope"] = json!(1);
+        let resp = app
+            .oneshot(human_req("POST", "/reviews", body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_review_rejects_illegal_daily_and_weekly_period() {
+        let (app, _sink) = test_app().await;
+
+        let resp = app
+            .clone()
+            .oneshot(human_req(
+                "POST",
+                "/reviews",
+                new_review_body("daily", "2026-13-40"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let resp = app
+            .clone()
+            .oneshot(human_req(
+                "POST",
+                "/reviews",
+                new_review_body("weekly", "2026-W99"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Positive control: a legal daily period is accepted.
+        let resp = app
+            .oneshot(human_req(
+                "POST",
+                "/reviews",
+                new_review_body("daily", "2026-09-24"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn create_review_rhythm_period_requires_existing_rhythm() {
+        let (app, _sink, store) = test_app_with_store().await;
+
+        let resp = app
+            .clone()
+            .oneshot(human_req(
+                "POST",
+                "/reviews",
+                new_review_body("rhythm", "no-such-rhythm"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // Positive control: an EXISTING rhythm id is accepted. T3.4.1 has no
+        // production `POST /rhythms` yet, so the rhythm is seeded directly.
+        crate::store::test_hooks::insert_rhythm(&store, "rhythm-1")
+            .await
+            .unwrap();
+        let resp = app
+            .oneshot(human_req(
+                "POST",
+                "/reviews",
+                new_review_body("rhythm", "rhythm-1"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    // ---- duplicate (kind, period) -> 409; positive control: distinct period --
+
+    #[tokio::test]
+    async fn create_review_duplicate_kind_period_is_409_distinct_period_is_201() {
+        let (app, _sink) = test_app().await;
+        assert_eq!(
+            app.clone()
+                .oneshot(human_req(
+                    "POST",
+                    "/reviews",
+                    new_review_body("daily", "2026-09-24"),
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+
+        let resp = app
+            .clone()
+            .oneshot(human_req(
+                "POST",
+                "/reviews",
+                new_review_body("daily", "2026-09-24"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        // Positive control: a different period for the same kind succeeds.
+        let resp = app
+            .oneshot(human_req(
+                "POST",
+                "/reviews",
+                new_review_body("daily", "2026-09-25"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    // ---- finalized is a closed door: PATCH -> 409, finalize twice -> 409 -----
+
+    #[tokio::test]
+    async fn patch_on_finalized_review_is_409() {
+        let (app, _sink) = test_app().await;
+        let created = body_json(
+            app.clone()
+                .oneshot(human_req(
+                    "POST",
+                    "/reviews",
+                    new_review_body("daily", "2026-09-24"),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let id = created["id"].as_str().unwrap().to_string();
+        assert_eq!(
+            app.clone()
+                .oneshot(human_req(
+                    "POST",
+                    &format!("/reviews/{id}/finalize"),
+                    json!({}),
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        let resp = app
+            .oneshot(human_req(
+                "PATCH",
+                &format!("/reviews/{id}"),
+                json!({"body": "too late"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn finalize_review_twice_is_409() {
+        let (app, _sink) = test_app().await;
+        let created = body_json(
+            app.clone()
+                .oneshot(human_req(
+                    "POST",
+                    "/reviews",
+                    new_review_body("daily", "2026-09-24"),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let id = created["id"].as_str().unwrap().to_string();
+        assert_eq!(
+            app.clone()
+                .oneshot(human_req(
+                    "POST",
+                    &format!("/reviews/{id}/finalize"),
+                    json!({}),
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        let resp = app
+            .oneshot(human_req(
+                "POST",
+                &format!("/reviews/{id}/finalize"),
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    // ---- no-op PATCH mirrors zero events; a real change mirrors one --------
+
+    #[tokio::test]
+    async fn noop_patch_mirrors_zero_events_real_change_mirrors_one() {
+        let (app, sink) = test_app().await;
+        let created = body_json(
+            app.clone()
+                .oneshot(human_req(
+                    "POST",
+                    "/reviews",
+                    new_review_body("daily", "2026-09-24"),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let id = created["id"].as_str().unwrap().to_string();
+        let events_before = sink.0.lock().unwrap().len();
+
+        // No-op: re-stating the current (empty) body.
+        let resp = app
+            .clone()
+            .oneshot(human_req(
+                "PATCH",
+                &format!("/reviews/{id}"),
+                json!({"body": ""}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            sink.0.lock().unwrap().len(),
+            events_before,
+            "a no-op PATCH must not mirror an event"
+        );
+
+        // Positive control: a real change mirrors exactly one event.
+        let resp = app
+            .oneshot(human_req(
+                "PATCH",
+                &format!("/reviews/{id}"),
+                json!({"body": "notes"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let events = sink.0.lock().unwrap();
+        let new_events = &events[events_before..];
+        assert_eq!(new_events.len(), 1, "{new_events:?}");
+        assert_eq!(new_events[0].0, "review.updated");
+    }
+
+    // ---- list filters ----------------------------------------------------
+
+    #[tokio::test]
+    async fn list_reviews_filters_by_kind_and_period() {
+        let (app, _sink) = test_app().await;
+        for (kind, period) in [
+            ("daily", "2026-09-24"),
+            ("daily", "2026-09-25"),
+            ("weekly", "2026-W39"),
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(human_req("POST", "/reviews", new_review_body(kind, period)))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::CREATED
+            );
+        }
+
+        let all = body_json(app.clone().oneshot(get_req("/reviews")).await.unwrap()).await;
+        assert_eq!(all["reviews"].as_array().unwrap().len(), 3);
+
+        let daily = body_json(
+            app.clone()
+                .oneshot(get_req("/reviews?kind=daily"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(daily["reviews"].as_array().unwrap().len(), 2);
+
+        let one = body_json(
+            app.oneshot(get_req("/reviews?kind=daily&period=2026-09-24"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let rows = one["reviews"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["period"], "2026-09-24");
+    }
+}
+
 // ---- T3.2.2: POST /_a24/scheduler/fired -------------------------------------
 
 mod fired {
