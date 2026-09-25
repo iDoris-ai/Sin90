@@ -156,6 +156,7 @@ pub fn router(state: Sin90State, mounted: bool) -> axum::Router {
         .route("/proposals", post(submit_proposal).get(list_proposals))
         .route("/proposals/{id}", get(get_proposal))
         .route("/proposals/{id}/accept", post(accept_proposal))
+        .route("/proposals/{id}/reject", post(reject_proposal))
         .route("/attention", get(attention))
         .route("/events", get(list_events))
         .route("/packs/install", post(install_pack))
@@ -724,6 +725,97 @@ async fn accept_proposal(
                 );
             }
             Json(outcome.receipt).into_response()
+        }
+        Err(e) => map_err(e),
+    }
+}
+
+/// Optional body of `POST /proposals/{id}/reject` — `deny_unknown_fields`
+/// (T5.7.1): a stray/mistyped key is a 400, same posture every other
+/// request-body struct in this file takes. An entirely absent body (the
+/// common case — no reason given) never reaches `serde_json`: an empty
+/// `Bytes` is short-circuited to `reason: None` below, since
+/// `serde_json::from_slice(b"")` would otherwise fail as a parse error, not
+/// "no reason provided".
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RejectProposalReq {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// `reason`'s max length, in Unicode scalar values ("字符", not bytes) —
+/// Opus review L2.
+const MAX_REJECT_REASON_CHARS: usize = 1000;
+
+/// L2 (Opus review): trims surrounding whitespace, treats a trim-to-empty
+/// string the same as "no reason given" (`None`, not an empty string
+/// persisted to the log) — a caller sending `{"reason": "   "}` almost
+/// certainly means nothing, not an intentional empty note — and rejects
+/// (400) a reason over [`MAX_REJECT_REASON_CHARS`] characters, before it
+/// ever reaches the store.
+#[allow(clippy::result_large_err)]
+fn normalize_reject_reason(raw: Option<String>) -> std::result::Result<Option<String>, Response> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.chars().count() > MAX_REJECT_REASON_CHARS {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            &format!("reason must be at most {MAX_REJECT_REASON_CHARS} characters"),
+        ));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+/// `POST /proposals/{id}/reject` (T5.7.1, design §2 #27, Q6): human-only,
+/// same gate `accept_proposal` uses and for the same reason — reject commits
+/// a terminal state change (`pending → rejected`), so only a human may pull
+/// that trigger; automation may still submit (design §7.1). Every successful
+/// reject also writes one append-only `sin90_proposal_rejections` row (the
+/// store's job, `Sin90Store::reject_proposal`'s doc) and mirrors
+/// `proposal.rejected` to `EventSink`, same "internal row + sink mirror"
+/// split every other mutating handler in this file follows — both payloads
+/// key the proposal id `proposal_id` (Opus review L1) and the mirror also
+/// carries `ops_summary`, not just `capability_source`.
+async fn reject_proposal(
+    State(state): State<Sin90State>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    body: Bytes,
+) -> Response {
+    if let Err(r) = state.require_human(&headers) {
+        return r;
+    }
+    let reason = if body.is_empty() {
+        None
+    } else {
+        match parse::<RejectProposalReq>(&body, "proposal reject") {
+            Ok(b) => b.reason,
+            Err(r) => return r,
+        }
+    };
+    let reason = match normalize_reject_reason(reason) {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+    match state.store.reject_proposal(&id, reason.as_deref()).await {
+        Ok(outcome) => {
+            state.emit(
+                "proposal.rejected",
+                serde_json::json!({
+                    "proposal_id": id,
+                    "capability_source": outcome.capability_source,
+                    "ops_summary": outcome.ops_summary,
+                    "reason": reason,
+                }),
+            );
+            Json(serde_json::json!({ "id": id, "status": "rejected" })).into_response()
         }
         Err(e) => map_err(e),
     }
