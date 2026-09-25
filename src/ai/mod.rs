@@ -123,5 +123,5 @@ pub use self::ports::{
     AiCallRecord, AiReadModel, AiSettings, AiSink, Capability, Complexity, DirectionCandidate,
     Engine, LadderAction, ModelAccess, ModelFailure, ModelMessage, ModelPort, ModelReply,
     ModelRequest, NoModelPort, ProposalDraft, ReadError, Role, ServedTier, SettingsRead, SinkError,
-    UnavailableCause,
+    SummarizeBucket, SummarizeDraft, SummarizeRoutineRow, UnavailableCause,
 };

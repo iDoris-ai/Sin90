@@ -349,6 +349,65 @@ pub struct DirectionCandidate {
 #[error("read model: {0}")]
 pub struct ReadError(pub String);
 
+// ---------------------------------------------------------------- summarize
+
+/// One (Area or Direction) bucket's realized minutes for `summarize`'s
+/// target week (design §11.4.2, T5.3.1), with its title already resolved by
+/// the store — `ai/` may not name anything under `crate::store` (§11.5), so
+/// [`AiReadModel::weekly_draft`]'s own implementation does the id→title join
+/// before handing this back. `label` is `None` ONLY for the genuine "no
+/// direction"/"no area" bucket (empty id) — an id that resolves to no title
+/// (a row this store has no route to blank out today, but not assumed
+/// impossible) falls back to the RAW ID, never silently collapsing into the
+/// same bucket as "no direction/area" (2026-09-26 review, Low: `ai::
+/// summarize::facts`'s "未分类" phrase is reserved for the true empty-id
+/// case only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummarizeBucket {
+    pub label: Option<String>,
+    pub minutes: i64,
+}
+
+/// One Routine's fired/completed counts for `summarize`'s target week, title
+/// already resolved (same posture as [`SummarizeBucket`], same id-fallback
+/// rule — a Routine always has a non-empty id, so `label` here is never
+/// `None`). `completed` is always `0` today — see `store::weekly_draft`'s
+/// module doc for why (no completed-block-to-Routine link exists in this
+/// schema).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummarizeRoutineRow {
+    pub label: String,
+    pub fired: i64,
+    pub completed: i64,
+}
+
+/// `summarize`'s own shape of T4.3.1's weekly draft (design §11.4.2, §11.1
+/// 第 13 条) — NOT `store::weekly_draft::WeeklyDraft` itself: same numbers,
+/// but `by_area`/`by_direction`/`routines` carry an already-resolved display
+/// `label` instead of a raw id (`ai::summarize` has no read access of its
+/// own to turn one into the other — its only I/O is [`AiReadModel`]).
+///
+/// `auto_draft_md` (2026-09-26 review, C1/H1): T4.3.2's own
+/// `render_weekly_draft_markdown` output for this SAME draft, computed by
+/// the store from the SAME read (`AiReadModel::weekly_draft`'s
+/// implementation) that produced every other field here — NOT re-rendered
+/// independently by `ai/`, which may not import `render_weekly_draft_
+/// markdown` (a `store` item) at all. This is the SECOND program-rendered
+/// text `is_program_only` may compare the current review body against
+/// (§11.4.2's revised "可改写条件" ②) — a review whose body was seeded by
+/// T4.3.2's own auto-create path (`record_routine_fire`) starts out equal
+/// to exactly THIS string, not `ai::summarize::render_facts`'s own "本周数字"
+/// block (①), so summarize must recognize both, not just its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummarizeDraft {
+    pub week: String,
+    pub by_area: Vec<SummarizeBucket>,
+    pub by_direction: Vec<SummarizeBucket>,
+    pub tasks_done: i64,
+    pub routines: Vec<SummarizeRoutineRow>,
+    pub auto_draft_md: String,
+}
+
 pub trait SettingsRead: Send + Sync {
     fn settings(&self) -> impl Future<Output = Result<AiSettings, ReadError>> + Send;
 }
@@ -416,4 +475,23 @@ pub trait AiReadModel: SettingsRead {
     /// `allocations`; an empty `Vec` if no such row exists (§11.4.3: "Rhythm
     /// 当前配额（非 retired 的最新一条）").
     fn rhythm_alloc(&self) -> impl Future<Output = Result<Vec<Alloc>, ReadError>> + Send;
+    /// New (T5.3.1, §11.4.2's "数字来源"): T4.3.1's weekly draft numbers for
+    /// `iso_week` (`YYYY-Www`), reshaped into [`SummarizeDraft`] (titles
+    /// already resolved, `auto_draft_md` filled in — see that type's own
+    /// doc, and `store::weekly_draft::weekly_draft_on`'s doc for why the
+    /// numbers are computed in one read). `Err(ReadError)` for a malformed
+    /// week label, mirroring `Sin90Store::weekly_draft`'s own
+    /// `StoreError::Invalid`.
+    fn weekly_draft(
+        &self,
+        iso_week: &str,
+    ) -> impl Future<Output = Result<SummarizeDraft, ReadError>> + Send;
+    /// New (T5.3.1, §11.4.2's "数字来源"): titles of tasks that transitioned
+    /// to `done` inside `iso_week`'s window, most recent first, capped at 50
+    /// (⚖️) — reference material the narrative may cite via `{{tN}}`, never
+    /// counted toward [`super::summarize::facts`].
+    fn done_titles(
+        &self,
+        iso_week: &str,
+    ) -> impl Future<Output = Result<Vec<String>, ReadError>> + Send;
 }

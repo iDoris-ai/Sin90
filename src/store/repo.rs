@@ -2069,34 +2069,31 @@ impl Sin90Store {
     /// `review`-kind Routine ALWAYS maps to that week's `weekly` draft, no
     /// matter its actual cron cadence.
     ///
-    /// **Same-transaction note**: the fire dedup + `routine.fired` event
-    /// above, and the review-existence-check + insert below, both run
+    /// **Same-transaction note (T5.3.1 review C1, 2026-09-26, revised)**:
+    /// the fire dedup + `routine.fired` event above, the draft CONTENT
+    /// computation, and the review-existence-check + insert below all run
     /// inside the ONE `BEGIN IMMEDIATE` transaction this method already
-    /// opens — genuinely atomic, not a two-step race. What does NOT run in
-    /// that transaction is computing the draft's CONTENT (the `by_area`/
-    /// `by_direction`/`tasks_done`/`routines` numbers,
-    /// [`Sin90Store::weekly_draft`]): that call goes through
-    /// `self.pool()` for its own reads, and `Sin90Store::open_memory`
-    /// (every test in this crate) pools exactly ONE connection — reusing it
-    /// from inside a transaction that already checked that same connection
-    /// out would deadlock waiting for a connection that will never free up
-    /// before this transaction commits. So the draft's Markdown body is
-    /// precomputed BEFORE `tx` opens below, on a separate pool checkout,
-    /// and only the cheap "does this period already have a Review" gate +
-    /// the `INSERT` run inside the write transaction. Consequence: the
-    /// precomputed body can miss an event written in the (normally
-    /// sub-millisecond) gap between that precompute and this transaction's
-    /// commit — including, notably, THIS very `routine.fired` event, which
-    /// is always appended strictly after the precompute runs. Accepted per
-    /// this task's brief ("草稿内容可能差最新一两个事件，可接受但要写明"):
-    /// the alternative (rewriting `weekly_draft`/`attention` to accept an
-    /// arbitrary `sqlx` executor instead of always going through
-    /// `self.pool()`) is real surgery on two other files whose sourcing
-    /// discipline is already carefully documented and tested (see
-    /// `weekly_draft.rs`'s module doc) — out of proportion to what this
-    /// task needs, and not required by its own acceptance criteria (which
-    /// only asks that the rendered numbers match `WeeklyDraft`'s own
-    /// structure, not that the draft be perfectly live).
+    /// opens — genuinely atomic, not a two-step race, and (unlike the
+    /// original T3.2.2 version of this method) the draft is rendered
+    /// STRICTLY AFTER this fire's own `routine.fired` event is appended,
+    /// on the SAME connection (`weekly_draft_on`, `store::weekly_draft`,
+    /// now takes an explicit connection instead of always going through
+    /// `self.pool()` — no second checkout, so no deadlock risk against
+    /// `Sin90Store::open_memory`'s single-connection test pool either).
+    ///
+    /// **Why the ordering matters (the bug this fixes)**: `ai::summarize`'s
+    /// Q7 gate ("可改写条件") needs the auto-created draft's body to be a
+    /// FIXED, reproducible target — `render_weekly_draft_markdown` applied
+    /// to a `WeeklyDraft` a LATER read can recompute byte-identically. The
+    /// OLD code rendered the draft on a `self.pool()` checkout taken BEFORE
+    /// this method even opened `tx`, so `routines[].fired` in the stored
+    /// draft was permanently one less than what `weekly_draft` would ever
+    /// compute again — a fresh read always sees THIS fire's own event,
+    /// which the precompute, by construction, never could. The auto-draft
+    /// was therefore never re-derivable and summarize could never tell it
+    /// apart from human-written text (§11.4.2's "可改写条件" ②). See
+    /// `store::weekly_draft::weekly_draft_on`'s own doc for the store-side
+    /// half of this fix.
     #[allow(dead_code)]
     pub async fn record_routine_fire(
         &self,
@@ -2107,35 +2104,6 @@ impl Sin90Store {
     ) -> Result<RoutineFireOutcome> {
         let Some(routine_id) = key.strip_prefix("routine.").filter(|rest| !rest.is_empty()) else {
             return Ok(RoutineFireOutcome::UnknownKey);
-        };
-
-        // Precompute (see this method's doc for why it must happen BEFORE
-        // `tx` opens): only bother if this routine is `kind: review` and
-        // `scheduled_for` parses as a fixed-width timestamp. A malformed
-        // `scheduled_for` here does not fail the whole fire receipt — it
-        // just means no auto-draft this time (the HTTP layer already
-        // rejects a malformed `scheduled_for` with 400 before ever calling
-        // this method; this fallback only matters for a direct test/store
-        // caller that skips that check).
-        let review_week: Option<String> = {
-            let kind: Option<String> = sqlx::query("SELECT kind FROM sin90_routines WHERE id = ?")
-                .bind(routine_id)
-                .fetch_optional(self.pool())
-                .await?
-                .map(|r| r.get::<String, _>("kind"));
-            match kind.as_deref() {
-                Some("review") => crate::core::iso_week_of(scheduled_for),
-                _ => None,
-            }
-        };
-        // Fetch the actual draft content now, still before `tx` opens, on
-        // its own separate `self.pool()` checkout (see this method's doc).
-        let precomputed_weekly: Option<(String, String)> = match review_week {
-            Some(week) => {
-                let draft = self.weekly_draft(&week).await?;
-                Some((week, crate::store::render_weekly_draft_markdown(&draft)))
-            }
-            None => None,
         };
 
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
@@ -2202,11 +2170,22 @@ impl Sin90Store {
         )
         .await?;
 
+        // C1 fix (T5.3.1 review, 2026-09-26): rendered AFTER the
+        // `routine.fired` event just appended above, on `&mut *tx` — the
+        // SAME connection/transaction, not a separate pre-`tx` pool
+        // checkout (this method's own doc). A malformed `scheduled_for`
+        // does not fail the whole fire receipt — it just means no
+        // auto-draft this time (the HTTP layer already rejects a malformed
+        // `scheduled_for` with 400 before ever calling this method; this
+        // fallback only matters for a direct test/store caller that skips
+        // that check).
         let mut auto_review = None;
         if kind == "review" {
-            if let Some((week, body)) = &precomputed_weekly {
+            if let Some(week) = crate::core::iso_week_of(scheduled_for) {
+                let draft = crate::store::weekly_draft::weekly_draft_on(&mut tx, &week).await?;
+                let body = crate::store::render_weekly_draft_markdown(&draft);
                 auto_review =
-                    insert_weekly_review_draft_if_absent(&mut tx, week, body, &now).await?;
+                    insert_weekly_review_draft_if_absent(&mut tx, &week, &body, &now).await?;
             }
         }
 
@@ -6127,8 +6106,14 @@ mod review_routine_tests {
             .unwrap();
 
         // Independently computed expectation — the SAME call the draft
-        // itself would run, at the SAME point in time (before the routine
-        // fires below adds its own `routine.fired` event on top).
+        // itself would run. This fixture has no OTHER review-kind routine
+        // fire to worry about, so it is unaffected by whether the auto-draft
+        // below is rendered before or after ITS OWN `routine.fired` event
+        // (2026-09-26 review C1: `record_routine_fire` now renders strictly
+        // AFTER, `weekly_draft_on`'s own doc) — the `fired`-count-specific
+        // regression that fix addresses is
+        // `review_routine_auto_draft_fired_count_matches_a_fresh_weekly_draft_call`,
+        // below.
         let expected = store.weekly_draft("2026-W39").await.unwrap();
         let expected_md = crate::store::render_weekly_draft_markdown(&expected);
         assert!(expected_md.contains(&format!(
@@ -6165,6 +6150,76 @@ mod review_routine_tests {
             body.contains("Tasks done: 1"),
             "draft body must contain the exact tasks_done count: {body}"
         );
+    }
+
+    // ----- C1 (2026-09-26 review): the auto-draft must count ITS OWN fire ----
+
+    /// **The regression this fix addresses**: the routine firing right now
+    /// is ITSELF a `kind: review` Routine whose `routine.fired` event feeds
+    /// `weekly_draft`'s own `routines[].fired` count for that same week. The
+    /// OLD code rendered the auto-draft on a `self.pool()` checkout taken
+    /// BEFORE this transaction even opened — so the stored draft's `fired`
+    /// count was always ONE LESS than what a `weekly_draft` call moments
+    /// later would compute (that fresh call DOES see the event this method
+    /// just committed). `ai::summarize`'s Q7 gate depends on being able to
+    /// re-derive the SAME text a fresh read produces (§11.4.2's "可改写条件"
+    /// ②) — a permanently-one-behind auto-draft can never match, ever, no
+    /// matter when summarize is triggered afterward.
+    ///
+    /// Mutation target: move the `weekly_draft_on(&mut *tx, ..)` call in
+    /// `record_routine_fire` back to BEFORE `append_event(.., "fired", ..)`
+    /// (or back to a separate pre-`tx` `self.pool()` checkout, the ORIGINAL
+    /// bug) — this test goes red (`fired 0` stored vs. `fired 1` fresh).
+    ///
+    /// H1 (2026-09-26 review round 2): `scheduled_for` is `now_iso8601()`
+    /// (not a hand-picked `2026-09-21T18:00:00Z`) and the target week is
+    /// DERIVED from it (`iso_week_of`), not hardcoded `"2026-W39"` — a fixed
+    /// date/week pair goes stale (and this test would start asserting
+    /// against a week that no longer contains "now") the moment real
+    /// calendar time passes it, which for `2026-W39` was already true past
+    /// 2026-09-28. Nothing about what this test actually checks (the
+    /// auto-draft's stored body vs. a fresh `weekly_draft` render) depends
+    /// on which week it runs in.
+    #[tokio::test]
+    async fn review_routine_auto_draft_fired_count_matches_a_fresh_weekly_draft_call() {
+        let store = new_store().await;
+        let routine = create_review_routine(&store).await;
+
+        let now = crate::core::now_iso8601();
+        let week = crate::core::iso_week_of(&now)
+            .expect("now_iso8601() is always a fixed ISO-8601 timestamp");
+        let outcome = store
+            .record_routine_fire(
+                "fire-1",
+                &format!("routine.{}", routine.id),
+                &now,
+                FireTrigger::Tick,
+            )
+            .await
+            .unwrap();
+        let RoutineFireOutcome::Recorded { auto_review, .. } = outcome else {
+            panic!("expected Recorded, got {outcome:?}");
+        };
+        let auto_review = auto_review.expect("must auto-create a draft");
+
+        // A FRESH read, strictly AFTER `record_routine_fire` returned (and
+        // therefore strictly after its `routine.fired` event committed) —
+        // the target the stored auto-draft must already equal.
+        let fresh = store.weekly_draft(&week).await.unwrap();
+        let fresh_md = crate::store::render_weekly_draft_markdown(&fresh);
+        let expected_line = format!("{}: fired 1, completed 0", routine.id);
+        assert!(
+            fresh_md.contains(&expected_line),
+            "sanity: the fresh read itself must count this fire: {fresh_md}"
+        );
+
+        let (stored_body, _status) = review_row(&store, &auto_review.review_id).await;
+        assert_eq!(
+            stored_body, fresh_md,
+            "the auto-draft stored at fire time must be BYTE-IDENTICAL to a fresh \
+             weekly_draft render moments later — including this fire's OWN count"
+        );
+        assert!(stored_body.contains(&expected_line), "{stored_body}");
     }
 
     // ----- event payload: source field ------------------------------------

@@ -13,7 +13,7 @@
 //! satisfied, confirmed, carried over).
 
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
+use sqlx::{Row, SqliteConnection};
 
 use crate::store::{Result, Sin90Store};
 
@@ -49,32 +49,50 @@ pub struct WeekAttention {
     pub deviation_min: i64,
 }
 
+/// Pure replay (shared by [`Sin90Store::attention`] and, via T5.3.1's
+/// `store::weekly_draft::weekly_draft_on`, `ai::summarize`'s
+/// `AiReadModel::weekly_draft`): realized minutes per direction for
+/// `[start, end)` (ISO-8601 bounds, lexical compare == chronological on
+/// fixed-width UTC), run against a GIVEN connection rather than always
+/// `self.pool()` — the caller may be mid-transaction (e.g.
+/// `record_routine_fire`'s C1 fix: render the auto-draft AFTER appending
+/// this fire's own `routine.fired` event, in the SAME transaction, so the
+/// numbers it prints are never stale by exactly one event).
+pub(crate) async fn attention_on(
+    conn: &mut SqliteConnection,
+    start: &str,
+    end: &str,
+) -> Result<Vec<AttentionRow>> {
+    let rows = sqlx::query(
+        "SELECT COALESCE(json_extract(payload,'$.direction_id'),'') AS dir,
+                MAX(json_extract(payload,'$.direction_title'))       AS title,
+                CAST(COALESCE(SUM(json_extract(payload,'$.minutes')),0) AS INTEGER) AS actual
+         FROM sin90_events
+         WHERE entity = 'block' AND kind = 'transitioned' AND to_state = 'completed'
+           AND at >= ? AND at < ?
+         GROUP BY dir
+         ORDER BY actual DESC, dir",
+    )
+    .bind(start)
+    .bind(end)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| AttentionRow {
+            direction_id: r.get("dir"),
+            direction_title: r.get("title"),
+            actual_min: r.get("actual"),
+        })
+        .collect())
+}
+
 impl Sin90Store {
     /// Pure replay: realized minutes per direction for `[start, end)` (ISO-8601
     /// bounds, lexical compare == chronological on fixed-width UTC).
     pub async fn attention(&self, start: &str, end: &str) -> Result<Vec<AttentionRow>> {
-        let rows = sqlx::query(
-            "SELECT COALESCE(json_extract(payload,'$.direction_id'),'') AS dir,
-                    MAX(json_extract(payload,'$.direction_title'))       AS title,
-                    CAST(COALESCE(SUM(json_extract(payload,'$.minutes')),0) AS INTEGER) AS actual
-             FROM sin90_events
-             WHERE entity = 'block' AND kind = 'transitioned' AND to_state = 'completed'
-               AND at >= ? AND at < ?
-             GROUP BY dir
-             ORDER BY actual DESC, dir",
-        )
-        .bind(start)
-        .bind(end)
-        .fetch_all(self.pool())
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| AttentionRow {
-                direction_id: r.get("dir"),
-                direction_title: r.get("title"),
-                actual_min: r.get("actual"),
-            })
-            .collect())
+        let mut conn = self.pool().acquire().await?;
+        attention_on(&mut conn, start, end).await
     }
 
     /// Fold every not-yet-applied completed-block event into
