@@ -41,6 +41,7 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex, Semaphore};
 
 use crate::http::{EventSink, NullEventSink};
 
+pub mod clients;
 mod frame;
 mod transport;
 
@@ -61,6 +62,16 @@ pub use transport::FatalHook;
 /// this module rebuilt just to keep negotiating successfully.
 const PROTOCOL_MIN: u32 = 1;
 const PROTOCOL_MAX: u32 = 1000;
+
+/// The capability NAMES this module tells the kernel it wants at
+/// `initialize` time — a named constant, not an inline array literal in
+/// [`connect_and_initialize`], specifically so
+/// `tests::initialize_capabilities_matches_domain_os_yml_kernel_capabilities`
+/// (L2) can assert against the exact value that gets sent, rather than a
+/// hand-copied second literal that could silently drift from it. See
+/// [`connect_and_initialize`]'s own comment at the call site for what the
+/// kernel actually does with this field today (L1: less than it looks like).
+const INITIALIZE_CAPABILITIES: &[&str] = &["events", "memory", "approval", "scheduler"];
 
 /// How long a queued event will wait — combined, across both the sub-quota
 /// gate and the main in-flight semaphore (M5) — before it is given up on and
@@ -152,12 +163,14 @@ pub fn manifest_digest(manifest_bytes: &[u8]) -> String {
 }
 
 /// Capability prefixes Sin90 has any use for, per the kernel contract table
-/// (`docs/agent/architecture.md` §"与内核的契约"). Only `events` is wired up
-/// today (`KernelEventSink`); `scheduler`/`memory` (private)/`approval` get
-/// typed clients in T3.2.1. `model` is deliberately NOT listed — Sin90 does
-/// not declare that capability this round (L4), and the `initialize`
-/// `capabilities` field below stays `["events"]` only; T3.2.1 is what
-/// expands both together.
+/// (`docs/agent/architecture.md` §"与内核的契约"). `events` is wired up via
+/// `KernelEventSink`; `scheduler`/`memory` (private)/`approval` have typed
+/// clients as of T3.2.1 (`clients::Clients`, built from an `Arc<KernelClients>`
+/// once the handshake is done — each one is `None` unless `Offer.provides`
+/// covers its own prefix, architecture.md 不可破边界 #7). `model` is
+/// deliberately NOT listed — Sin90 does not declare that capability this
+/// round (L4), and the `initialize` `capabilities` field below never lists
+/// it either.
 pub const SIN90_CAPABILITY_PREFIXES: &[&str] = &[
     "_a24/events/",
     "_a24/scheduler/",
@@ -298,7 +311,24 @@ async fn connect_and_initialize(
             "module": module,
             "manifest_digest": manifest_digest(manifest_bytes),
             "auth_token": auth_token,
-            "capabilities": ["events"],
+            // L1 (post-review correction): the kernel's `initialize` handler
+            // only DESERIALIZES this field — it does not use it to decide
+            // what gets granted. Grants come only from the intersection of
+            // the manifest's own `kernel_capabilities` (read once, at mount
+            // time, straight from `domain-os.yml`) and the kernel's own
+            // `KERNEL_OOP_GRANTS` allowlist (ME4-S1 §6.5). This list is kept
+            // in sync with `domain-os.yml`'s `kernel_capabilities` by hand
+            // regardless — not because the kernel reads it as authority
+            // today, but so nothing here contradicts the manifest for a
+            // human reader, or for a future kernel version that starts
+            // consuming it (`INITIALIZE_CAPABILITIES`'s own doc; L2's test
+            // pins the two staying equal). Capability NAMES here, not the
+            // wire method prefixes in `SIN90_CAPABILITY_PREFIXES` — the
+            // kernel's `Grants` parses these against
+            // `agent24_domain::Capability::parse` (`events`/`memory`/
+            // `approval`/`scheduler`, snake_case), not against a `_a24/...`
+            // path.
+            "capabilities": INITIALIZE_CAPABILITIES,
         }
     });
     frame::write_frame(reader.get_mut(), &req).await?;
@@ -541,6 +571,37 @@ mod tests {
 
     fn noop_hook() -> FatalHook {
         Arc::new(|| {})
+    }
+
+    /// L2: pins `INITIALIZE_CAPABILITIES` against `domain-os.yml`'s
+    /// `kernel_capabilities` line, so the two cannot silently drift apart —
+    /// deliberately a plain string search, not a YAML parser (this crate has
+    /// no YAML dependency; the kernel is the one that actually parses the
+    /// manifest at mount time, per L1). Mutation: edit either list without
+    /// the other and this goes red.
+    #[test]
+    fn initialize_capabilities_matches_domain_os_yml_kernel_capabilities() {
+        let manifest = include_str!("../../domain-os.yml");
+        let line = manifest
+            .lines()
+            .find(|l| l.trim_start().starts_with("kernel_capabilities:"))
+            .expect("domain-os.yml must have a `kernel_capabilities: [...]` line");
+        let open = line
+            .find('[')
+            .expect("kernel_capabilities must be a bracketed list");
+        let close = line
+            .find(']')
+            .expect("kernel_capabilities list must be closed on the same line");
+        let from_manifest: Vec<&str> = line[open + 1..close]
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(
+            from_manifest, INITIALIZE_CAPABILITIES,
+            "domain-os.yml's kernel_capabilities and INITIALIZE_CAPABILITIES (sent at \
+             `initialize` time) must list the same capability names"
+        );
     }
 
     #[test]
