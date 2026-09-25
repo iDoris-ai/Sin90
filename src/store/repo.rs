@@ -12,12 +12,12 @@
 use std::collections::HashMap;
 
 use crate::core::{
-    check_alloc, check_area_transition, check_rhythm_transition, check_schedule_block_transition,
-    check_task_transition, check_week_transition, now_iso8601, ulid, validate, validate_cron,
-    validate_tz, week_is_open, Alloc, Area, AreaStatus, Direction, DirectionStatus, Energy,
-    NewRoutine, ProposalSource, ProposalStatus, Rhythm, RhythmStatus, Routine, RoutineStatus,
-    ScheduleBlock, ScheduleBlockStatus, Sin90Op, Sin90Proposal, Task, TaskKind, TaskStatus,
-    ValidationCtx, Week, WeekStatus,
+    check_alloc, check_area_transition, check_rhythm_transition, check_routine_transition,
+    check_schedule_block_transition, check_task_transition, check_week_transition, now_iso8601,
+    routine_is_terminal, ulid, validate, validate_cron, validate_tz, week_is_open, Alloc, Area,
+    AreaStatus, Direction, DirectionStatus, Energy, NewRoutine, ProposalSource, ProposalStatus,
+    Rhythm, RhythmStatus, Routine, RoutinePatch, RoutineStatus, ScheduleBlock, ScheduleBlockStatus,
+    Sin90Op, Sin90Proposal, Task, TaskKind, TaskStatus, ValidationCtx, Week, WeekStatus,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -1283,6 +1283,203 @@ impl Sin90Store {
         rows.into_iter().map(row_to_routine).collect()
     }
 
+    // ----- Routine update/transition (feat/t3.1.1-routine-store, layered on
+    // feat/t3.1.1b-routine-store-read's create/get/list) ----------------------
+
+    /// Apply a [`RoutinePatch`] (T3.1.1 review, "M2" — was five positional
+    /// arguments before). Status changes go through
+    /// [`Self::transition_routine`] instead; a patch never touches `status`.
+    ///
+    /// - **H2**: a `retired` routine is a closed door — rejected with
+    ///   [`StoreError::Conflict`] (maps to HTTP 409 once T3.1.2 wires a
+    ///   route) before any comparison or write, even one that would
+    ///   otherwise be a no-op.
+    /// - **L1**: after resolving every field to its post-patch value, it is
+    ///   compared field-by-field against the CURRENT row (not against
+    ///   whether the patch supplied a value) — a patch that re-states the
+    ///   same values, or supplies none at all, writes nothing: no `UPDATE`,
+    ///   no event, `updated_at` untouched.
+    /// - **L2/L4**: a non-`None` `tz` must not be empty; a non-`None` `title`
+    ///   is trimmed and must not be blank — same rules `create_routine`
+    ///   enforces.
+    /// - **M5**: the `updated` event's payload is the FULL post-update
+    ///   snapshot (`serde_json::to_value(&updated)`, not an ad hoc field
+    ///   list) plus a `"changed"` array naming which fields actually moved —
+    ///   so a reader never has to diff two snapshots to know what happened.
+    pub async fn update_routine(&self, id: &str, patch: &RoutinePatch) -> Result<Routine> {
+        let title = match &patch.title {
+            Some(t) => {
+                let trimmed = t.trim();
+                if trimmed.is_empty() {
+                    return Err(StoreError::Invalid("title must not be blank".into()));
+                }
+                Some(trimmed.to_string())
+            }
+            None => None,
+        };
+        if let Some(c) = &patch.cron {
+            validate_cron(c).map_err(StoreError::Invalid)?;
+        }
+        if let Some(t) = &patch.tz {
+            if t.is_empty() {
+                return Err(StoreError::Invalid("tz must not be an empty string".into()));
+            }
+            validate_tz(t).map_err(StoreError::Invalid)?;
+        }
+        if let Some(Some(tc)) = patch.target_count {
+            check_positive_target(Some(tc), "target_count")?;
+        }
+        if let Some(Some(tm)) = patch.target_minutes {
+            check_positive_target(Some(tm), "target_minutes")?;
+        }
+
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let row = sqlx::query(&format!(
+            "SELECT {ROUTINE_COLUMNS} FROM sin90_routines WHERE id = ?"
+        ))
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            return Err(StoreError::NotFound(format!("routine {id}")));
+        };
+        let current = row_to_routine(row)?;
+
+        // H2 (T3.1.1 review): retired is terminal for edits too, not just
+        // status transitions — checked before the no-op diff below so even a
+        // patch that would otherwise change nothing is still refused (the
+        // guarantee is "no writes reach a retired routine", not "no
+        // meaningful writes do").
+        if routine_is_terminal(current.status) {
+            return Err(StoreError::Conflict(format!(
+                "routine {id} is retired; no further changes are accepted"
+            )));
+        }
+
+        let new_title = title.as_deref().unwrap_or(&current.title);
+        let new_cron = patch.cron.as_deref().unwrap_or(&current.cron);
+        let new_tz = patch.tz.as_deref().unwrap_or(&current.tz);
+        let new_target_count = patch.target_count.unwrap_or(current.target_count);
+        let new_target_minutes = patch.target_minutes.unwrap_or(current.target_minutes);
+
+        // L1: diff against the CURRENT row, not against "did the patch
+        // supply this field" — a patch that re-states the current values is
+        // just as much a no-op as an empty one.
+        let mut changed: Vec<&'static str> = Vec::new();
+        if new_title != current.title {
+            changed.push("title");
+        }
+        if new_cron != current.cron {
+            changed.push("cron");
+        }
+        if new_tz != current.tz {
+            changed.push("tz");
+        }
+        if new_target_count != current.target_count {
+            changed.push("target_count");
+        }
+        if new_target_minutes != current.target_minutes {
+            changed.push("target_minutes");
+        }
+        if changed.is_empty() {
+            // Dropping `tx` here rolls back the `BEGIN IMMEDIATE` we opened
+            // to read `current` — no row, no event, `updated_at` untouched.
+            return Ok(current);
+        }
+
+        let now = now_iso8601();
+        sqlx::query(
+            "UPDATE sin90_routines
+             SET title = ?, cron = ?, tz = ?, target_count = ?, target_minutes = ?, updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(new_title)
+        .bind(new_cron)
+        .bind(new_tz)
+        .bind(new_target_count.map(i64::from))
+        .bind(new_target_minutes.map(i64::from))
+        .bind(&now)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+
+        let updated = Routine {
+            title: new_title.to_string(),
+            cron: new_cron.to_string(),
+            tz: new_tz.to_string(),
+            target_count: new_target_count,
+            target_minutes: new_target_minutes,
+            updated_at: now.clone(),
+            ..current
+        };
+        // M5: full snapshot + which fields moved, rather than an ad hoc
+        // field list — a reader gets both "what it looks like now" and
+        // "what specifically changed" from one event.
+        let mut payload = serde_json::to_value(&updated)?;
+        if let serde_json::Value::Object(map) = &mut payload {
+            map.insert("changed".to_string(), json!(changed));
+        }
+        append_event(
+            &mut tx, "routine", id, "updated", None, None, &payload, &now,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(updated)
+    }
+
+    /// Transition a Routine's status (`active <-> paused`, `{active,paused} ->
+    /// retired`, design §3.2 — `retired` is terminal, see
+    /// `core::transitions::routine_transition_allowed`). The event `kind` is
+    /// the destination-specific name spec.md pins down (`paused`/`resumed`/
+    /// `retired`), NOT a generic `"transitioned"` like most other entities —
+    /// there is only one legal edge INTO each of those three states, so the
+    /// destination alone is unambiguous.
+    pub async fn transition_routine(&self, id: &str, to: RoutineStatus) -> Result<Routine> {
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let row = sqlx::query(&format!(
+            "SELECT {ROUTINE_COLUMNS} FROM sin90_routines WHERE id = ?"
+        ))
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            return Err(StoreError::NotFound(format!("routine {id}")));
+        };
+        let current = row_to_routine(row)?;
+        check_routine_transition(current.status, to)?;
+
+        let kind = match to {
+            RoutineStatus::Paused => "paused",
+            RoutineStatus::Active => "resumed",
+            RoutineStatus::Retired => "retired",
+        };
+        let now = now_iso8601();
+        let to_str = to_wire(&to)?;
+        sqlx::query("UPDATE sin90_routines SET status = ?, updated_at = ? WHERE id = ?")
+            .bind(&to_str)
+            .bind(&now)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        append_event(
+            &mut tx,
+            "routine",
+            id,
+            kind,
+            Some(&to_wire(&current.status)?),
+            Some(&to_str),
+            &json!({"routine_id": id}),
+            &now,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Routine {
+            status: to,
+            updated_at: now,
+            ..current
+        })
+    }
+
     // ----- reads (list + detail) ---------------------------------------------
 
     pub async fn list_directions(&self) -> Result<Vec<Direction>> {
@@ -2413,5 +2610,433 @@ mod routine_tests {
                 .len(),
             2
         );
+    }
+
+    // ----- list filter: positive control (M4, status half) ------------------
+
+    /// M4 (T3.1.1 review), status half: needs `transition_routine` to
+    /// produce a non-`active` row, so it lives here rather than alongside
+    /// `routine_list_filters_by_area_and_direction_have_positive_controls`
+    /// (feat/t3.1.1b-routine-store-read, which has no transition method).
+    /// Same shape of positive control: two routines, one paused, each
+    /// `status` filter returns exactly the matching one.
+    #[tokio::test]
+    async fn routine_list_filter_by_status_has_positive_control() {
+        let store = new_store().await;
+        let r1 = create_ok(&store).await;
+        let r2 = create_ok(&store).await;
+        store
+            .transition_routine(&r2.id, RoutineStatus::Paused)
+            .await
+            .unwrap();
+
+        let ids = |rs: &[Routine]| rs.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            ids(&store
+                .list_routines(None, None, Some(RoutineStatus::Active))
+                .await
+                .unwrap()),
+            vec![r1.id.clone()]
+        );
+        assert_eq!(
+            ids(&store
+                .list_routines(None, None, Some(RoutineStatus::Paused))
+                .await
+                .unwrap()),
+            vec![r2.id.clone()]
+        );
+        // No filter -> both, positive control that the filter above isn't
+        // just "return everything regardless".
+        assert_eq!(
+            store.list_routines(None, None, None).await.unwrap().len(),
+            2
+        );
+    }
+
+    // ----- events: create -> pause -> resume -> retire sequence -------------
+
+    /// M3 (T3.1.1 review): the exact `(kind, from_state, to_state)` sequence
+    /// a full create → pause → resume → retire lifecycle produces — not just
+    /// the count. Mutation (verified during development, not committed):
+    /// remap `transition_routine`'s `paused`/`resumed`/`retired` kinds to a
+    /// single generic `"transitioned"` string (the pattern every OTHER
+    /// entity in this file uses) and this assertion goes red, proving it
+    /// actually pins the destination-specific names down.
+    #[tokio::test]
+    async fn routine_event_sequence_kinds_and_states_are_exact() {
+        let store = new_store().await;
+        let routine = create_ok(&store).await;
+        store
+            .transition_routine(&routine.id, RoutineStatus::Paused)
+            .await
+            .unwrap();
+        store
+            .transition_routine(&routine.id, RoutineStatus::Active)
+            .await
+            .unwrap();
+        store
+            .transition_routine(&routine.id, RoutineStatus::Retired)
+            .await
+            .unwrap();
+
+        let events = store
+            .list_events(Some("routine"), Some(&routine.id), None, None)
+            .await
+            .unwrap();
+        let seq: Vec<(String, Option<String>, Option<String>)> = events
+            .iter()
+            .map(|e| (e.kind.clone(), e.from_state.clone(), e.to_state.clone()))
+            .collect();
+        assert_eq!(
+            seq,
+            vec![
+                ("created".to_string(), None, Some("active".to_string())),
+                (
+                    "paused".to_string(),
+                    Some("active".to_string()),
+                    Some("paused".to_string())
+                ),
+                (
+                    "resumed".to_string(),
+                    Some("paused".to_string()),
+                    Some("active".to_string())
+                ),
+                (
+                    "retired".to_string(),
+                    Some("active".to_string()),
+                    Some("retired".to_string())
+                ),
+            ]
+        );
+    }
+
+    /// M3/M5 (T3.1.1 review): payload field assertions for `created` (ad hoc
+    /// fields, `routine_id` key) and `updated` (full snapshot + `changed`).
+    #[tokio::test]
+    async fn routine_created_and_updated_event_payloads_have_expected_fields() {
+        let store = new_store().await;
+        let routine = create_ok(&store).await;
+        let updated = store
+            .update_routine(
+                &routine.id,
+                &RoutinePatch {
+                    title: Some("Evening run".to_string()),
+                    cron: Some("0 19 * * MON,WED,FRI".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let events = store
+            .list_events(Some("routine"), Some(&routine.id), None, None)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 2);
+
+        let created_payload = &events[0].payload;
+        assert_eq!(created_payload["routine_id"], json!(routine.id));
+        assert_eq!(created_payload["title"], json!("Morning run"));
+        assert_eq!(created_payload["kind"], json!("exercise"));
+        assert_eq!(created_payload["cron"], json!("0 7 * * MON,WED,FRI"));
+        assert_eq!(created_payload["status"], json!("active"));
+
+        let updated_payload = &events[1].payload;
+        // Full snapshot: the entity's OWN `id` field, not a `routine_id`
+        // reference key (M5 — only the ad hoc payloads use `routine_id`).
+        assert_eq!(updated_payload["id"], json!(routine.id));
+        assert_eq!(updated_payload["title"], json!("Evening run"));
+        assert_eq!(updated_payload["cron"], json!("0 19 * * MON,WED,FRI"));
+        assert_eq!(updated_payload["tz"], json!(updated.tz));
+        assert_eq!(updated_payload["target_count"], json!(updated.target_count));
+        let changed: Vec<String> =
+            serde_json::from_value(updated_payload["changed"].clone()).unwrap();
+        assert_eq!(changed, vec!["title".to_string(), "cron".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn routine_update_changes_fields_and_emits_exactly_one_event() {
+        let store = new_store().await;
+        let routine = create_ok(&store).await;
+
+        let updated = store
+            .update_routine(
+                &routine.id,
+                &RoutinePatch {
+                    title: Some("Evening run".to_string()),
+                    cron: Some("0 19 * * MON,WED,FRI".to_string()),
+                    tz: Some("America/New_York".to_string()),
+                    target_count: Some(Some(4)),
+                    target_minutes: Some(None), // explicitly clear target_minutes
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(updated.title, "Evening run");
+        assert_eq!(updated.cron, "0 19 * * MON,WED,FRI");
+        assert_eq!(updated.tz, "America/New_York");
+        assert_eq!(updated.target_count, Some(4));
+        assert_eq!(updated.target_minutes, None);
+        assert_eq!(updated.status, RoutineStatus::Active); // update never touches status
+
+        let n = test_hooks::event_count(&store, "routine", &routine.id)
+            .await
+            .unwrap();
+        assert_eq!(n, 2); // created + updated
+    }
+
+    /// L1 (T3.1.1 review): a fully-empty patch is a no-op, AND — the actual
+    /// point of L1 — so is a patch that re-states the CURRENT values. Both
+    /// must write nothing (no event, `updated_at` untouched), in contrast to
+    /// `routine_update_changes_fields_and_emits_exactly_one_event` which
+    /// changes real values and DOES add one.
+    #[tokio::test]
+    async fn routine_update_noop_writes_no_event_and_leaves_updated_at_alone() {
+        let store = new_store().await;
+        let routine = create_ok(&store).await;
+
+        let empty_patch = store
+            .update_routine(&routine.id, &RoutinePatch::default())
+            .await
+            .unwrap();
+        assert_eq!(empty_patch, routine);
+
+        let same_values_patch = store
+            .update_routine(
+                &routine.id,
+                &RoutinePatch {
+                    title: Some(routine.title.clone()),
+                    cron: Some(routine.cron.clone()),
+                    tz: Some(routine.tz.clone()),
+                    target_count: Some(routine.target_count),
+                    target_minutes: Some(routine.target_minutes),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(same_values_patch, routine);
+        assert_eq!(same_values_patch.updated_at, routine.updated_at);
+
+        let n = test_hooks::event_count(&store, "routine", &routine.id)
+            .await
+            .unwrap();
+        assert_eq!(n, 1); // only `created` — neither no-op update added anything
+    }
+
+    #[tokio::test]
+    async fn routine_update_rejects_invalid_cron_and_tz() {
+        let store = new_store().await;
+        let routine = create_ok(&store).await;
+
+        let err = store
+            .update_routine(
+                &routine.id,
+                &RoutinePatch {
+                    cron: Some("garbage".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
+
+        // H1 via the update path too: a digit weekday must be rejected here,
+        // not just on create.
+        let err = store
+            .update_routine(
+                &routine.id,
+                &RoutinePatch {
+                    cron: Some("0 7 * * 1-5".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
+
+        let err = store
+            .update_routine(
+                &routine.id,
+                &RoutinePatch {
+                    tz: Some("Not/AZone".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
+
+        // L2 via the update path: an explicit empty tz is also rejected.
+        let err = store
+            .update_routine(
+                &routine.id,
+                &RoutinePatch {
+                    tz: Some(String::new()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
+
+        let err = store
+            .update_routine(
+                &routine.id,
+                &RoutinePatch {
+                    target_count: Some(Some(0)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
+
+        // L4 via the update path: a blank title is also rejected.
+        let err = store
+            .update_routine(
+                &routine.id,
+                &RoutinePatch {
+                    title: Some("   ".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
+
+        // Rejected update must not have touched the row or appended an event.
+        let still = store.get_routine(&routine.id).await.unwrap();
+        assert_eq!(still, routine);
+        let n = test_hooks::event_count(&store, "routine", &routine.id)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    /// H2 (T3.1.1 review): a retired routine is a closed door for `update`,
+    /// not just for `transition`. Paired positive control: the SAME patch
+    /// succeeds while the routine is merely `paused`.
+    #[tokio::test]
+    async fn routine_update_on_retired_rejected_paused_accepted_positive_control() {
+        let store = new_store().await;
+
+        // Positive control first: paused accepts the update.
+        let paused_routine = create_ok(&store).await;
+        store
+            .transition_routine(&paused_routine.id, RoutineStatus::Paused)
+            .await
+            .unwrap();
+        let patch = RoutinePatch {
+            title: Some("Renamed".to_string()),
+            ..Default::default()
+        };
+        let updated = store
+            .update_routine(&paused_routine.id, &patch)
+            .await
+            .unwrap();
+        assert_eq!(updated.title, "Renamed");
+
+        // Now the actual assertion: retired rejects the exact same patch.
+        let retired_routine = create_ok(&store).await;
+        store
+            .transition_routine(&retired_routine.id, RoutineStatus::Retired)
+            .await
+            .unwrap();
+        let err = store
+            .update_routine(&retired_routine.id, &patch)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Conflict(_)), "{err:?}");
+
+        // Row unchanged, and no `updated` event was appended (still exactly
+        // created + retired).
+        let still = store.get_routine(&retired_routine.id).await.unwrap();
+        assert_eq!(still.title, "Morning run");
+        let n = test_hooks::event_count(&store, "routine", &retired_routine.id)
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+
+    // ----- transitions ------------------------------------------------------
+
+    #[tokio::test]
+    async fn routine_transition_active_paused_active_emits_paused_then_resumed() {
+        let store = new_store().await;
+        let routine = create_ok(&store).await;
+
+        let paused = store
+            .transition_routine(&routine.id, RoutineStatus::Paused)
+            .await
+            .unwrap();
+        assert_eq!(paused.status, RoutineStatus::Paused);
+
+        let resumed = store
+            .transition_routine(&routine.id, RoutineStatus::Active)
+            .await
+            .unwrap();
+        assert_eq!(resumed.status, RoutineStatus::Active);
+
+        let n = test_hooks::event_count(&store, "routine", &routine.id)
+            .await
+            .unwrap();
+        assert_eq!(n, 3); // created, paused, resumed
+    }
+
+    #[tokio::test]
+    async fn routine_transition_to_retired_is_terminal() {
+        let store = new_store().await;
+        let routine = create_ok(&store).await;
+
+        let retired = store
+            .transition_routine(&routine.id, RoutineStatus::Retired)
+            .await
+            .unwrap();
+        assert_eq!(retired.status, RoutineStatus::Retired);
+
+        // Every possible destination from `retired` must be rejected —
+        // including re-activating (the task's explicit "retired -> active
+        // must be rejected" example) and re-pausing.
+        for to in [
+            RoutineStatus::Active,
+            RoutineStatus::Paused,
+            RoutineStatus::Retired,
+        ] {
+            let err = store.transition_routine(&routine.id, to).await.unwrap_err();
+            assert!(matches!(err, StoreError::Transition(_)), "{to:?}: {err:?}");
+        }
+
+        // Rejected transitions must not have appended events: still exactly
+        // created + retired.
+        let n = test_hooks::event_count(&store, "routine", &routine.id)
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+
+    #[tokio::test]
+    async fn routine_transition_paused_to_retired_is_legal() {
+        let store = new_store().await;
+        let routine = create_ok(&store).await;
+        store
+            .transition_routine(&routine.id, RoutineStatus::Paused)
+            .await
+            .unwrap();
+        let retired = store
+            .transition_routine(&routine.id, RoutineStatus::Retired)
+            .await
+            .unwrap();
+        assert_eq!(retired.status, RoutineStatus::Retired);
+    }
+
+    #[tokio::test]
+    async fn routine_transition_unknown_id_is_not_found() {
+        let store = new_store().await;
+        let err = store
+            .transition_routine("no-such-routine", RoutineStatus::Paused)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotFound(_)), "{err:?}");
     }
 }
