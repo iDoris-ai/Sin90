@@ -20,10 +20,12 @@ pub mod weekly_draft;
 pub use attention::{AttentionRow, WeekAttention};
 pub use packs::{five_life_systems, SeedArea};
 pub use repo::{
-    AppliedProposal, ApplyOutcome, EventRow, ReviewUpdate, RoutineFireOutcome, RoutineUpdate,
-    StoredProposal, TodayView,
+    AppliedProposal, ApplyOutcome, AutoReviewCreated, EventRow, ReviewUpdate, RoutineFireOutcome,
+    RoutineUpdate, StoredProposal, TodayView,
 };
-pub use weekly_draft::{AreaMinutes, DirectionMinutes, RoutineDraftRow, WeeklyDraft};
+pub use weekly_draft::{
+    render_weekly_draft_markdown, AreaMinutes, DirectionMinutes, RoutineDraftRow, WeeklyDraft,
+};
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;

@@ -86,17 +86,41 @@ pub struct ReviewUpdate {
 pub enum RoutineFireOutcome {
     /// First time this `fire_id` was seen: a `sin90_routine_fires` row was
     /// inserted and a `routine.fired` event appended, in the same tx.
-    Recorded { routine_id: String },
+    /// `auto_review` is `Some` when this fire ALSO caused a weekly draft
+    /// Review to be auto-created (T4.3.2: `Routine{kind:review}` fired and
+    /// no `(weekly, <that ISO week>)` Review existed yet) — `None` for
+    /// every other Routine kind, a duplicate fire (never reaches this
+    /// variant), or a review-kind fire whose week already had a Review.
+    Recorded {
+        routine_id: String,
+        auto_review: Option<AutoReviewCreated>,
+    },
     /// This `fire_id` was already recorded — the kernel's at-least-once
     /// retry of the same due slot (design §4.1/§4.2: same slot, same
     /// `fire_id`). No new row, no new event (spec.md M3: "重复投递幂等返回
-    /// 2xx").
+    /// 2xx") — and, per the same idempotency rule, no auto-review draft
+    /// either: T4.3.2 only acts on a REAL new fire.
     Duplicate { routine_id: String },
     /// `key` is not shaped `routine.<id>`, or no such routine exists.
     UnknownKey,
     /// The routine exists but has already reached `retired` — a schedule the
     /// kernel had not yet finished tearing down when it fired one last time.
     RoutineRetired { routine_id: String },
+}
+
+/// T4.3.2: the weekly draft Review a `Routine{kind:review}` fire
+/// auto-created, so `http::scheduler_fired` can mirror `review.created` to
+/// `EventSink` for it too — the same "internal `sin90_events` row + sink
+/// mirror" split every other direct-write handler in this codebase follows
+/// (`http::create_review`'s doc). Only ever carries a `weekly` Review today
+/// (this task's scope — see [`Sin90Store::record_routine_fire`]'s doc for
+/// why daily/rhythm are out of scope), so `kind` isn't a field here; the
+/// caller hardcodes `"weekly"`/`"draft"` the same way this module's own
+/// `insert_weekly_review_draft_if_absent` does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoReviewCreated {
+    pub review_id: String,
+    pub period: String,
 }
 
 /// A persisted proposal as returned by the read endpoints — the stored row plus
@@ -460,6 +484,66 @@ async fn append_event(
     .execute(&mut **tx)
     .await?;
     Ok(id)
+}
+
+/// T4.3.2: ensure a `(weekly, week)` Review exists, on the SAME transaction
+/// [`Sin90Store::record_routine_fire`] already holds — genuinely atomic
+/// against a concurrent call for the same routine (that other call's own
+/// `BEGIN IMMEDIATE` simply waits for this one to commit first, same as
+/// every other writer in this module) and against `create_review` (its
+/// `UNIQUE(kind, period)` check-then-insert is likewise gated by the SAME
+/// write lock). Returns `None` — inserting nothing, appending no event — if
+/// a Review already exists for `(weekly, week)`, draft OR finalized: this
+/// is a "make sure one exists" operation, not a create-or-error one, so an
+/// existing FINALIZED review for the week is left alone rather than
+/// clobbered or reported as a conflict (unlike `create_review`'s own 409,
+/// which is for a human explicitly asking to create one).
+async fn insert_weekly_review_draft_if_absent(
+    tx: &mut Tx<'_>,
+    week: &str,
+    body: &str,
+    now: &str,
+) -> Result<Option<AutoReviewCreated>> {
+    let taken = sqlx::query("SELECT 1 FROM sin90_reviews WHERE kind = 'weekly' AND period = ?")
+        .bind(week)
+        .fetch_optional(&mut **tx)
+        .await?;
+    if taken.is_some() {
+        return Ok(None);
+    }
+
+    let id = ulid();
+    sqlx::query(
+        "INSERT INTO sin90_reviews (id, kind, status, week_id, period, body, created_at, updated_at)
+         VALUES (?, 'weekly', 'draft', NULL, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(week)
+    .bind(body)
+    .bind(now)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+
+    append_event(
+        tx,
+        "review",
+        &id,
+        "created",
+        None,
+        Some("draft"),
+        &json!({
+            "review_id": id, "kind": "weekly", "period": week, "status": "draft",
+            "source": "routine",
+        }),
+        now,
+    )
+    .await?;
+
+    Ok(Some(AutoReviewCreated {
+        review_id: id,
+        period: week.to_string(),
+    }))
 }
 
 /// Slugify a title for `sin90_areas.slug` (unique, URL-safe). Lowercase ASCII
@@ -1929,6 +2013,51 @@ impl Sin90Store {
     /// nothing functionally — it documents, same convention as
     /// `core::proposal`'s `_AreaIdUsed`, that a caller-less `pub fn` at this
     /// point in the stack is expected, not a mistake.
+    ///
+    /// **T4.3.2** (spec.md M4 "review Routine 到点自动建草稿"): when the
+    /// fired Routine's `kind` is `review`, this ALSO ensures a `weekly`
+    /// draft Review exists for the ISO week `scheduled_for` falls in
+    /// ([`crate::core::iso_week_of`]) — but only on a genuinely NEW fire
+    /// (never on [`RoutineFireOutcome::Duplicate`] or
+    /// [`RoutineFireOutcome::RoutineRetired`]), and only if no `(weekly,
+    /// that week)` Review exists yet (draft OR finalized — see
+    /// `insert_weekly_review_draft_if_absent`'s doc). Only `weekly` is
+    /// implemented: Sin90's data model has no field today that would tell
+    /// this function a review-kind Routine's fire should instead produce a
+    /// `daily` or `rhythm` Review (`Routine.kind` only says "this is a
+    /// review routine", not which `Review.kind`/period it feeds) — adding
+    /// that distinction is out of this task's scope (see task report), so a
+    /// `review`-kind Routine ALWAYS maps to that week's `weekly` draft, no
+    /// matter its actual cron cadence.
+    ///
+    /// **Same-transaction note**: the fire dedup + `routine.fired` event
+    /// above, and the review-existence-check + insert below, both run
+    /// inside the ONE `BEGIN IMMEDIATE` transaction this method already
+    /// opens — genuinely atomic, not a two-step race. What does NOT run in
+    /// that transaction is computing the draft's CONTENT (the `by_area`/
+    /// `by_direction`/`tasks_done`/`routines` numbers,
+    /// [`Sin90Store::weekly_draft`]): that call goes through
+    /// `self.pool()` for its own reads, and `Sin90Store::open_memory`
+    /// (every test in this crate) pools exactly ONE connection — reusing it
+    /// from inside a transaction that already checked that same connection
+    /// out would deadlock waiting for a connection that will never free up
+    /// before this transaction commits. So the draft's Markdown body is
+    /// precomputed BEFORE `tx` opens below, on a separate pool checkout,
+    /// and only the cheap "does this period already have a Review" gate +
+    /// the `INSERT` run inside the write transaction. Consequence: the
+    /// precomputed body can miss an event written in the (normally
+    /// sub-millisecond) gap between that precompute and this transaction's
+    /// commit — including, notably, THIS very `routine.fired` event, which
+    /// is always appended strictly after the precompute runs. Accepted per
+    /// this task's brief ("草稿内容可能差最新一两个事件，可接受但要写明"):
+    /// the alternative (rewriting `weekly_draft`/`attention` to accept an
+    /// arbitrary `sqlx` executor instead of always going through
+    /// `self.pool()`) is real surgery on two other files whose sourcing
+    /// discipline is already carefully documented and tested (see
+    /// `weekly_draft.rs`'s module doc) — out of proportion to what this
+    /// task needs, and not required by its own acceptance criteria (which
+    /// only asks that the rendered numbers match `WeeklyDraft`'s own
+    /// structure, not that the draft be perfectly live).
     #[allow(dead_code)]
     pub async fn record_routine_fire(
         &self,
@@ -1941,17 +2070,47 @@ impl Sin90Store {
             return Ok(RoutineFireOutcome::UnknownKey);
         };
 
+        // Precompute (see this method's doc for why it must happen BEFORE
+        // `tx` opens): only bother if this routine is `kind: review` and
+        // `scheduled_for` parses as a fixed-width timestamp. A malformed
+        // `scheduled_for` here does not fail the whole fire receipt — it
+        // just means no auto-draft this time (the HTTP layer already
+        // rejects a malformed `scheduled_for` with 400 before ever calling
+        // this method; this fallback only matters for a direct test/store
+        // caller that skips that check).
+        let review_week: Option<String> = {
+            let kind: Option<String> = sqlx::query("SELECT kind FROM sin90_routines WHERE id = ?")
+                .bind(routine_id)
+                .fetch_optional(self.pool())
+                .await?
+                .map(|r| r.get::<String, _>("kind"));
+            match kind.as_deref() {
+                Some("review") => crate::core::iso_week_of(scheduled_for),
+                _ => None,
+            }
+        };
+        // Fetch the actual draft content now, still before `tx` opens, on
+        // its own separate `self.pool()` checkout (see this method's doc).
+        let precomputed_weekly: Option<(String, String)> = match review_week {
+            Some(week) => {
+                let draft = self.weekly_draft(&week).await?;
+                Some((week, crate::store::render_weekly_draft_markdown(&draft)))
+            }
+            None => None,
+        };
+
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
 
-        let status: Option<String> = sqlx::query("SELECT status FROM sin90_routines WHERE id = ?")
+        let row = sqlx::query("SELECT status, kind FROM sin90_routines WHERE id = ?")
             .bind(routine_id)
             .fetch_optional(&mut *tx)
-            .await?
-            .map(|r| r.get::<String, _>("status"));
-
-        let Some(status) = status else {
+            .await?;
+        let Some(row) = row else {
             return Ok(RoutineFireOutcome::UnknownKey);
         };
+        let status: String = row.get("status");
+        let kind: String = row.get("kind");
+
         if status == "retired" {
             return Ok(RoutineFireOutcome::RoutineRetired {
                 routine_id: routine_id.to_string(),
@@ -2003,9 +2162,19 @@ impl Sin90Store {
             &now,
         )
         .await?;
+
+        let mut auto_review = None;
+        if kind == "review" {
+            if let Some((week, body)) = &precomputed_weekly {
+                auto_review =
+                    insert_weekly_review_draft_if_absent(&mut tx, week, body, &now).await?;
+            }
+        }
+
         tx.commit().await?;
         Ok(RoutineFireOutcome::Recorded {
             routine_id: routine_id.to_string(),
+            auto_review,
         })
     }
 
@@ -2390,6 +2559,7 @@ impl Sin90Store {
             Some("draft"),
             &json!({
                 "review_id": id, "kind": kind_str, "period": period, "status": "draft",
+                "source": "human",
             }),
             &now,
         )
@@ -5263,5 +5433,415 @@ mod fired_tests {
             .filter(|r| r.id == routine.id)
             .count();
         assert_eq!(count, 1, "{:?}", view.fired_routines);
+    }
+}
+
+// ----- T4.3.2: review Routine fired -> auto weekly draft (spec.md M4) -----
+
+#[cfg(test)]
+mod review_routine_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::routine_tests::nr;
+    use super::*;
+    use crate::core::RoutineKind;
+
+    async fn new_store() -> Sin90Store {
+        Sin90Store::open_memory().await.unwrap()
+    }
+
+    async fn create_review_routine(store: &Sin90Store) -> Routine {
+        store
+            .create_routine(&nr("Weekly review", RoutineKind::Review, "0 18 * * SUN"))
+            .await
+            .unwrap()
+    }
+
+    /// Reads a Review's `body`/`status` back by id — small local helper so
+    /// the tests below don't repeat the same raw query.
+    async fn review_row(store: &Sin90Store, id: &str) -> (String, String) {
+        let row = sqlx::query("SELECT body, status FROM sin90_reviews WHERE id = ?")
+            .bind(id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        (row.get::<String, _>("body"), row.get::<String, _>("status"))
+    }
+
+    async fn weekly_review_count(store: &Sin90Store, period: &str) -> i64 {
+        sqlx::query("SELECT COUNT(*) AS n FROM sin90_reviews WHERE kind = 'weekly' AND period = ?")
+            .bind(period)
+            .fetch_one(store.pool())
+            .await
+            .unwrap()
+            .get("n")
+    }
+
+    // ----- two fires, same ISO week -> exactly one draft ----------------------
+
+    /// The task's core acceptance: a review-kind Routine firing TWICE in the
+    /// SAME ISO week (two distinct `fire_id`s, so this is not the dedup path)
+    /// must still leave exactly one `(weekly, week)` Review.
+    #[tokio::test]
+    async fn review_routine_two_fires_same_week_create_only_one_draft() {
+        let store = new_store().await;
+        let routine = create_review_routine(&store).await;
+
+        let first = store
+            .record_routine_fire(
+                "fire-1",
+                &format!("routine.{}", routine.id),
+                "2026-09-21T18:00:00Z", // 2026-W39, Monday
+                FireTrigger::Tick,
+            )
+            .await
+            .unwrap();
+        let second = store
+            .record_routine_fire(
+                "fire-2",
+                &format!("routine.{}", routine.id),
+                "2026-09-24T18:00:00Z", // still 2026-W39, Thursday
+                FireTrigger::Tick,
+            )
+            .await
+            .unwrap();
+
+        let RoutineFireOutcome::Recorded { auto_review, .. } = first else {
+            panic!("expected Recorded, got {first:?}");
+        };
+        assert!(
+            auto_review.is_some(),
+            "first fire in a fresh week must auto-create the draft"
+        );
+        let RoutineFireOutcome::Recorded { auto_review, .. } = second else {
+            panic!("expected Recorded, got {second:?}");
+        };
+        assert!(
+            auto_review.is_none(),
+            "second fire in the SAME week must not auto-create another draft"
+        );
+
+        assert_eq!(weekly_review_count(&store, "2026-W39").await, 1);
+    }
+
+    /// Positive control for the test above: two fires landing in DIFFERENT
+    /// ISO weeks must leave two separate drafts, one per week — proves the
+    /// dedup above is keyed on the week, not just "this routine already has
+    /// a draft somewhere".
+    #[tokio::test]
+    async fn review_routine_fires_in_different_weeks_create_two_drafts_positive_control() {
+        let store = new_store().await;
+        let routine = create_review_routine(&store).await;
+
+        let first = store
+            .record_routine_fire(
+                "fire-1",
+                &format!("routine.{}", routine.id),
+                "2026-09-21T18:00:00Z", // 2026-W39
+                FireTrigger::Tick,
+            )
+            .await
+            .unwrap();
+        let second = store
+            .record_routine_fire(
+                "fire-2",
+                &format!("routine.{}", routine.id),
+                "2026-09-28T18:00:00Z", // 2026-W40 — the FOLLOWING week
+                FireTrigger::Tick,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            first,
+            RoutineFireOutcome::Recorded {
+                auto_review: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            second,
+            RoutineFireOutcome::Recorded {
+                auto_review: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(weekly_review_count(&store, "2026-W39").await, 1);
+        assert_eq!(weekly_review_count(&store, "2026-W40").await, 1);
+    }
+
+    // ----- same fire_id retried -> no duplicate draft --------------------------
+
+    #[tokio::test]
+    async fn review_routine_duplicate_fire_id_does_not_duplicate_draft() {
+        let store = new_store().await;
+        let routine = create_review_routine(&store).await;
+
+        let first = store
+            .record_routine_fire(
+                "fire-retry",
+                &format!("routine.{}", routine.id),
+                "2026-09-21T18:00:00Z",
+                FireTrigger::Tick,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            first,
+            RoutineFireOutcome::Recorded {
+                auto_review: Some(_),
+                ..
+            }
+        ));
+
+        // The kernel's at-least-once retry: SAME fire_id.
+        let retried = store
+            .record_routine_fire(
+                "fire-retry",
+                &format!("routine.{}", routine.id),
+                "2026-09-21T18:00:00Z",
+                FireTrigger::Tick,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            retried,
+            RoutineFireOutcome::Duplicate {
+                routine_id: routine.id.clone()
+            }
+        );
+
+        assert_eq!(weekly_review_count(&store, "2026-W39").await, 1);
+    }
+
+    // ----- an already-finalized review for the week -> no new draft -----------
+
+    /// A Review for the week already exists and is FINALIZED (not just a
+    /// draft) — the fire must not create a second `(weekly, week)` row, and
+    /// must not touch the finalized one either.
+    #[tokio::test]
+    async fn review_routine_existing_finalized_review_blocks_auto_draft() {
+        let store = new_store().await;
+        let routine = create_review_routine(&store).await;
+
+        let human = store
+            .create_review(&NewReview {
+                kind: ReviewKind::Weekly,
+                period: "2026-W39".to_string(),
+            })
+            .await
+            .unwrap();
+        store.finalize_review(&human.id).await.unwrap();
+
+        let outcome = store
+            .record_routine_fire(
+                "fire-1",
+                &format!("routine.{}", routine.id),
+                "2026-09-21T18:00:00Z",
+                FireTrigger::Tick,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            RoutineFireOutcome::Recorded {
+                auto_review: None,
+                ..
+            }
+        ));
+
+        assert_eq!(weekly_review_count(&store, "2026-W39").await, 1);
+        let (_, status) = review_row(&store, &human.id).await;
+        assert_eq!(status, "finalized", "the existing review must be untouched");
+    }
+
+    // ----- non-review Routine kind -> never auto-creates a review -------------
+
+    /// Negative control: an `exercise`-kind Routine firing must NEVER
+    /// auto-create a Review, no matter how many times it fires.
+    #[tokio::test]
+    async fn review_routine_non_review_kind_never_creates_a_review() {
+        let store = new_store().await;
+        let routine = store
+            .create_routine(&nr(
+                "Morning run",
+                RoutineKind::Exercise,
+                "0 7 * * MON,WED,FRI",
+            ))
+            .await
+            .unwrap();
+
+        let outcome = store
+            .record_routine_fire(
+                "fire-1",
+                &format!("routine.{}", routine.id),
+                "2026-09-21T18:00:00Z",
+                FireTrigger::Tick,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            RoutineFireOutcome::Recorded {
+                auto_review: None,
+                ..
+            }
+        ));
+        assert_eq!(weekly_review_count(&store, "2026-W39").await, 0);
+    }
+
+    // ----- draft body matches weekly_draft's own structure ---------------------
+
+    /// The auto-created draft's `body` must contain the SAME numbers
+    /// `weekly_draft` itself computes for that week — built from a small
+    /// fixture (one completed block, one done task) BEFORE the routine
+    /// fires, same technique `weekly_draft_tests` uses.
+    #[tokio::test]
+    async fn review_routine_draft_body_matches_weekly_draft_structure() {
+        use crate::core::{Energy, ScheduleBlockStatus, TaskKind, TaskStatus};
+        use crate::store::test_hooks;
+
+        let store = new_store().await;
+        let area_id = store.create_area("Work").await.unwrap().id;
+        let direction = store
+            .create_direction("Coding", "this-quarter", Some(&area_id))
+            .await
+            .unwrap();
+
+        let in_week = "2026-09-22T09:00:00Z"; // 2026-W39
+        let block = store
+            .create_block(Some(&direction.id), None, 90)
+            .await
+            .unwrap();
+        store
+            .transition_block(&block.id, ScheduleBlockStatus::Started)
+            .await
+            .unwrap();
+        store
+            .transition_block(&block.id, ScheduleBlockStatus::Completed)
+            .await
+            .unwrap();
+        test_hooks::set_last_event_at(&store, "block", &block.id, in_week)
+            .await
+            .unwrap();
+
+        let task = store
+            .create_task("t", None, None, TaskKind::Other, Energy::Mid, None)
+            .await
+            .unwrap();
+        for to in [
+            TaskStatus::Planned,
+            TaskStatus::InProgress,
+            TaskStatus::Done,
+        ] {
+            store.transition_task(&task.id, to).await.unwrap();
+        }
+        test_hooks::set_last_event_at(&store, "task", &task.id, in_week)
+            .await
+            .unwrap();
+
+        // Independently computed expectation — the SAME call the draft
+        // itself would run, at the SAME point in time (before the routine
+        // fires below adds its own `routine.fired` event on top).
+        let expected = store.weekly_draft("2026-W39").await.unwrap();
+        let expected_md = crate::store::render_weekly_draft_markdown(&expected);
+        assert!(expected_md.contains(&format!(
+            "{direction_id}: 90 min",
+            direction_id = direction.id
+        )));
+        assert!(expected_md.contains("Tasks done: 1"));
+
+        let routine = create_review_routine(&store).await;
+        let outcome = store
+            .record_routine_fire(
+                "fire-1",
+                &format!("routine.{}", routine.id),
+                "2026-09-24T18:00:00Z", // 2026-W39, after the fixture events above
+                FireTrigger::Tick,
+            )
+            .await
+            .unwrap();
+        let RoutineFireOutcome::Recorded { auto_review, .. } = outcome else {
+            panic!("expected Recorded, got {outcome:?}");
+        };
+        let auto_review = auto_review.expect("must auto-create a draft");
+
+        let (body, status) = review_row(&store, &auto_review.review_id).await;
+        assert_eq!(status, "draft");
+        assert!(
+            body.contains(&format!(
+                "{direction_id}: 90 min",
+                direction_id = direction.id
+            )),
+            "draft body must contain the area/direction hour numbers weekly_draft computed: {body}"
+        );
+        assert!(
+            body.contains("Tasks done: 1"),
+            "draft body must contain the exact tasks_done count: {body}"
+        );
+    }
+
+    // ----- event payload: source field ------------------------------------
+
+    #[tokio::test]
+    async fn review_routine_created_event_payload_has_source_routine() {
+        let store = new_store().await;
+        let routine = create_review_routine(&store).await;
+
+        let outcome = store
+            .record_routine_fire(
+                "fire-1",
+                &format!("routine.{}", routine.id),
+                "2026-09-21T18:00:00Z",
+                FireTrigger::Tick,
+            )
+            .await
+            .unwrap();
+        let RoutineFireOutcome::Recorded { auto_review, .. } = outcome else {
+            panic!("expected Recorded, got {outcome:?}");
+        };
+        let auto_review = auto_review.expect("must auto-create a draft");
+
+        let row = sqlx::query(
+            "SELECT payload FROM sin90_events
+             WHERE entity = 'review' AND entity_id = ? AND kind = 'created'",
+        )
+        .bind(&auto_review.review_id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(&row.get::<String, _>("payload")).unwrap();
+        assert_eq!(payload["source"], "routine");
+        assert_eq!(payload["kind"], "weekly");
+        assert_eq!(payload["period"], "2026-W39");
+    }
+
+    /// Positive control for the test above: a HUMAN-created review's
+    /// `review.created` event payload carries `source: "human"`, not
+    /// `"routine"` — proves the field actually distinguishes the two paths,
+    /// not just a hardcoded constant on one side.
+    #[tokio::test]
+    async fn review_routine_human_created_event_payload_has_source_human_positive_control() {
+        let store = new_store().await;
+        let review = store
+            .create_review(&NewReview {
+                kind: ReviewKind::Weekly,
+                period: "2026-W01".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let row = sqlx::query(
+            "SELECT payload FROM sin90_events
+             WHERE entity = 'review' AND entity_id = ? AND kind = 'created'",
+        )
+        .bind(&review.id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(&row.get::<String, _>("payload")).unwrap();
+        assert_eq!(payload["source"], "human");
     }
 }

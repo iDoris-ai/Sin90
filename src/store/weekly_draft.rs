@@ -75,6 +75,63 @@ pub struct WeeklyDraft {
     pub routines: Vec<RoutineDraftRow>,
 }
 
+/// Deterministic Markdown rendering of a [`WeeklyDraft`] (T4.3.2, spec.md M4:
+/// a `Routine{kind:review}` fire's auto-created draft Review's `body` "=
+/// T4.3.1 的周复盘草稿"). Pure function of the struct's own fields — every
+/// number it prints came from [`Sin90Store::weekly_draft`]'s own event
+/// replay, nothing is recomputed or looked up again here, so the same
+/// [`WeeklyDraft`] value always renders to byte-identical Markdown.
+pub fn render_weekly_draft_markdown(draft: &WeeklyDraft) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("# Weekly Review Draft — {}\n\n", draft.week));
+
+    out.push_str("## By Area\n\n");
+    if draft.by_area.is_empty() {
+        out.push_str("_no attention recorded this week_\n\n");
+    } else {
+        for a in &draft.by_area {
+            let label = if a.area_id.is_empty() {
+                "(no area)"
+            } else {
+                a.area_id.as_str()
+            };
+            out.push_str(&format!("- {label}: {} min\n", a.minutes));
+        }
+        out.push('\n');
+    }
+
+    out.push_str("## By Direction\n\n");
+    if draft.by_direction.is_empty() {
+        out.push_str("_no attention recorded this week_\n\n");
+    } else {
+        for d in &draft.by_direction {
+            let label = if d.direction_id.is_empty() {
+                "(no direction)"
+            } else {
+                d.direction_id.as_str()
+            };
+            out.push_str(&format!("- {label}: {} min\n", d.minutes));
+        }
+        out.push('\n');
+    }
+
+    out.push_str(&format!("## Tasks done: {}\n\n", draft.tasks_done));
+
+    out.push_str("## Routines fired\n\n");
+    if draft.routines.is_empty() {
+        out.push_str("_no routines fired this week_\n");
+    } else {
+        for r in &draft.routines {
+            out.push_str(&format!(
+                "- {}: fired {}, completed {}\n",
+                r.routine_id, r.fired, r.completed
+            ));
+        }
+    }
+
+    out
+}
+
 impl Sin90Store {
     /// Pure event replay for `iso_week` (`YYYY-Www`). `Err(StoreError::Invalid)`
     /// for a malformed week label — never a silent empty draft (same posture
@@ -518,6 +575,84 @@ mod weekly_draft_tests {
         assert_eq!(
             after, before,
             "editing sin90_schedule_blocks/sin90_tasks directly must not change the draft at all"
+        );
+    }
+
+    // ----- T4.3.2: render_weekly_draft_markdown -------------------------------
+
+    /// The task's own acceptance for the render function: the Markdown must
+    /// contain the SAME numbers the struct carries — checked against a draft
+    /// built from the same hand-computed fixture style the tests above use,
+    /// not against the render function's own output (that would be circular).
+    #[tokio::test]
+    async fn render_weekly_draft_markdown_contains_correct_hours_and_counts() {
+        let store = new_store().await;
+        let area_work = store.create_area("Work").await.unwrap().id;
+        let dir_coding = direction(&store, Some(&area_work)).await;
+        let in_week = "2026-09-24T10:00:00Z";
+        complete_block_at(&store, &dir_coding, 125, in_week).await;
+        complete_task_at(&store, in_week).await;
+        let r1 = routine(&store, "Weekly review").await;
+        fire_routine_at(&store, &r1, "fire-1", in_week).await;
+        fire_routine_at(&store, &r1, "fire-2", in_week).await;
+
+        let draft = store.weekly_draft("2026-W39").await.unwrap();
+        let md = render_weekly_draft_markdown(&draft);
+
+        assert!(md.contains("2026-W39"), "must name the week: {md}");
+        assert!(
+            md.contains(&format!("{area_work}: 125 min")),
+            "must contain the area's exact minutes: {md}"
+        );
+        assert!(
+            md.contains(&format!("{dir_coding}: 125 min")),
+            "must contain the direction's exact minutes: {md}"
+        );
+        assert!(
+            md.contains("Tasks done: 1"),
+            "must contain the exact tasks_done count: {md}"
+        );
+        assert!(
+            md.contains(&format!("{r1}: fired 2, completed 0")),
+            "must contain the routine's exact fired count: {md}"
+        );
+    }
+
+    /// An empty week still renders a structurally complete, non-panicking
+    /// Markdown document (no area/direction/routine rows to iterate).
+    #[tokio::test]
+    async fn render_weekly_draft_markdown_empty_week_does_not_panic() {
+        let store = new_store().await;
+        let draft = store.weekly_draft("2026-W01").await.unwrap();
+        let md = render_weekly_draft_markdown(&draft);
+        assert!(md.contains("2026-W01"));
+        assert!(md.contains("Tasks done: 0"));
+    }
+
+    /// Determinism: the same [`WeeklyDraft`] value always renders to the
+    /// exact same Markdown string (pure function of its fields).
+    #[test]
+    fn render_weekly_draft_markdown_is_deterministic() {
+        let draft = WeeklyDraft {
+            week: "2026-W39".to_string(),
+            by_area: vec![AreaMinutes {
+                area_id: "area-1".to_string(),
+                minutes: 60,
+            }],
+            by_direction: vec![DirectionMinutes {
+                direction_id: "dir-1".to_string(),
+                minutes: 60,
+            }],
+            tasks_done: 3,
+            routines: vec![RoutineDraftRow {
+                routine_id: "routine-1".to_string(),
+                fired: 2,
+                completed: 0,
+            }],
+        };
+        assert_eq!(
+            render_weekly_draft_markdown(&draft),
+            render_weekly_draft_markdown(&draft)
         );
     }
 }
