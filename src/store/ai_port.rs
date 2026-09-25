@@ -230,20 +230,18 @@ impl AiReadModel for AiReader {
             .collect()
     }
 
-    /// R1's history lookup (§11.4.1, T5.2.1): every ALREADY-classified task
-    /// whose Direction is still non-terminal, normalized here through the
-    /// **T5.2.1a placeholder** `coarse_normalize` (this branch has no
-    /// `ai::classify` yet — the frozen `normalize_title` algorithm, §11.4.1
-    /// R1, is `ai::classify`'s deliverable, T5.2.1b) and compared against
-    /// `normalized` taken as-is — correct as long as the caller normalizes
-    /// its query the same way this folds candidates. The non-terminal-
-    /// Direction filter (the `JOIN` + `status NOT IN (...)`, exclusion set
-    /// shared with `direction_candidates` above via
-    /// [`terminal_direction_status_wires`]) is real already: "is this
-    /// Direction still open" is a plain relational check that belongs here
-    /// regardless of which normalization algorithm is doing the string
-    /// comparison. See `r1_history_ignores_abandoned_direction` for the
-    /// regression this filter guards against.
+    /// R1's history lookup (§11.4.1, T5.2.1b): every ALREADY-classified task
+    /// whose Direction is still non-terminal, normalized through the real
+    /// `normalize_title` (`crate::ai::classify`, not a local approximation —
+    /// T5.2.1a's placeholder here was `coarse_normalize`, now removed) and
+    /// compared against `normalized` (the caller normalizes the SAME way, so
+    /// the comparison is exact). The non-terminal-Direction filter (the
+    /// `JOIN` + `status NOT IN (...)`, exclusion set shared with
+    /// `direction_candidates` above via [`terminal_direction_status_wires`])
+    /// landed in T5.2.1a already, independent of which normalization
+    /// algorithm does the string comparison. See
+    /// `r1_history_ignores_abandoned_direction` (T5.2.1a) for the regression
+    /// this filter guards against.
     async fn title_history(&self, normalized: &str) -> Result<Vec<DirectionId>, ReadError> {
         let terminal = terminal_direction_status_wires();
         let placeholders = terminal.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
@@ -262,7 +260,7 @@ impl AiReadModel for AiReader {
         let mut out = Vec::new();
         for r in rows {
             let title: String = r.get("title");
-            if coarse_normalize(&title) == normalized {
+            if crate::ai::classify::normalize_title(&title) == normalized {
                 out.push(r.get::<String, _>("direction_id"));
             }
         }
@@ -295,14 +293,6 @@ impl AiReadModel for AiReader {
             .collect::<StoreResult<_>>()
             .map_err(rerr)
     }
-}
-
-/// Whitespace-collapse + lowercase — see [`AiReadModel::title_history`]'s doc.
-fn coarse_normalize(s: &str) -> String {
-    s.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
 }
 
 async fn read_ai_settings(pool: &SqlitePool) -> Result<AiSettings, ReadError> {
@@ -1375,5 +1365,88 @@ mod tests {
         for s in ALL_DIRECTION_STATUSES {
             assert_exhaustive(s);
         }
+    }
+
+    /// A fixed-reply `ModelPort`, local to this test — J8's own boundary
+    /// snapshot test needs a model but this file (not `ai::classify`'s own
+    /// tests) is where it belongs, since it exercises the REAL
+    /// `Sin90Store`-as-`AiSink` path end to end.
+    struct FixedReply(&'static str);
+    impl crate::ai::ModelPort for FixedReply {
+        async fn complete(
+            &self,
+            _req: crate::ai::ModelRequest,
+        ) -> Result<crate::ai::ModelReply, crate::ai::ModelFailure> {
+            Ok(crate::ai::ModelReply {
+                text: self.0.to_string(),
+                model_id: Some("test-model".into()),
+                tier: crate::ai::ServedTier::Local,
+                prompt_tokens: None,
+                completion_tokens: None,
+            })
+        }
+    }
+
+    /// M7 (2026-09-24 review): J8's table-snapshot judgement, exercised
+    /// through the FULL classify capability (`ai::classify::run_classify`),
+    /// not just a hand-built `ProposalDraft` — the produced
+    /// `AssignTaskDirection` proposal's `submit` dry-run must still leave
+    /// `sin90_tasks` untouched. Mutation target: same as
+    /// `ai_boundary_tables_unchanged`'s — make `dry_run` actually commit
+    /// instead of rolling back its `SAVEPOINT`, and `sin90_tasks` changes.
+    #[tokio::test]
+    async fn ai_boundary_tables_unchanged_via_full_classify_run() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let _direction = store
+            .create_direction("Work", "2026-Q4", None)
+            .await
+            .unwrap();
+        let task = store
+            .create_task(
+                "Write the doc",
+                None,
+                None,
+                crate::core::TaskKind::Other,
+                crate::core::Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+        let reader = store.ai_reader();
+        let pool = store.pool().clone();
+
+        let before = snapshot_all_tables(&pool).await;
+        let model = FixedReply(r#"{"choice":"d1","confidence":"high","reason":"fits"}"#);
+        let items = crate::ai::classify::run_classify(
+            "run-j8-full",
+            std::slice::from_ref(&task),
+            crate::ai::ModelAccess::LocalOnly,
+            Some(&model),
+            &store,
+            &reader,
+        )
+        .await;
+        assert!(matches!(
+            items[0].result,
+            crate::ai::classify::ItemResult::Proposed(_)
+        ));
+
+        let after = snapshot_all_tables(&pool).await;
+        let mut changed = diff_keys(&before, &after);
+        changed.sort();
+        assert_eq!(
+            changed,
+            vec![
+                "sin90_ai_calls".to_string(),
+                "sin90_events(entity=proposal)".to_string(),
+                "sin90_proposals".to_string(),
+            ],
+            "a full classify run's submit must leave sin90_tasks untouched"
+        );
+        assert_eq!(
+            before.get("sin90_tasks"),
+            after.get("sin90_tasks"),
+            "the produced AssignTaskDirection's dry-run apply must not have actually applied"
+        );
     }
 }

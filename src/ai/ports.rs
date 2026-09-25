@@ -246,6 +246,25 @@ pub trait ModelPort: Send + Sync {
     ) -> impl Future<Output = Result<ModelReply, ModelFailure>> + Send;
 }
 
+/// A `ModelPort` this branch never actually calls (T5.1.2 handoff — no real
+/// `_a24/model/complete` adapter is wired yet, see `ai::mod`'s doc). HTTP
+/// trigger routes (`POST /ai/classify`, T5.2.1) pass `model: None` typed
+/// against this so the engine ladder's generic `M` parameter still has a
+/// concrete type to monomorphize against, without pretending a model is
+/// present. `plan()` never schedules a `Step::Model(..)` when the caller
+/// passes `model_port_present: false`, so `complete` is provably unreachable
+/// through that path; it still needs a body to satisfy the trait.
+#[derive(Debug, Clone, Copy)]
+pub struct NoModelPort;
+impl ModelPort for NoModelPort {
+    async fn complete(&self, _req: ModelRequest) -> Result<ModelReply, ModelFailure> {
+        unreachable!(
+            "NoModelPort::complete: the caller must pass model_port_present=false to plan() \
+             so no Step::Model is ever scheduled against a None model"
+        )
+    }
+}
+
 // ---------------------------------------------------------------- sink + read
 
 #[derive(Debug, Clone, PartialEq, Eq)]
