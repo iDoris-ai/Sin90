@@ -232,12 +232,14 @@ fn row_to_review(r: sqlx::sqlite::SqliteRow) -> Result<Review> {
         week_id: r.get("week_id"),
         period: r.get("period"),
         body: r.get("body"),
+        body_ref: r.get("body_ref"),
         created_at: r.get("created_at"),
         updated_at: r.get("updated_at"),
     })
 }
 
-const REVIEW_COLUMNS: &str = "id, kind, status, week_id, period, body, created_at, updated_at";
+const REVIEW_COLUMNS: &str =
+    "id, kind, status, week_id, period, body, body_ref, created_at, updated_at";
 
 /// L3 (T3.1.1 review): an `i64` column value read back as `u32` goes through
 /// a checked conversion, not `as u32` — `as` silently truncates/wraps on
@@ -298,6 +300,117 @@ fn validate_review_period(kind: ReviewKind, period: &str) -> Result<String> {
             Ok(trimmed.to_string())
         }
     }
+}
+
+/// Crockford Base32 — the exact alphabet [`crate::core::ulid`] emits, and
+/// therefore the only charset a `rhythm` Review's `period` (a `RhythmId`,
+/// itself always a `ulid()`) can legitimately hold.
+const ULID_ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/// Compute the `body_ref` a finalized Review's Markdown export gets — a path
+/// RELATIVE TO `data_dir` (T4.2.1, design §2 #11/§4.2/spec.md M4):
+/// `reviews/<kind>/<period>.md`.
+///
+/// `period` reaches `finalize_review` already validated once, by
+/// [`validate_review_period`] at `create_review` time (daily/weekly: a
+/// canonical calendar-date/ISO-week string that structurally cannot contain
+/// a path separator; rhythm: confirmed to equal a real `sin90_rhythms.id`,
+/// which is always a [`crate::core::ulid`]). This function does NOT lean on
+/// that history — it independently re-validates `period` as a single safe
+/// filename component before it is allowed anywhere near a filesystem path,
+/// because that is the only thing standing between a future bug elsewhere
+/// (a new caller of `write_markdown_atomic`, a relaxed `validate_review_period`,
+/// a hand-crafted DB row) and a path-traversal write. Rejects a `period`
+/// that:
+///   - is empty, is exactly `.` or `..`, or starts with `.`
+///   - contains `/`, `\`, `..` (as a substring — catches `a..b` too), or a
+///     NUL byte
+///
+/// and, for `rhythm` specifically, additionally whitelists the charset to
+/// [`ULID_ALPHABET`] (belt-and-suspenders: even a period that passed the
+/// generic checks above must still look like an actual ulid).
+fn review_markdown_relpath(kind: ReviewKind, period: &str) -> Result<String> {
+    let unsafe_component = period.is_empty()
+        || period == "."
+        || period == ".."
+        || period.starts_with('.')
+        || period.contains('/')
+        || period.contains('\\')
+        || period.contains("..")
+        || period.contains('\0');
+    if unsafe_component {
+        return Err(StoreError::Invalid(format!(
+            "review period {period:?} is not a safe filename component"
+        )));
+    }
+    if matches!(kind, ReviewKind::Rhythm) && !period.bytes().all(|b| ULID_ALPHABET.contains(&b)) {
+        return Err(StoreError::Invalid(format!(
+            "rhythm review period {period:?} is not a valid rhythm id"
+        )));
+    }
+    // `kind`'s wire form is a fixed enum value ("daily"/"weekly"/"rhythm"),
+    // never user input — nothing to validate there.
+    let kind_str = to_wire(&kind)?;
+    Ok(format!("reviews/{kind_str}/{period}.md"))
+}
+
+/// Write `body` to `<data_dir>/<relpath>` atomically (T4.2.1): a temp file in
+/// the SAME directory as the final path (so the final `rename` is a same-
+/// filesystem rename, atomic on every OS Sin90 ships on — never true across
+/// filesystems/mount points), fsync'd before the rename, and the containing
+/// directory is fsync'd after the rename so the rename itself survives a
+/// crash. Creates `<data_dir>/reviews/<kind>/` if it does not exist yet.
+///
+/// Deliberately synchronous `std::fs`, not `tokio::fs`: this runs inside
+/// `finalize_review`'s critical section (BEFORE the DB transaction commits —
+/// see that function's doc), and Sin90's whole Review surface is low-volume,
+/// human-paced writes, not a hot path — spawning a blocking task here would
+/// be complexity with no payoff.
+fn write_markdown_atomic(
+    data_dir: &std::path::Path,
+    relpath: &str,
+    body: &str,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let full_path = data_dir.join(relpath);
+    let dir = full_path.parent().expect(
+        "review_markdown_relpath always returns `reviews/<kind>/<period>.md`, which has a parent",
+    );
+    std::fs::create_dir_all(dir)?;
+
+    let file_name = full_path
+        .file_name()
+        .expect("review_markdown_relpath always ends in `<period>.md`");
+    let tmp_path = dir.join(format!(
+        ".{}.tmp-{}",
+        file_name.to_string_lossy(),
+        crate::core::ulid()
+    ));
+
+    let write_result = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp_path)?;
+        f.write_all(body.as_bytes())?;
+        f.sync_all()
+    })();
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    std::fs::rename(&tmp_path, &full_path)?;
+
+    // Best-effort directory fsync so the rename itself is durable, not just
+    // the file's contents — a `File::open` on a directory is valid on the
+    // Unix targets Sin90 ships on. Not fatal if it fails (e.g. an odd
+    // filesystem that refuses to open a directory as a file): the rename
+    // already landed, so the export is not lost, only its durability
+    // guarantee against a same-instant crash is weaker.
+    if let Ok(dir_handle) = std::fs::File::open(dir) {
+        let _ = dir_handle.sync_all();
+    }
+
+    Ok(())
 }
 
 /// `GET /today`'s response shape (design M1). Every field is a plain read —
@@ -2289,6 +2402,7 @@ impl Sin90Store {
             week_id: None,
             period,
             body: String::new(),
+            body_ref: None,
             created_at: now.clone(),
             updated_at: now,
         })
@@ -2406,6 +2520,44 @@ impl Sin90Store {
     /// legal edge, [`check_review_transition`]; `finalized` is terminal, so
     /// finalizing twice is a [`crate::core::TransitionError`] -> 409, same
     /// convention every other transition endpoint above uses).
+    ///
+    /// T4.2.1: finalizing also exports `body` to
+    /// `<data_dir>/reviews/<kind>/<period>.md` (design §2 #11/§4.2) and
+    /// records the RELATIVE path in `body_ref`. Ordering and failure
+    /// semantics (deliberate, not incidental):
+    ///
+    ///   1. Read + validate the transition under `BEGIN IMMEDIATE` (as
+    ///      before) — nothing written yet.
+    ///   2. Write the Markdown file atomically ([`write_markdown_atomic`]),
+    ///      STILL before any `UPDATE`/event/commit. If this fails, we return
+    ///      the error immediately: no `UPDATE` has run, so dropping `tx`
+    ///      rolls back to a no-op and the review is untouched — still
+    ///      `draft`, `body_ref` still whatever it was, no `finalized` event.
+    ///   3. Only once the file is safely on disk do we `UPDATE` the row
+    ///      (`status`, `body_ref`) and append the `finalized` event, then
+    ///      commit.
+    ///
+    /// The one acceptable inconsistency this leaves: if step 3's `commit()`
+    /// itself fails (disk/IO error at COMMIT, not before), the `.md` file
+    /// from step 2 is now orphaned — written, but the row never actually
+    /// flipped to `finalized` (SQLite rolls the transaction back when a
+    /// commit fails, so `status` reverts to `draft` and `body_ref` reverts to
+    /// whatever it was). This is fine: the Markdown file is a ONE-WAY export,
+    /// never read back, so an orphan is inert — and because the review is
+    /// still `draft`, a client can simply retry `finalize`, which overwrites
+    /// that same orphaned file (same `relpath`) with fresh content and, this
+    /// time, hopefully commits. We do NOT attempt to delete the orphan on a
+    /// failed commit — best-effort cleanup after a commit failure is itself
+    /// I/O that can fail, and leaving a stale file is strictly safer than a
+    /// half-deleted one.
+    ///
+    /// If `self.data_dir` is `None` (only reachable via `open_memory()` with
+    /// no test override — the shipped binary always has a `data_dir`, see
+    /// `main.rs`), there is nowhere to export to: the Markdown step is
+    /// skipped entirely (not a failure) and `body_ref` stays `None`. SQLite
+    /// is the source of truth either way, so this degrades the same way a
+    /// kernel not granting `events` does elsewhere in this crate — it never
+    /// blocks the actual state transition.
     pub async fn finalize_review(&self, id: &str) -> Result<Review> {
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query(&format!(
@@ -2420,12 +2572,32 @@ impl Sin90Store {
         let current = row_to_review(row)?;
         check_review_transition(current.status, ReviewStatus::Finalized)?;
 
+        // Step 2: write the file FIRST — see this fn's doc for why. Nothing
+        // has been written to `sin90_reviews` yet, so an error here leaves
+        // the review exactly as it was (dropping `tx` rolls back the read).
+        let body_ref = match &self.data_dir {
+            Some(dir) => {
+                let relpath = review_markdown_relpath(current.kind, &current.period)?;
+                write_markdown_atomic(dir, &relpath, &current.body).map_err(|e| {
+                    StoreError::Internal(format!(
+                        "failed writing review markdown export {relpath:?}: {e}"
+                    ))
+                })?;
+                Some(relpath)
+            }
+            None => None,
+        };
+
+        // Step 3: only now does anything land in the DB.
         let now = now_iso8601();
-        sqlx::query("UPDATE sin90_reviews SET status = 'finalized', updated_at = ? WHERE id = ?")
-            .bind(&now)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "UPDATE sin90_reviews SET status = 'finalized', body_ref = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(&body_ref)
+        .bind(&now)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
         append_event(
             &mut tx,
             "review",
@@ -2440,6 +2612,7 @@ impl Sin90Store {
         tx.commit().await?;
         Ok(Review {
             status: ReviewStatus::Finalized,
+            body_ref,
             updated_at: now,
             ..current
         })
@@ -3939,6 +4112,359 @@ mod review_tests {
 
         let all = store.list_reviews(None, None).await.unwrap();
         assert_eq!(all.len(), 3);
+    }
+}
+
+// ----- T4.2.1: body_ref — one-way Markdown export on finalize (design §2 #11/
+// §4.2, migration 0008) ------------------------------------------------------
+
+#[cfg(test)]
+mod body_ref_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::store::test_hooks;
+
+    /// A fresh, unique directory under the OS temp dir, removed on drop — no
+    /// `tempfile` dependency needed for this small a need.
+    struct TempDataDir(std::path::PathBuf);
+
+    impl TempDataDir {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("sin90-body-ref-test-{}", ulid()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDataDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    async fn new_store_with_data_dir(dir: &TempDataDir) -> Sin90Store {
+        Sin90Store::open_memory_with_data_dir(dir.path().to_path_buf())
+            .await
+            .unwrap()
+    }
+
+    fn nr(kind: ReviewKind, period: &str) -> NewReview {
+        NewReview {
+            kind,
+            period: period.to_string(),
+        }
+    }
+
+    // ----- happy path: file content == body, body_ref == expected relpath ---
+
+    #[tokio::test]
+    async fn body_ref_finalize_writes_file_matching_body_and_expected_relpath() {
+        let tmp = TempDataDir::new();
+        let store = new_store_with_data_dir(&tmp).await;
+        let review = store
+            .create_review(&nr(ReviewKind::Daily, "2026-09-24"))
+            .await
+            .unwrap();
+        store
+            .update_review_body(&review.id, "today went well")
+            .await
+            .unwrap();
+
+        // The target directory does not exist yet — proves `finalize_review`
+        // creates it (see the next assertions), not that it merely happened
+        // to already be there.
+        assert!(!tmp.path().join("reviews").exists());
+
+        let finalized = store.finalize_review(&review.id).await.unwrap();
+        assert_eq!(finalized.status, ReviewStatus::Finalized);
+        assert_eq!(
+            finalized.body_ref.as_deref(),
+            Some("reviews/daily/2026-09-24.md")
+        );
+
+        let full_path = tmp.path().join("reviews/daily/2026-09-24.md");
+        assert!(full_path.is_file());
+        assert_eq!(
+            std::fs::read_to_string(&full_path).unwrap(),
+            "today went well"
+        );
+
+        // Re-fetching the row agrees with what `finalize_review` returned.
+        let fetched = store.get_review(&review.id).await.unwrap();
+        assert_eq!(
+            fetched.body_ref.as_deref(),
+            Some("reviews/daily/2026-09-24.md")
+        );
+    }
+
+    /// `kind` participates in the relpath, and a `rhythm` period (a real
+    /// `ulid()`-shaped `RhythmId`) passes the charset whitelist.
+    #[tokio::test]
+    async fn body_ref_rhythm_kind_relpath_uses_rhythm_directory() {
+        let tmp = TempDataDir::new();
+        let store = new_store_with_data_dir(&tmp).await;
+        let rhythm_id = ulid();
+        test_hooks::insert_rhythm(&store, &rhythm_id).await.unwrap();
+        let review = store
+            .create_review(&nr(ReviewKind::Rhythm, &rhythm_id))
+            .await
+            .unwrap();
+        store
+            .update_review_body(&review.id, "rhythm notes")
+            .await
+            .unwrap();
+
+        let finalized = store.finalize_review(&review.id).await.unwrap();
+        assert_eq!(
+            finalized.body_ref.as_deref(),
+            Some(format!("reviews/rhythm/{rhythm_id}.md").as_str())
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(format!("reviews/rhythm/{rhythm_id}.md")))
+                .unwrap(),
+            "rhythm notes"
+        );
+    }
+
+    // ----- read API is one-way: a hand-edited .md never leaks back ----------
+
+    #[tokio::test]
+    async fn body_ref_hand_edited_md_does_not_affect_read_api() {
+        let tmp = TempDataDir::new();
+        let store = new_store_with_data_dir(&tmp).await;
+        let review = store
+            .create_review(&nr(ReviewKind::Daily, "2026-09-24"))
+            .await
+            .unwrap();
+        store
+            .update_review_body(&review.id, "original body")
+            .await
+            .unwrap();
+        let finalized = store.finalize_review(&review.id).await.unwrap();
+        let relpath = finalized.body_ref.clone().unwrap();
+
+        // Hand-edit the exported file — simulating a human/tool touching the
+        // one-way export directly.
+        std::fs::write(tmp.path().join(&relpath), "TAMPERED").unwrap();
+
+        // Positive control baked into the same assertion: the file itself
+        // really did change...
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(&relpath)).unwrap(),
+            "TAMPERED"
+        );
+        // ...but every read path still answers from SQLite.
+        let via_get = store.get_review(&review.id).await.unwrap();
+        assert_eq!(via_get.body, "original body");
+        let via_list = store
+            .list_reviews(Some(ReviewKind::Daily), Some("2026-09-24"))
+            .await
+            .unwrap();
+        assert_eq!(via_list[0].body, "original body");
+    }
+
+    // ----- defense-in-depth: illegal `period` rejected, no file written -----
+
+    /// Direct unit coverage of [`review_markdown_relpath`] (bypassing
+    /// `create_review`'s own validation entirely — the whole point is to
+    /// prove THIS function does not trust its caller). Mutation target:
+    /// deleting the path-component checks in `review_markdown_relpath`
+    /// turns this red.
+    #[test]
+    fn body_ref_relpath_rejects_unsafe_period_components() {
+        for bad in ["../x", "a/b", ".hidden", "a\\b", "a..b", "", ".", ".."] {
+            let err = review_markdown_relpath(ReviewKind::Daily, bad).unwrap_err();
+            assert!(matches!(err, StoreError::Invalid(_)), "{bad:?}: {err:?}");
+        }
+        // NUL is legal Rust `&str` content but never a legal filename byte.
+        let with_nul = "2026-09\0-24";
+        let err = review_markdown_relpath(ReviewKind::Daily, with_nul).unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)));
+
+        // Positive control: a canonical period is accepted.
+        assert_eq!(
+            review_markdown_relpath(ReviewKind::Daily, "2026-09-24").unwrap(),
+            "reviews/daily/2026-09-24.md"
+        );
+    }
+
+    /// A `rhythm` period that dodges the generic separator/`..`/leading-`.`
+    /// checks (no slash, no dot) but is not shaped like a `ulid()` (contains
+    /// a hyphen, which `ULID_ALPHABET` excludes) is still rejected — the
+    /// charset whitelist is a SEPARATE defense from the generic component
+    /// check, not implied by it.
+    #[test]
+    fn body_ref_relpath_rejects_non_ulid_rhythm_period() {
+        let err = review_markdown_relpath(ReviewKind::Rhythm, "rhythm-1").unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
+        // Same string IS accepted for daily/weekly (no charset restriction
+        // there — the generic component check is the only gate) — proves
+        // the whitelist is rhythm-specific, not a blanket ASCII rule.
+        assert_eq!(
+            review_markdown_relpath(ReviewKind::Daily, "rhythm-1").unwrap(),
+            "reviews/daily/rhythm-1.md"
+        );
+    }
+
+    /// End-to-end: a `sin90_reviews` row with an illegal `period` — crafted
+    /// via raw SQL, the only way to get one past `create_review`'s own
+    /// validation (format-checked for daily/weekly; existence-checked
+    /// against a real `sin90_rhythms.id` for rhythm — see
+    /// `validate_review_period`'s and `create_review`'s docs) — makes
+    /// `finalize_review` fail, leaves the review `draft`, appends no
+    /// `finalized` event, and writes NO file anywhere under `data_dir`
+    /// (proving the rejection happens before any filesystem write is
+    /// attempted, not just that the wrong file didn't happen to appear).
+    #[tokio::test]
+    async fn body_ref_finalize_rejects_illegal_period_writes_no_file() {
+        let tmp = TempDataDir::new();
+        let store = new_store_with_data_dir(&tmp).await;
+
+        let now = crate::core::now_iso8601();
+        sqlx::query(
+            "INSERT INTO sin90_reviews (id, kind, status, week_id, period, body, created_at, updated_at)
+             VALUES ('legacy-bad-period', 'daily', 'draft', NULL, '../x', 'body text', ?, ?)",
+        )
+        .bind(&now)
+        .bind(&now)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let err = store
+            .finalize_review("legacy-bad-period")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
+
+        let still_draft = store.get_review("legacy-bad-period").await.unwrap();
+        assert_eq!(still_draft.status, ReviewStatus::Draft);
+        assert_eq!(still_draft.body_ref, None);
+        assert_eq!(
+            test_hooks::event_count(&store, "review", "legacy-bad-period")
+                .await
+                .unwrap(),
+            0,
+            "no finalized event (and no created event either — this row was inserted via raw SQL)"
+        );
+
+        // Nothing was written anywhere under `data_dir` — not even a
+        // `reviews/` directory, let alone a file outside it via `../x`.
+        assert!(
+            std::fs::read_dir(tmp.path()).unwrap().next().is_none(),
+            "data_dir must be untouched"
+        );
+        assert!(
+            !tmp.path().parent().unwrap().join("x").exists(),
+            "must not have escaped data_dir via `../x`"
+        );
+    }
+
+    // ----- directory auto-created when missing -------------------------------
+
+    #[tokio::test]
+    async fn body_ref_finalize_creates_reviews_directory_when_missing() {
+        let tmp = TempDataDir::new();
+        let store = new_store_with_data_dir(&tmp).await;
+        assert!(!tmp.path().join("reviews").exists());
+
+        let review = store
+            .create_review(&nr(ReviewKind::Weekly, "2026-W39"))
+            .await
+            .unwrap();
+        store.finalize_review(&review.id).await.unwrap();
+
+        assert!(tmp.path().join("reviews/weekly").is_dir());
+        assert!(tmp.path().join("reviews/weekly/2026-W39.md").is_file());
+    }
+
+    // ----- file-write failure leaves the review draft, no finalized event ---
+
+    /// `<data_dir>/reviews` is occupied by a plain FILE (not a directory) —
+    /// `create_dir_all("<data_dir>/reviews/<kind>")` must fail, and that
+    /// failure must leave `finalize_review` a no-op on the DB side: still
+    /// `draft`, no `finalized` event. Mutation target: swapping
+    /// `finalize_review`'s ordering to "commit first, write the file after"
+    /// turns this red (the row would show `finalized` despite the write
+    /// failure).
+    #[tokio::test]
+    async fn body_ref_file_write_failure_leaves_review_draft_no_finalized_event() {
+        let tmp = TempDataDir::new();
+        // Occupy the spot `reviews/` needs to become a directory.
+        std::fs::write(tmp.path().join("reviews"), b"not a directory").unwrap();
+
+        let store = new_store_with_data_dir(&tmp).await;
+        let review = store
+            .create_review(&nr(ReviewKind::Daily, "2026-09-24"))
+            .await
+            .unwrap();
+        let events_before = test_hooks::event_count(&store, "review", &review.id)
+            .await
+            .unwrap();
+        assert_eq!(events_before, 1, "only `created` so far");
+
+        let err = store.finalize_review(&review.id).await.unwrap_err();
+        assert!(matches!(err, StoreError::Internal(_)), "{err:?}");
+
+        let still_draft = store.get_review(&review.id).await.unwrap();
+        assert_eq!(still_draft.status, ReviewStatus::Draft);
+        assert_eq!(still_draft.body_ref, None);
+        assert_eq!(
+            test_hooks::event_count(&store, "review", &review.id)
+                .await
+                .unwrap(),
+            events_before,
+            "no `finalized` event on a failed write"
+        );
+    }
+
+    // ----- data_dir absent (in-memory/dev mode): degrade, don't fail --------
+
+    /// Positive control for the failure test above: with NO `data_dir` at
+    /// all (plain `open_memory()`, no override), `finalize_review` still
+    /// succeeds — there is simply nowhere to export to, so the export step
+    /// is skipped and `body_ref` stays `None`. This is the same
+    /// `Sin90Store` every other Review test in `review_tests` already uses.
+    #[tokio::test]
+    async fn body_ref_no_data_dir_finalize_still_succeeds_with_null_body_ref() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let review = store
+            .create_review(&nr(ReviewKind::Daily, "2026-09-24"))
+            .await
+            .unwrap();
+        let finalized = store.finalize_review(&review.id).await.unwrap();
+        assert_eq!(finalized.status, ReviewStatus::Finalized);
+        assert_eq!(finalized.body_ref, None);
+    }
+
+    // ----- migration 0008: rows from before this column existed stay NULL ---
+
+    /// Inserts a row the way any pre-0008 `INSERT INTO sin90_reviews` would
+    /// have (no `body_ref` in the column list — that column did not exist
+    /// yet) — proves `ALTER TABLE ... ADD COLUMN body_ref TEXT NULL`
+    /// (migration 0008) leaves such a row's `body_ref` as `NULL`, not some
+    /// other default.
+    #[tokio::test]
+    async fn body_ref_pre_0008_row_reads_back_as_null() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let now = crate::core::now_iso8601();
+        sqlx::query(
+            "INSERT INTO sin90_reviews (id, kind, status, week_id, period, body, created_at, updated_at)
+             VALUES ('legacy-1', 'daily', 'draft', NULL, '2026-01-01', '', ?, ?)",
+        )
+        .bind(&now)
+        .bind(&now)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let row = store.get_review("legacy-1").await.unwrap();
+        assert_eq!(row.body_ref, None);
     }
 }
 

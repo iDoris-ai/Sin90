@@ -77,10 +77,21 @@ impl StoreError {
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// Opaque wire status returned to callers is defined in `core`; this struct
-/// only owns the connection pool.
+/// owns the connection pool plus (T4.2.1) Sin90's own `data_dir` — the
+/// directory `finalize_review` exports a Review's Markdown to (design §2
+/// #11/§4.2: `<data_dir>/reviews/<kind>/<period>.md`, `body_ref` stored
+/// relative to it).
 #[derive(Clone)]
 pub struct Sin90Store {
     pool: SqlitePool,
+    /// `Some(path.parent())` for [`Sin90Store::open`] (real deployments —
+    /// both `Serve --data-dir` and the Agent24-module `A24_DATA_DIR`, per
+    /// `main.rs`, always pass a `path` with a parent). `None` for
+    /// [`Sin90Store::open_memory`] — the `:memory:`/dev-and-test-only mode
+    /// that already drops events too (see `main.rs::run_standalone`'s doc) —
+    /// unless overridden by the test-only
+    /// [`Sin90Store::open_memory_with_data_dir`].
+    data_dir: Option<std::path::PathBuf>,
 }
 
 impl Sin90Store {
@@ -99,11 +110,14 @@ impl Sin90Store {
             .connect_with(options)
             .await?;
         sqlx::migrate!("./src/store/migrations").run(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            data_dir: path.parent().map(|p| p.to_path_buf()),
+        })
     }
 
     /// In-memory database for tests (single connection — each `:memory:` handle
-    /// is its own database).
+    /// is its own database). No `data_dir` — see the field's doc.
     pub async fn open_memory() -> Result<Self> {
         let options = SqliteConnectOptions::from_str("sqlite::memory:")?
             .busy_timeout(std::time::Duration::from_secs(5))
@@ -113,7 +127,23 @@ impl Sin90Store {
             .connect_with(options)
             .await?;
         sqlx::migrate!("./src/store/migrations").run(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            data_dir: None,
+        })
+    }
+
+    /// Test-only (T4.2.1): an `:memory:` store (cheap, no real `sin90.db`)
+    /// that STILL has a real filesystem `data_dir`, so `finalize_review`'s
+    /// Markdown export can be exercised without standing up a full `open()`.
+    /// Not reachable from the shipped binary — `main.rs` only ever calls
+    /// `open` (real deployments) or `open_memory` (`Serve` with no
+    /// `--data-dir`).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub async fn open_memory_with_data_dir(dir: std::path::PathBuf) -> Result<Self> {
+        let mut store = Self::open_memory().await?;
+        store.data_dir = Some(dir);
+        Ok(store)
     }
 
     pub(crate) fn pool(&self) -> &SqlitePool {

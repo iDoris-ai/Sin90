@@ -1,0 +1,27 @@
+-- 0008 (T4.2.1, design DESIGN-LIFEOS.md §2 #11/§4.2; spec.md M4): the
+-- single-writer Markdown pointer `0007_review_period.sql`'s header comment
+-- explicitly deferred.
+--
+-- `body_ref` is NULL until a Review is finalized — a draft has no Markdown
+-- export at all (nothing to point at yet). Once `POST /reviews/{id}/finalize`
+-- succeeds, `store::repo::finalize_review` writes the review's `body` to
+-- `<data_dir>/reviews/<kind>/<period>.md` (atomically: temp file in the same
+-- dir, fsync'd, then renamed into place — never a partial file) and stores
+-- that file's path RELATIVE TO `data_dir` here.
+--
+-- One-way (design §2 #11 / §4.2's three rules): SQLite stays the source of
+-- truth, this column is a pointer to a derived export nothing ever reads
+-- back — `GET /reviews`/`GET /reviews/{id}` always answer from the `body`
+-- column, never from the file this points at.
+--
+-- Every pre-existing row (created before this migration ever runs) gets the
+-- SQLite `ALTER TABLE ... ADD COLUMN ... NULL` default of NULL, same as
+-- every other nullable column this table has grown (`week_id`, `period`
+-- excepted since that one back-filled) — there is nothing to backfill here:
+-- a NULL `body_ref` on an old row correctly means "this review predates
+-- Markdown export, or was never finalized," not a missing value bug.
+--
+-- Takes migration slot 0008, the next free one after 0007
+-- (`outbox_migrations_are_contiguous_no_gaps`, src/store/repo.rs).
+
+ALTER TABLE sin90_reviews ADD COLUMN body_ref TEXT NULL;
