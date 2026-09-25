@@ -30,11 +30,12 @@
 //! exactly the kind of table-joining/fabrication this task explicitly rules
 //! out, so it is left at 0 rather than invented. See task report for T4.3.1.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
+use sqlx::{Row, SqliteConnection};
 
+use crate::store::attention::attention_on;
 use crate::store::{Result, Sin90Store, StoreError};
 
 /// One direction's realized minutes over the week — `by_direction`'s wire
@@ -132,123 +133,156 @@ pub fn render_weekly_draft_markdown(draft: &WeeklyDraft) -> String {
     out
 }
 
-impl Sin90Store {
-    /// Pure event replay for `iso_week` (`YYYY-Www`). `Err(StoreError::Invalid)`
-    /// for a malformed week label — never a silent empty draft (same posture
-    /// `attention`'s HTTP handler enforces for its `start`/`end` query, and
-    /// `week_attention`'s 404 enforces for an unknown week id).
-    pub async fn weekly_draft(&self, iso_week: &str) -> Result<WeeklyDraft> {
-        let (start, end) = crate::core::iso_week_bounds(iso_week).ok_or_else(|| {
-            StoreError::Invalid(format!(
-                "week must be an ISO-8601 week like 2026-W39, got {iso_week:?}"
-            ))
-        })?;
-        // Canonicalized label for the response's `week` field (same
-        // lowercase-w-in/uppercase-out convention `create_week` and
-        // `create_review`'s weekly period already guarantee).
-        let week = crate::core::canonical_iso_week(iso_week)
-            .expect("iso_week_bounds already validated this parses");
-
-        // by_direction: reuse `attention`'s own replay verbatim — this is
-        // the SAME query `GET /attention` and `week_attention` run, not a
-        // re-derived one.
-        let attention_rows = self.attention(&start, &end).await?;
-        let by_direction: Vec<DirectionMinutes> = attention_rows
-            .iter()
-            .map(|r| DirectionMinutes {
-                direction_id: r.direction_id.clone(),
-                minutes: r.actual_min,
-            })
-            .collect();
-
-        // by_area: fold `by_direction` through the direction->area snapshot
-        // (itself pure `sin90_events` replay — see module doc).
-        let area_of = self.direction_area_snapshot().await?;
-        let mut area_totals: BTreeMap<String, i64> = BTreeMap::new();
-        for row in &attention_rows {
-            let area_id = if row.direction_id.is_empty() {
-                String::new()
-            } else {
-                area_of.get(&row.direction_id).cloned().unwrap_or_default()
-            };
-            *area_totals.entry(area_id).or_insert(0) += row.actual_min;
-        }
-        let by_area: Vec<AreaMinutes> = area_totals
-            .into_iter()
-            .map(|(area_id, minutes)| AreaMinutes { area_id, minutes })
-            .collect();
-
-        let tasks_done: i64 = sqlx::query(
-            "SELECT COUNT(*) AS n FROM sin90_events
-             WHERE entity = 'task' AND kind = 'transitioned' AND to_state = 'done'
-               AND at >= ? AND at < ?",
-        )
-        .bind(&start)
-        .bind(&end)
-        .fetch_one(self.pool())
-        .await?
-        .get("n");
-
-        let routine_rows = sqlx::query(
-            "SELECT entity_id AS routine_id,
-                    CAST(COUNT(*) AS INTEGER) AS fired
-             FROM sin90_events
-             WHERE entity = 'routine' AND kind = 'fired'
-               AND at >= ? AND at < ?
-             GROUP BY entity_id
-             ORDER BY entity_id",
-        )
-        .bind(&start)
-        .bind(&end)
-        .fetch_all(self.pool())
-        .await?;
-        let routines: Vec<RoutineDraftRow> = routine_rows
-            .into_iter()
-            .map(|r| RoutineDraftRow {
-                routine_id: r.get("routine_id"),
-                fired: r.get("fired"),
-                // Always 0 — see module doc: nothing in the event log links
-                // a completed block back to a Routine.
-                completed: 0,
-            })
-            .collect();
-
-        Ok(WeeklyDraft {
-            week,
-            by_area,
-            by_direction,
-            tasks_done,
-            routines,
+/// `direction_id -> area_id` snapshot, replayed purely from
+/// `direction.created` events (never `sin90_directions`, which is
+/// mutable — though for THIS field it wouldn't matter, since a
+/// Direction's `area_id` is set once at creation and no update route
+/// ever changes it; the replay is still preferred over the table for the
+/// same "never join a mutable table" discipline `attention` and
+/// `week_attention` already follow, so this endpoint has exactly one
+/// sourcing rule, not two). A direction created with no area (`area_id:
+/// null`) is absent from the map; callers treat that the same as "no
+/// area" (`""`), matching [`crate::store::AttentionRow`]'s own "no direction" bucket.
+/// `pub(crate)` (T5.3.1's review C1 fix): run against a GIVEN connection —
+/// see [`weekly_draft_on`]'s own doc for why.
+pub(crate) async fn direction_area_snapshot_on(
+    conn: &mut SqliteConnection,
+) -> Result<HashMap<String, String>> {
+    let rows = sqlx::query(
+        "SELECT entity_id AS direction_id,
+                json_extract(payload,'$.area_id') AS area_id
+         FROM sin90_events
+         WHERE entity = 'direction' AND kind = 'created'",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| {
+            let direction_id: String = r.get("direction_id");
+            let area_id: Option<String> = r.get("area_id");
+            area_id.map(|a| (direction_id, a))
         })
-    }
+        .collect())
+}
 
-    /// `direction_id -> area_id` snapshot, replayed purely from
-    /// `direction.created` events (never `sin90_directions`, which is
-    /// mutable — though for THIS field it wouldn't matter, since a
-    /// Direction's `area_id` is set once at creation and no update route
-    /// ever changes it; the replay is still preferred over the table for the
-    /// same "never join a mutable table" discipline `attention` and
-    /// `week_attention` already follow, so this endpoint has exactly one
-    /// sourcing rule, not two). A direction created with no area (`area_id:
-    /// null`) is absent from the map; callers treat that the same as "no
-    /// area" (`""`), matching [`crate::store::AttentionRow`]'s own "no direction" bucket.
-    async fn direction_area_snapshot(&self) -> Result<std::collections::HashMap<String, String>> {
-        let rows = sqlx::query(
-            "SELECT entity_id AS direction_id,
-                    json_extract(payload,'$.area_id') AS area_id
-             FROM sin90_events
-             WHERE entity = 'direction' AND kind = 'created'",
-        )
-        .fetch_all(self.pool())
-        .await?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|r| {
-                let direction_id: String = r.get("direction_id");
-                let area_id: Option<String> = r.get("area_id");
-                area_id.map(|a| (direction_id, a))
-            })
-            .collect())
+/// Pure event replay for `iso_week` (`YYYY-Www`), run against a GIVEN
+/// connection rather than always a fresh pool checkout. `Err(StoreError::
+/// Invalid)` for a malformed week label — never a silent empty draft (same
+/// posture `attention`'s HTTP handler enforces for its `start`/`end` query,
+/// and `week_attention`'s 404 enforces for an unknown week id).
+///
+/// **T5.3.1 review C1 (2026-09-26)**: this function exists SPECIFICALLY so
+/// [`crate::store::repo::Sin90Store::record_routine_fire`] can call it
+/// INSIDE its own open transaction, AFTER appending that fire's own
+/// `routine.fired` event — not on a separate `self.pool()` checkout taken
+/// BEFORE the transaction even opens (T3.2.2's original, since-corrected
+/// design: see that method's own now-updated doc). The bug the old ordering
+/// had: T4.3.2's auto-created review draft is meant to be a fixed target
+/// `ai::summarize`'s Q7 gate can compare a CURRENT `render_weekly_draft_
+/// markdown` re-render against — but the OLD precompute ran before this married
+/// fire's count was in `sin90_events` at all, so `routines[].fired` in the
+/// stored draft was permanently one less than what a fresh `weekly_draft`
+/// call (which DOES see it) would ever compute again. `AiReadModel::
+/// weekly_draft` (`ai::summarize`, T5.3.1) and [`Sin90Store::weekly_draft`]
+/// both call this SAME function (H1: one source of truth for the numbers,
+/// whichever connection/transaction context each caller happens to be in).
+pub(crate) async fn weekly_draft_on(
+    conn: &mut SqliteConnection,
+    iso_week: &str,
+) -> Result<WeeklyDraft> {
+    let (start, end) = crate::core::iso_week_bounds(iso_week).ok_or_else(|| {
+        StoreError::Invalid(format!(
+            "week must be an ISO-8601 week like 2026-W39, got {iso_week:?}"
+        ))
+    })?;
+    // Canonicalized label for the response's `week` field (same
+    // lowercase-w-in/uppercase-out convention `create_week` and
+    // `create_review`'s weekly period already guarantee).
+    let week = crate::core::canonical_iso_week(iso_week)
+        .expect("iso_week_bounds already validated this parses");
+
+    // by_direction: reuse `attention`'s own replay verbatim, on the SAME
+    // connection — this is the SAME query `GET /attention` and
+    // `week_attention` run, not a re-derived one.
+    let attention_rows = attention_on(&mut *conn, &start, &end).await?;
+    let by_direction: Vec<DirectionMinutes> = attention_rows
+        .iter()
+        .map(|r| DirectionMinutes {
+            direction_id: r.direction_id.clone(),
+            minutes: r.actual_min,
+        })
+        .collect();
+
+    // by_area: fold `by_direction` through the direction->area snapshot
+    // (itself pure `sin90_events` replay — see [`direction_area_snapshot_on`]'s
+    // doc), on the SAME connection.
+    let area_of = direction_area_snapshot_on(&mut *conn).await?;
+    let mut area_totals: BTreeMap<String, i64> = BTreeMap::new();
+    for row in &attention_rows {
+        let area_id = if row.direction_id.is_empty() {
+            String::new()
+        } else {
+            area_of.get(&row.direction_id).cloned().unwrap_or_default()
+        };
+        *area_totals.entry(area_id).or_insert(0) += row.actual_min;
+    }
+    let by_area: Vec<AreaMinutes> = area_totals
+        .into_iter()
+        .map(|(area_id, minutes)| AreaMinutes { area_id, minutes })
+        .collect();
+
+    let tasks_done: i64 = sqlx::query(
+        "SELECT COUNT(*) AS n FROM sin90_events
+         WHERE entity = 'task' AND kind = 'transitioned' AND to_state = 'done'
+           AND at >= ? AND at < ?",
+    )
+    .bind(&start)
+    .bind(&end)
+    .fetch_one(&mut *conn)
+    .await?
+    .get("n");
+
+    let routine_rows = sqlx::query(
+        "SELECT entity_id AS routine_id,
+                CAST(COUNT(*) AS INTEGER) AS fired
+         FROM sin90_events
+         WHERE entity = 'routine' AND kind = 'fired'
+           AND at >= ? AND at < ?
+         GROUP BY entity_id
+         ORDER BY entity_id",
+    )
+    .bind(&start)
+    .bind(&end)
+    .fetch_all(&mut *conn)
+    .await?;
+    let routines: Vec<RoutineDraftRow> = routine_rows
+        .into_iter()
+        .map(|r| RoutineDraftRow {
+            routine_id: r.get("routine_id"),
+            fired: r.get("fired"),
+            // Always 0 — see module doc: nothing in the event log links
+            // a completed block back to a Routine.
+            completed: 0,
+        })
+        .collect();
+
+    Ok(WeeklyDraft {
+        week,
+        by_area,
+        by_direction,
+        tasks_done,
+        routines,
+    })
+}
+
+impl Sin90Store {
+    /// Thin wrapper around [`weekly_draft_on`] on a freshly acquired
+    /// connection — see that function's own doc for why the actual query
+    /// logic lives there now (T5.3.1 review C1) rather than here directly.
+    pub async fn weekly_draft(&self, iso_week: &str) -> Result<WeeklyDraft> {
+        let mut conn = self.pool().acquire().await?;
+        weekly_draft_on(&mut conn, iso_week).await
     }
 }
 

@@ -10,21 +10,20 @@
 //! **Capability → allowed ops.** The design's `allowed_ops(cap)` (§11.4 公共)
 //! is `Classify ⇒ {AssignTaskDirection}`, `Summarize ⇒ {DraftReviewBody}`,
 //! `Propose ⇒ {CarryOverTask, ReorderTasks, CreateTasks}`. `AssignTaskDirection`
-//! landed in T5.2.1 (this file's [`allowed_ops`] now answers the real
-//! one-op set for `Classify`). `Sin90Op::DraftReviewBody` ALSO exists as of
-//! T5.2.1 (design §11.2.3/§11.8's "一次加齐" — the Op's type/validate/apply
-//! is added alongside `AssignTaskDirection` so `ValidationCtx` is widened
-//! only once) — but the `summarize` CAPABILITY that will eventually PRODUCE
-//! it is T5.3.1's job, explicitly out of this task's scope. So `allowed_ops`
-//! deliberately still answers "nothing" for `Summarize`, and `submit`/
-//! `precheck` for it will always be `SinkError::Invalid` until T5.3.1 opens
-//! it; that is expected, not a bug this task should paper over.
+//! landed in T5.2.1; `Sin90Op::DraftReviewBody`'s type/validate/apply ALSO
+//! landed then (design §11.2.3/§11.8's "一次加齐" — added alongside
+//! `AssignTaskDirection` so `ValidationCtx` is widened only once), but
+//! `allowed_ops(Summarize)` stayed an empty set until the `summarize`
+//! CAPABILITY that actually PRODUCES it existed. T5.3.1 (`ai::summarize`)
+//! is that capability — `allowed_ops` now answers the real one-op set for
+//! `Summarize` too.
 
 use sqlx::{Acquire, Row, SqlitePool};
 
 use crate::ai::ports::{
     AiCallRecord, AiReadModel, AiSettings, AiSink, Capability, DirectionCandidate, Engine,
-    ProposalDraft, ReadError, SettingsRead, SinkError,
+    ProposalDraft, ReadError, SettingsRead, SinkError, SummarizeBucket, SummarizeDraft,
+    SummarizeRoutineRow,
 };
 use crate::ai::source_for;
 use crate::core::{
@@ -383,7 +382,122 @@ impl AiReadModel for AiReader {
             }
         }
     }
+
+    /// T5.3.1 (§11.4.2's "数字来源", 2026-09-26 review C1/H1): the numbers
+    /// come from `store::weekly_draft::weekly_draft_on` — the SAME function
+    /// `Sin90Store::weekly_draft` calls (one source of truth) — run on a
+    /// connection acquired from THIS reader's own `query_only` pool. Titles
+    /// and `auto_draft_md` (T4.3.2's own `render_weekly_draft_markdown`,
+    /// see [`SummarizeDraft::auto_draft_md`]'s doc) are then derived from
+    /// that SAME `WeeklyDraft` value, on the SAME connection — one read,
+    /// not "the numbers from one query and the labels from another that
+    /// might see a different snapshot".
+    async fn weekly_draft(&self, iso_week: &str) -> Result<SummarizeDraft, ReadError> {
+        let mut conn = self.0.acquire().await.map_err(rerr)?;
+        let draft = crate::store::weekly_draft::weekly_draft_on(&mut conn, iso_week)
+            .await
+            .map_err(rerr)?;
+        let auto_draft_md = crate::store::render_weekly_draft_markdown(&draft);
+
+        let mut by_direction = Vec::with_capacity(draft.by_direction.len());
+        for d in &draft.by_direction {
+            let label = resolve_label(&mut conn, "sin90_directions", &d.direction_id).await?;
+            by_direction.push(SummarizeBucket {
+                label,
+                minutes: d.minutes,
+            });
+        }
+        let mut by_area = Vec::with_capacity(draft.by_area.len());
+        for a in &draft.by_area {
+            let label = resolve_label(&mut conn, "sin90_areas", &a.area_id).await?;
+            by_area.push(SummarizeBucket {
+                label,
+                minutes: a.minutes,
+            });
+        }
+        let mut routines = Vec::with_capacity(draft.routines.len());
+        for r in &draft.routines {
+            // A Routine's own id is never empty, so `resolve_label`'s
+            // "empty id -> None" branch never fires here — `unwrap_or_else`
+            // only ever falls back to the id itself when the title lookup
+            // comes back `None` (2026-09-26 review, Low).
+            let label = resolve_label(&mut conn, "sin90_routines", &r.routine_id)
+                .await?
+                .unwrap_or_else(|| r.routine_id.clone());
+            routines.push(SummarizeRoutineRow {
+                label,
+                fired: r.fired,
+                completed: r.completed,
+            });
+        }
+
+        Ok(SummarizeDraft {
+            week: draft.week,
+            by_area,
+            by_direction,
+            tasks_done: draft.tasks_done,
+            routines,
+            auto_draft_md,
+        })
+    }
+
+    /// T5.3.1 (§11.4.2's "数字来源"): titles of tasks that transitioned to
+    /// `done` inside `iso_week`'s window, most recent first, capped at
+    /// [`DONE_TITLES_LIMIT`] (⚖️) — reference material only, never counted
+    /// toward `ai::summarize::facts`.
+    async fn done_titles(&self, iso_week: &str) -> Result<Vec<String>, ReadError> {
+        let (start, end) = crate::core::iso_week_bounds(iso_week).ok_or_else(|| {
+            ReadError(format!(
+                "week must be an ISO-8601 week like 2026-W39, got {iso_week:?}"
+            ))
+        })?;
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT t.title
+             FROM sin90_events e
+             JOIN sin90_tasks t ON t.id = e.entity_id
+             WHERE e.entity = 'task' AND e.kind = 'transitioned' AND e.to_state = 'done'
+               AND e.at >= ? AND e.at < ?
+             ORDER BY e.at DESC
+             LIMIT ?",
+        )
+        .bind(&start)
+        .bind(&end)
+        .bind(DONE_TITLES_LIMIT)
+        .fetch_all(&self.0)
+        .await
+        .map_err(rerr)?;
+        Ok(rows)
+    }
 }
+
+/// 2026-09-26 review (Low): shared by `AiReader::weekly_draft`'s area/
+/// direction/routine title resolution — one fallback rule, not three
+/// hand-copied ones. An EMPTY `id` (the "no direction"/"no area" bucket)
+/// resolves to `None`; any NON-empty id whose title lookup comes back
+/// `None` (a row this schema has no route to blank out today, but not
+/// assumed impossible) falls back to the RAW ID — it must never silently
+/// collapse into the SAME bucket as "no direction/area" just because a
+/// title happened to be missing.
+async fn resolve_label(
+    conn: &mut sqlx::SqliteConnection,
+    table: &str,
+    id: &str,
+) -> Result<Option<String>, ReadError> {
+    if id.is_empty() {
+        return Ok(None);
+    }
+    let title: Option<String> =
+        sqlx::query_scalar(&format!("SELECT title FROM {table} WHERE id = ?"))
+            .bind(id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(rerr)?;
+    Ok(Some(title.unwrap_or_else(|| id.to_string())))
+}
+
+/// ⚖️ §11.4.2: at most 50 done-task titles handed to the model as reference
+/// material.
+const DONE_TITLES_LIMIT: i64 = 50;
 
 fn row_to_week(r: sqlx::sqlite::SqliteRow) -> StoreResult<Week> {
     Ok(Week {
@@ -422,7 +536,7 @@ fn allowed_ops(cap: Capability, ops: &[Sin90Op]) -> Result<(), SinkError> {
     let ok = |op: &Sin90Op| -> bool {
         match cap {
             Capability::Classify => matches!(op, Sin90Op::AssignTaskDirection { .. }),
-            Capability::Summarize => false,
+            Capability::Summarize => matches!(op, Sin90Op::DraftReviewBody { .. }),
             Capability::Propose => matches!(
                 op,
                 Sin90Op::CarryOverTask { .. }
@@ -1667,5 +1781,162 @@ mod tests {
             after.get("sin90_tasks"),
             "the produced AssignTaskDirection's dry-run apply must not have actually applied"
         );
+    }
+
+    // ---- T5.3.1 review (Layer A, H1): AiReader::weekly_draft agrees with
+    // Sin90Store::weekly_draft under the same fixture ------------------------
+
+    /// Same fixture style `weekly_draft_tests` uses (one area/direction with
+    /// a completed block, one done task) — `AiReader::weekly_draft`'s
+    /// NUMBERS (`by_area`/`by_direction` minutes, `tasks_done`) must agree
+    /// EXACTLY with `Sin90Store::weekly_draft`'s own numbers for the same
+    /// week, since both now go through the SAME `weekly_draft_on`
+    /// (2026-09-26 review H1: "数字只有一份来源"). Mutation target: hand-edit
+    /// `AiReader::weekly_draft` to call some OTHER query for `tasks_done`
+    /// (e.g. a raw `COUNT(*)` over `sin90_tasks` instead of going through
+    /// `weekly_draft_on`'s event replay) — this test goes red the moment
+    /// the two diverge.
+    #[tokio::test]
+    async fn ai_reader_weekly_draft_matches_sin90_store_weekly_draft_same_fixture() {
+        use crate::ai::AiReadModel;
+        use crate::core::{Energy, ScheduleBlockStatus, TaskKind, TaskStatus};
+
+        let store = Sin90Store::open_memory().await.unwrap();
+        let area = store.create_area("Work").await.unwrap();
+        let direction = store
+            .create_direction("Coding", "this-quarter", Some(&area.id))
+            .await
+            .unwrap();
+        let in_week = "2026-09-22T09:00:00Z"; // 2026-W39
+        let block = store
+            .create_block(Some(&direction.id), None, 90)
+            .await
+            .unwrap();
+        store
+            .transition_block(&block.id, ScheduleBlockStatus::Started)
+            .await
+            .unwrap();
+        store
+            .transition_block(&block.id, ScheduleBlockStatus::Completed)
+            .await
+            .unwrap();
+        crate::store::test_hooks::set_last_event_at(&store, "block", &block.id, in_week)
+            .await
+            .unwrap();
+        let task = store
+            .create_task("t", None, None, TaskKind::Other, Energy::Mid, None)
+            .await
+            .unwrap();
+        for to in [
+            TaskStatus::Planned,
+            TaskStatus::InProgress,
+            TaskStatus::Done,
+        ] {
+            store.transition_task(&task.id, to).await.unwrap();
+        }
+        crate::store::test_hooks::set_last_event_at(&store, "task", &task.id, in_week)
+            .await
+            .unwrap();
+
+        let from_store = store.weekly_draft("2026-W39").await.unwrap();
+        let reader = store.ai_reader();
+        let from_reader = AiReadModel::weekly_draft(&reader, "2026-W39")
+            .await
+            .unwrap();
+
+        assert_eq!(from_reader.week, from_store.week);
+        assert_eq!(from_reader.tasks_done, from_store.tasks_done);
+        assert_eq!(
+            from_reader
+                .by_direction
+                .iter()
+                .map(|b| b.minutes)
+                .sum::<i64>(),
+            from_store
+                .by_direction
+                .iter()
+                .map(|b| b.minutes)
+                .sum::<i64>(),
+        );
+        assert_eq!(
+            from_reader.by_area.iter().map(|b| b.minutes).sum::<i64>(),
+            from_store.by_area.iter().map(|b| b.minutes).sum::<i64>(),
+        );
+        assert_eq!(
+            from_reader.by_direction.len(),
+            from_store.by_direction.len()
+        );
+        assert_eq!(from_reader.by_area.len(), from_store.by_area.len());
+        // Positive control: the reader's OWN label resolution actually ran
+        // (not vacuously equal because both sides ended up empty).
+        assert_eq!(from_reader.by_direction[0].label.as_deref(), Some("Coding"));
+        assert_eq!(from_reader.by_direction[0].minutes, 90);
+    }
+
+    /// 2026-09-26 review (Low): a non-empty direction/area id whose title
+    /// lookup comes back `None` falls back to the RAW ID, not the "no
+    /// direction/area" `UNASSIGNED_LABEL` `ai::summarize::facts` reserves
+    /// for a genuinely EMPTY id. Exercised here (not at the `ai::summarize`
+    /// unit level) because it needs a real row deleted out from under a
+    /// still-referenced id — `resolve_label`'s own contract, not `facts`'s.
+    #[tokio::test]
+    async fn ai_reader_weekly_draft_label_falls_back_to_id_when_title_lookup_misses() {
+        use crate::ai::AiReadModel;
+        use crate::core::ScheduleBlockStatus;
+
+        let store = Sin90Store::open_memory().await.unwrap();
+        let direction = store
+            .create_direction("Temp", "this-quarter", None)
+            .await
+            .unwrap();
+        let in_week = "2026-09-22T09:00:00Z"; // 2026-W39
+        let block = store
+            .create_block(Some(&direction.id), None, 30)
+            .await
+            .unwrap();
+        store
+            .transition_block(&block.id, ScheduleBlockStatus::Started)
+            .await
+            .unwrap();
+        store
+            .transition_block(&block.id, ScheduleBlockStatus::Completed)
+            .await
+            .unwrap();
+        crate::store::test_hooks::set_last_event_at(&store, "block", &block.id, in_week)
+            .await
+            .unwrap();
+        // Delete the direction row out from under its own (still event
+        // -referenced) id — no production route can do this, but the
+        // fallback must not assume it is impossible. The block row is
+        // deleted first (its own FK references the direction); the
+        // NUMBERS this test checks come entirely from `sin90_events`
+        // (`weekly_draft_on`'s own event-replay discipline), so the live
+        // block row disappearing changes nothing about them.
+        sqlx::query("DELETE FROM sin90_schedule_blocks WHERE id = ?")
+            .bind(&block.id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM sin90_directions WHERE id = ?")
+            .bind(&direction.id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let reader = store.ai_reader();
+        let draft = AiReadModel::weekly_draft(&reader, "2026-W39")
+            .await
+            .unwrap();
+        assert_eq!(
+            draft.by_direction[0].label.as_deref(),
+            Some(direction.id.as_str()),
+            "must fall back to the raw id, not None/UNASSIGNED_LABEL: {:?}",
+            draft.by_direction[0]
+        );
+        // Positive control: `ai_reader_weekly_draft_matches_sin90_store_
+        // weekly_draft_same_fixture` (above) is this same fallback's
+        // negative space — an UNDELETED direction resolves its real title
+        // ("Coding"), not its id, proving this assertion isn't just always
+        // true regardless of what `resolve_label` does.
     }
 }
