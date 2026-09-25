@@ -208,4 +208,88 @@ pub mod test_hooks {
                 .map(|r| r.get::<String, _>("status")),
         )
     }
+
+    // ----- T3.3.1 outbox peeks -------------------------------------------
+
+    /// One `sin90_outbox` row, as read back for assertions — `desired` is
+    /// pre-parsed to [`serde_json::Value`] so a test can index into it
+    /// (`.desired["spec"]["cron"]`) instead of string-matching.
+    #[derive(Debug, Clone)]
+    pub struct OutboxTestRow {
+        pub id: String,
+        pub kind: String,
+        pub dedup_key: String,
+        pub desired: serde_json::Value,
+        pub status: String,
+        pub attempts: i64,
+        pub failure_kind: Option<String>,
+        pub last_error: Option<String>,
+        pub next_attempt_at: Option<String>,
+    }
+
+    /// All `sin90_outbox` rows for a `dedup_key`, oldest first. Production
+    /// code (`store::repo::upsert_outbox`) keeps this to at most one
+    /// `pending`/`failed` row per `dedup_key`, but `done` rows accumulate
+    /// (never resurrected) — a test that only cares about the live row
+    /// should filter on `status` itself, same as the reconciler will.
+    pub async fn outbox_rows_for(
+        store: &Sin90Store,
+        dedup_key: &str,
+    ) -> Result<Vec<OutboxTestRow>> {
+        let rows = sqlx::query(
+            "SELECT id, kind, dedup_key, desired, status, attempts, failure_kind, \
+                    last_error, next_attempt_at
+             FROM sin90_outbox WHERE dedup_key = ? ORDER BY created_at ASC, rowid ASC",
+        )
+        .bind(dedup_key)
+        .fetch_all(store.pool())
+        .await?;
+        rows.into_iter()
+            .map(|r| {
+                Ok(OutboxTestRow {
+                    id: r.get("id"),
+                    kind: r.get("kind"),
+                    dedup_key: r.get("dedup_key"),
+                    desired: serde_json::from_str(&r.get::<String, _>("desired"))?,
+                    status: r.get("status"),
+                    attempts: r.get("attempts"),
+                    failure_kind: r.get("failure_kind"),
+                    last_error: r.get("last_error"),
+                    next_attempt_at: r.get("next_attempt_at"),
+                })
+            })
+            .collect()
+    }
+
+    /// Total row count across the whole `sin90_outbox` table — used by the
+    /// same-transaction-rollback test to prove a failed write leaves no
+    /// residue at all (not just "no residue for this one `dedup_key`").
+    pub async fn outbox_count(store: &Sin90Store) -> Result<i64> {
+        Ok(sqlx::query("SELECT COUNT(*) AS n FROM sin90_outbox")
+            .fetch_one(store.pool())
+            .await?
+            .get::<i64, _>("n"))
+    }
+
+    /// Force a row straight to `failed` via raw SQL, bypassing production
+    /// code entirely — nothing in THIS task produces `failed` rows (that is
+    /// the reconciler's job, T3.3.2); this hook exists only so the "a
+    /// `failed` row resets to `pending` on the Routine's next change" test
+    /// can set up its starting state.
+    pub async fn mark_outbox_failed(
+        store: &Sin90Store,
+        id: &str,
+        failure_kind: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE sin90_outbox
+             SET status = 'failed', failure_kind = ?, last_error = 'test-injected', attempts = 3
+             WHERE id = ?",
+        )
+        .bind(failure_kind)
+        .bind(id)
+        .execute(store.pool())
+        .await?;
+        Ok(())
+    }
 }

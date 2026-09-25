@@ -299,6 +299,105 @@ async fn allocate_area_slug(tx: &mut Tx<'_>, title: &str) -> Result<String> {
     }
 }
 
+/// `sin90_outbox.dedup_key` for a Routine's kernel-scheduler side effect
+/// (spec.md M3 "outbox": `dedup_key = routine:<id>`, note the colon — the
+/// KERNEL key inside `desired.key` uses a dot instead, see
+/// [`routine_outbox_upsert_desired`]/[`routine_outbox_delete_desired`]).
+fn routine_dedup_key(id: &str) -> String {
+    format!("routine:{id}")
+}
+
+/// The `desired` payload for a `scheduler.upsert` outbox row mirroring a
+/// Routine's active/paused state into the kernel scheduler (spec.md M3):
+/// `{key: "routine.<id>", spec: {cron, tz}, enabled}`. `enabled` is `true`
+/// for `active`, `false` for `paused` — `retired` never calls this, it calls
+/// [`routine_outbox_delete_desired`] instead.
+fn routine_outbox_upsert_desired(
+    id: &str,
+    cron: &str,
+    tz: &str,
+    enabled: bool,
+) -> serde_json::Value {
+    json!({
+        "key": format!("routine.{id}"),
+        "spec": {"cron": cron, "tz": tz},
+        "enabled": enabled,
+    })
+}
+
+/// The `desired` payload for a `scheduler.delete` outbox row (Routine
+/// reached `retired`, spec.md M3): just the kernel key, nothing left to
+/// describe.
+fn routine_outbox_delete_desired(id: &str) -> serde_json::Value {
+    json!({"key": format!("routine.{id}")})
+}
+
+/// T3.3.1 (design §2 #15, §4.1; spec.md M3 "outbox"; architecture.md #2:
+/// "写内核的副作用只经 `sin90_outbox` 幂等对账，不跨库两阶段提交"): idempotently
+/// upsert ONE outbox row for `dedup_key`, inside the CALLER's transaction —
+/// never opens or commits its own, so a rollback of the caller's write (e.g.
+/// a Routine `UPDATE`/event `INSERT` that fails later in the same tx) rolls
+/// this back too.
+///
+/// - A `pending` OR `failed` row for this `dedup_key` is overwritten in
+///   place: `kind`/`desired` become the caller's latest values, `status`
+///   resets to `pending`, `attempts` resets to `0`, and the three
+///   failure-bookkeeping columns are cleared. This is what makes N rapid
+///   changes to the same Routine collapse to exactly one row holding the
+///   LATEST desired state — never a queue of stale intents — and what makes
+///   a `failed` row recover on the Routine's next change rather than being
+///   stuck forever (spec.md "错误处理": "Routine 下次变更时重置为 pending").
+/// - If the only existing row for this `dedup_key` is `done` (or there is no
+///   row at all), a NEW row is inserted. The `done` row is left alone as a
+///   historical record — it is never resurrected — so `done_at` keeps
+///   meaning "this exact desired state was confirmed landed onto the
+///   kernel", not "some earlier, possibly-different state was".
+async fn upsert_outbox(
+    tx: &mut Tx<'_>,
+    kind: &str,
+    dedup_key: &str,
+    desired: &serde_json::Value,
+) -> Result<()> {
+    let existing: Option<String> = sqlx::query(
+        "SELECT id FROM sin90_outbox WHERE dedup_key = ? AND status IN ('pending', 'failed')
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(dedup_key)
+    .fetch_optional(&mut **tx)
+    .await?
+    .map(|r| r.get::<String, _>("id"));
+
+    let desired_str = serde_json::to_string(desired)?;
+    if let Some(id) = existing {
+        sqlx::query(
+            "UPDATE sin90_outbox
+             SET kind = ?, desired = ?, status = 'pending', attempts = 0,
+                 failure_kind = NULL, last_error = NULL, next_attempt_at = NULL
+             WHERE id = ?",
+        )
+        .bind(kind)
+        .bind(&desired_str)
+        .bind(&id)
+        .execute(&mut **tx)
+        .await?;
+    } else {
+        let id = ulid();
+        let now = now_iso8601();
+        sqlx::query(
+            "INSERT INTO sin90_outbox (id, kind, dedup_key, desired, status, created_at, done_at)
+             VALUES (?, ?, ?, ?, 'pending', ?, NULL)",
+        )
+        .bind(&id)
+        .bind(kind)
+        .bind(dedup_key)
+        .bind(&desired_str)
+        .bind(&now)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
 impl Sin90Store {
     // ----- Area (new, design §2 #1) -------------------------------------------
 
@@ -1235,6 +1334,17 @@ impl Sin90Store {
             &now,
         )
         .await?;
+        // T3.3.1: a freshly created Routine is `active`, so the kernel
+        // scheduler needs to know about it — same transaction as the row
+        // insert and the `created` event above, so a rollback of either of
+        // those rolls this back too.
+        upsert_outbox(
+            &mut tx,
+            "scheduler.upsert",
+            &routine_dedup_key(&id),
+            &routine_outbox_upsert_desired(&id, &new.cron, tz, true),
+        )
+        .await?;
         tx.commit().await?;
         Ok(Routine {
             id,
@@ -1446,6 +1556,23 @@ impl Sin90Store {
             &mut tx, "routine", id, "updated", None, None, &payload, &now,
         )
         .await?;
+        // T3.3.1: only `cron`/`tz` feed the kernel scheduler's `spec`
+        // (design §2 #15) — a `title`/`target_count`/`target_minutes`-only
+        // patch changed `changed` above but must NOT touch outbox (that's
+        // the whole point of the "title alone doesn't write outbox, cron
+        // does" test pair). `enabled` follows the routine's CURRENT status
+        // (patches never touch status) — a paused routine whose cron just
+        // moved must still land as `enabled: false`, not `true`.
+        if changed.contains(&"cron") || changed.contains(&"tz") {
+            let enabled = current.status == RoutineStatus::Active;
+            upsert_outbox(
+                &mut tx,
+                "scheduler.upsert",
+                &routine_dedup_key(id),
+                &routine_outbox_upsert_desired(id, new_cron, new_tz, enabled),
+            )
+            .await?;
+        }
         tx.commit().await?;
         Ok(RoutineUpdate {
             routine: updated,
@@ -1498,6 +1625,36 @@ impl Sin90Store {
             &now,
         )
         .await?;
+        // T3.3.1: mirror the new status into the kernel-scheduler outbox
+        // (design §2 #15, spec.md M3) — `active`/`paused` are both
+        // `scheduler.upsert` (only `enabled` flips), `retired` is
+        // `scheduler.delete` (a retired Routine is a closed door — nothing
+        // left to upsert, `update_routine` already rejects further edits).
+        match to {
+            RoutineStatus::Active | RoutineStatus::Paused => {
+                upsert_outbox(
+                    &mut tx,
+                    "scheduler.upsert",
+                    &routine_dedup_key(id),
+                    &routine_outbox_upsert_desired(
+                        id,
+                        &current.cron,
+                        &current.tz,
+                        to == RoutineStatus::Active,
+                    ),
+                )
+                .await?;
+            }
+            RoutineStatus::Retired => {
+                upsert_outbox(
+                    &mut tx,
+                    "scheduler.delete",
+                    &routine_dedup_key(id),
+                    &routine_outbox_delete_desired(id),
+                )
+                .await?;
+            }
+        }
         tx.commit().await?;
         Ok(Routine {
             status: to,
@@ -3076,5 +3233,390 @@ mod routine_tests {
             .await
             .unwrap_err();
         assert!(matches!(err, StoreError::NotFound(_)), "{err:?}");
+    }
+}
+
+// ----- T3.3.1: Routine changes write `sin90_outbox` in the same tx --------
+
+#[cfg(test)]
+mod outbox_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::routine_tests::{create_ok, nr};
+    use super::*;
+    use crate::core::RoutineKind;
+    use crate::store::test_hooks;
+
+    async fn new_store() -> Sin90Store {
+        Sin90Store::open_memory().await.unwrap()
+    }
+
+    // ----- collapsing repeated changes to one pending row ------------------
+
+    /// Create → change cron → pause, all on the same Routine: exactly one
+    /// `sin90_outbox` row survives for its `dedup_key`, holding the LATEST
+    /// desired state (new cron, `enabled: false`) — not a queue of three
+    /// stale intents.
+    #[tokio::test]
+    async fn outbox_repeated_routine_changes_collapse_to_one_pending_row() {
+        let store = new_store().await;
+        let routine = store
+            .create_routine(&nr(
+                "Morning run",
+                RoutineKind::Exercise,
+                "0 7 * * MON,WED,FRI",
+            ))
+            .await
+            .unwrap();
+        let dedup_key = routine_dedup_key(&routine.id);
+
+        store
+            .update_routine(
+                &routine.id,
+                &RoutinePatch {
+                    cron: Some("0 8 * * MON,WED,FRI".to_string()),
+                    ..RoutinePatch::default()
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .transition_routine(&routine.id, RoutineStatus::Paused)
+            .await
+            .unwrap();
+
+        let rows = test_hooks::outbox_rows_for(&store, &dedup_key)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0];
+        assert_eq!(row.status, "pending");
+        assert_eq!(row.kind, "scheduler.upsert");
+        assert_eq!(row.desired["key"], json!(format!("routine.{}", routine.id)));
+        assert_eq!(row.desired["spec"]["cron"], json!("0 8 * * MON,WED,FRI"));
+        assert_eq!(row.desired["enabled"], json!(false));
+    }
+
+    /// Retiring a Routine that already has a pending `scheduler.upsert` row
+    /// (from create) overwrites it in place with a `scheduler.delete` — still
+    /// exactly one row for the `dedup_key`.
+    #[tokio::test]
+    async fn outbox_retire_replaces_pending_row_with_scheduler_delete() {
+        let store = new_store().await;
+        let routine = create_ok(&store).await;
+        let dedup_key = routine_dedup_key(&routine.id);
+
+        store
+            .transition_routine(&routine.id, RoutineStatus::Retired)
+            .await
+            .unwrap();
+
+        let rows = test_hooks::outbox_rows_for(&store, &dedup_key)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0];
+        assert_eq!(row.status, "pending");
+        assert_eq!(row.kind, "scheduler.delete");
+        assert_eq!(
+            row.desired,
+            json!({"key": format!("routine.{}", routine.id)})
+        );
+    }
+
+    // ----- title doesn't write outbox; cron does (positive control) --------
+
+    #[tokio::test]
+    async fn outbox_title_only_update_does_not_touch_outbox() {
+        let store = new_store().await;
+        let routine = create_ok(&store).await;
+        let dedup_key = routine_dedup_key(&routine.id);
+        let before = test_hooks::outbox_rows_for(&store, &dedup_key)
+            .await
+            .unwrap();
+        assert_eq!(before.len(), 1);
+
+        let update = store
+            .update_routine(
+                &routine.id,
+                &RoutinePatch {
+                    title: Some("Evening run".to_string()),
+                    ..RoutinePatch::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(update.changed.contains(&"title"));
+
+        let after = test_hooks::outbox_rows_for(&store, &dedup_key)
+            .await
+            .unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(before[0].id, after[0].id);
+        assert_eq!(before[0].desired, after[0].desired);
+        assert_eq!(before[0].status, after[0].status);
+        assert_eq!(before[0].attempts, after[0].attempts);
+    }
+
+    /// Positive control for the test above: a `cron` change on the SAME kind
+    /// of routine DOES move the outbox row's `desired`.
+    #[tokio::test]
+    async fn outbox_cron_update_changes_outbox_positive_control() {
+        let store = new_store().await;
+        let routine = create_ok(&store).await;
+        let dedup_key = routine_dedup_key(&routine.id);
+        let before = test_hooks::outbox_rows_for(&store, &dedup_key)
+            .await
+            .unwrap();
+
+        let update = store
+            .update_routine(
+                &routine.id,
+                &RoutinePatch {
+                    cron: Some("0 9 * * MON,WED,FRI".to_string()),
+                    ..RoutinePatch::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(update.changed.contains(&"cron"));
+
+        let after = test_hooks::outbox_rows_for(&store, &dedup_key)
+            .await
+            .unwrap();
+        assert_eq!(after.len(), 1);
+        assert_ne!(before[0].desired, after[0].desired);
+        assert_eq!(
+            after[0].desired["spec"]["cron"],
+            json!("0 9 * * MON,WED,FRI")
+        );
+    }
+
+    // ----- failed rows reset on the next change -----------------------------
+
+    #[tokio::test]
+    async fn outbox_failed_row_resets_to_pending_on_next_routine_change() {
+        let store = new_store().await;
+        let routine = create_ok(&store).await;
+        let dedup_key = routine_dedup_key(&routine.id);
+        let rows = test_hooks::outbox_rows_for(&store, &dedup_key)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        test_hooks::mark_outbox_failed(&store, &rows[0].id, "quota_exceeded")
+            .await
+            .unwrap();
+        let failed = test_hooks::outbox_rows_for(&store, &dedup_key)
+            .await
+            .unwrap();
+        assert_eq!(failed[0].status, "failed");
+        assert_eq!(failed[0].failure_kind.as_deref(), Some("quota_exceeded"));
+        assert_eq!(failed[0].attempts, 3);
+
+        store
+            .update_routine(
+                &routine.id,
+                &RoutinePatch {
+                    cron: Some("0 6 * * MON,WED,FRI".to_string()),
+                    ..RoutinePatch::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let after = test_hooks::outbox_rows_for(&store, &dedup_key)
+            .await
+            .unwrap();
+        assert_eq!(after.len(), 1, "{after:?}");
+        assert_eq!(
+            after[0].id, failed[0].id,
+            "same row overwritten, not a new one"
+        );
+        assert_eq!(after[0].status, "pending");
+        assert_eq!(after[0].attempts, 0);
+        assert_eq!(after[0].failure_kind, None);
+        assert_eq!(after[0].last_error, None);
+        assert_eq!(after[0].next_attempt_at, None);
+        assert_eq!(
+            after[0].desired["spec"]["cron"],
+            json!("0 6 * * MON,WED,FRI")
+        );
+    }
+
+    // ----- same-transaction rollback leaves no residue ----------------------
+
+    /// Test-only (NOT called from any production path): writes one outbox
+    /// row via the real `upsert_outbox`, then — in the SAME transaction —
+    /// runs a statement guaranteed to fail (a `sin90_routines.status` CHECK
+    /// violation). Proves `upsert_outbox`'s "same transaction as the
+    /// caller" contract actually rolls back when the CALLER's other write
+    /// fails, not just when `upsert_outbox` itself errors.
+    async fn write_outbox_then_fail(store: &Sin90Store, dedup_key: &str) -> Result<()> {
+        let mut tx = store.pool().begin_with("BEGIN IMMEDIATE").await?;
+        upsert_outbox(
+            &mut tx,
+            "scheduler.upsert",
+            dedup_key,
+            &json!({
+                "key": "routine.doesnotmatter",
+                "spec": {"cron": "* * * * *", "tz": "UTC"},
+                "enabled": true,
+            }),
+        )
+        .await?;
+        // Guaranteed CHECK(status IN ('active','paused','retired')) violation
+        // (migration 0004) -> this `?` propagates an Err and `tx` is dropped
+        // without `commit()`, rolling back everything written above too.
+        sqlx::query(
+            "INSERT INTO sin90_routines
+                 (id, title, kind, cron, tz, status, created_at, updated_at)
+             VALUES ('rollback-test', 'x', 'other', '* * * * *', 'UTC',
+                      'not-a-real-status', 't', 't')",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn outbox_transaction_rollback_leaves_no_residue() {
+        let store = new_store().await;
+        let dedup_key = "routine:rollback-test";
+        let before = test_hooks::outbox_count(&store).await.unwrap();
+
+        let err = write_outbox_then_fail(&store, dedup_key).await.unwrap_err();
+        assert!(matches!(err, StoreError::Sqlx(_)), "{err:?}");
+
+        let after = test_hooks::outbox_count(&store).await.unwrap();
+        assert_eq!(
+            after, before,
+            "a failed transaction must leave no outbox row behind"
+        );
+        let rows = test_hooks::outbox_rows_for(&store, dedup_key)
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    // ----- migrating an existing db leaves existing outbox rows alone ------
+
+    /// A `sin90.db` that only has migrations 0001-0004 applied (T3.2.2
+    /// hasn't started, so there is no `routine_fires` migration in this
+    /// worktree yet — 0004 IS "the old state" here; this migration took the
+    /// `0005` slot instead of spec.md's originally-pre-allocated `0006`,
+    /// see this file's own header comment and DESIGN §4.1) gets a
+    /// `failed`-capable outbox after migration 0005 runs, but every
+    /// existing row's original columns (including a `done` row's
+    /// `done_at`) are untouched, and the four new columns land at their
+    /// "not yet retried" defaults.
+    #[tokio::test]
+    async fn outbox_migration_0005_preserves_existing_rows() {
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+        use std::str::FromStr;
+
+        let options = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+
+        for file in [
+            "0001_sin90.sql",
+            "0002_lifeos.sql",
+            "0003_week_iso_unique.sql",
+            "0004_routines.sql",
+        ] {
+            let sql = std::fs::read_to_string(format!("./src/store/migrations/{file}")).unwrap();
+            sqlx::raw_sql(&sql).execute(&pool).await.unwrap();
+        }
+
+        sqlx::query(
+            "INSERT INTO sin90_outbox (id, kind, dedup_key, desired, status, created_at, done_at)
+             VALUES ('old-1', 'scheduler.upsert', 'routine:pre-existing',
+                      '{\"key\":\"routine.pre-existing\"}', 'pending',
+                      '2026-01-01T00:00:00Z', NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sin90_outbox (id, kind, dedup_key, desired, status, created_at, done_at)
+             VALUES ('old-2', 'scheduler.delete', 'routine:gone',
+                      '{\"key\":\"routine.gone\"}', 'done',
+                      '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let sql = std::fs::read_to_string("./src/store/migrations/0005_outbox_failed.sql").unwrap();
+        sqlx::raw_sql(&sql).execute(&pool).await.unwrap();
+
+        let row = sqlx::query(
+            "SELECT kind, dedup_key, desired, status, created_at, done_at,
+                    attempts, failure_kind, last_error, next_attempt_at
+             FROM sin90_outbox WHERE id = 'old-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<String, _>("kind"), "scheduler.upsert");
+        assert_eq!(row.get::<String, _>("dedup_key"), "routine:pre-existing");
+        assert_eq!(row.get::<String, _>("status"), "pending");
+        assert_eq!(row.get::<String, _>("created_at"), "2026-01-01T00:00:00Z");
+        assert_eq!(row.get::<Option<String>, _>("done_at"), None);
+        assert_eq!(row.get::<i64, _>("attempts"), 0);
+        assert_eq!(row.get::<Option<String>, _>("failure_kind"), None);
+        assert_eq!(row.get::<Option<String>, _>("last_error"), None);
+        assert_eq!(row.get::<Option<String>, _>("next_attempt_at"), None);
+
+        let row2 = sqlx::query("SELECT status, done_at FROM sin90_outbox WHERE id = 'old-2'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row2.get::<String, _>("status"), "done");
+        assert_eq!(row2.get::<String, _>("done_at"), "2026-01-02T00:00:00Z");
+    }
+
+    // ----- migration directory has no numeric gaps --------------------------
+
+    /// Review follow-up (T3.3.1): `sqlx::migrate!` applies files in
+    /// version-number order, so a GAP in the numbering (e.g.
+    /// `0001,0002,0003,0004,0006` with no `0005`) is a live footgun — a
+    /// LATER change that fills the gap ships a migration numbered lower
+    /// than one that already shipped, so it applies AFTER its "true"
+    /// chronological place on any db that already upgraded past the gap
+    /// (exactly the mistake this task's own migration almost made — see
+    /// `0005_outbox_failed.sql`'s header comment). This asserts
+    /// `src/store/migrations/` has no such gap: version numbers, sorted,
+    /// are exactly `1..=N` for some `N` — same prefix convention
+    /// `sqlx::migrate!` itself parses (`NNNN_description.sql`).
+    #[tokio::test]
+    async fn outbox_migrations_are_contiguous_no_gaps() {
+        let mut versions: Vec<u32> = std::fs::read_dir("./src/store/migrations")
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".sql"))
+            .map(|name| {
+                let prefix = name.split('_').next().unwrap_or(&name).to_string();
+                prefix.parse::<u32>().unwrap_or_else(|e| {
+                    panic!("migration file {name:?} has no numeric prefix: {e}")
+                })
+            })
+            .collect();
+        versions.sort_unstable();
+
+        assert!(!versions.is_empty(), "no migration files found");
+        let expected: Vec<u32> = (1..=versions.len() as u32).collect();
+        assert_eq!(
+            versions, expected,
+            "migration version numbers must be contiguous starting at 1, no gaps \
+             (found {versions:?}) — a gap means a future migration filling it in \
+             would apply out of chronological order on an already-upgraded db"
+        );
     }
 }
