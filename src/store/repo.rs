@@ -12,13 +12,14 @@
 use std::collections::HashMap;
 
 use crate::core::{
-    check_alloc, check_area_transition, check_rhythm_transition, check_routine_transition,
+    canonical_iso_date, canonical_iso_week, check_alloc, check_area_transition,
+    check_review_transition, check_rhythm_transition, check_routine_transition,
     check_schedule_block_transition, check_task_transition, check_week_transition, now_iso8601,
-    routine_is_terminal, ulid, validate, validate_cron, validate_tz, week_is_open, Alloc, Area,
-    AreaStatus, Direction, DirectionStatus, Energy, FireTrigger, NewRoutine, ProposalSource,
-    ProposalStatus, Rhythm, RhythmStatus, Routine, RoutinePatch, RoutineStatus, ScheduleBlock,
-    ScheduleBlockStatus, Sin90Op, Sin90Proposal, Task, TaskKind, TaskStatus, ValidationCtx, Week,
-    WeekStatus,
+    review_is_terminal, routine_is_terminal, ulid, validate, validate_cron, validate_tz,
+    week_is_open, Alloc, Area, AreaStatus, Direction, DirectionStatus, Energy, FireTrigger,
+    NewReview, NewRoutine, ProposalSource, ProposalStatus, Review, ReviewKind, ReviewStatus,
+    Rhythm, RhythmStatus, Routine, RoutinePatch, RoutineStatus, ScheduleBlock, ScheduleBlockStatus,
+    Sin90Op, Sin90Proposal, Task, TaskKind, TaskStatus, ValidationCtx, Week, WeekStatus,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -58,6 +59,19 @@ pub struct ApplyOutcome {
 pub struct RoutineUpdate {
     pub routine: Routine,
     pub changed: Vec<&'static str>,
+}
+
+/// Outcome of [`Sin90Store::update_review_body`] (T4.1.1) — same convention
+/// as [`RoutineUpdate`], but `changed` is a bare `bool`: a [`ReviewPatch`]
+/// only ever has one field (`body`), so there is nothing to name. `false`
+/// means the patch was a no-op (`body` re-stated the current value) — no
+/// row was written and no `sin90_events` row was appended; a caller
+/// mirroring this to a second audience (`http::update_review`) MUST gate its
+/// own emit on `changed`, same rule `RoutineUpdate`'s doc states.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewUpdate {
+    pub review: Review,
+    pub changed: bool,
 }
 
 /// Outcome of [`Sin90Store::record_routine_fire`] (T3.2.2). Every variant
@@ -207,6 +221,24 @@ fn row_to_routine(r: sqlx::sqlite::SqliteRow) -> Result<Routine> {
 const ROUTINE_COLUMNS: &str = "id, area_id, direction_id, title, kind, cron, tz, \
      target_count, target_minutes, status, created_at, updated_at";
 
+/// Shared row→`Review` mapping (T4.1.1, design §2/§3.2/§4.1) for
+/// `create_review`/`get_review`/`list_reviews`/`update_review_body`/
+/// `finalize_review`, all of which `SELECT` the same full column list.
+fn row_to_review(r: sqlx::sqlite::SqliteRow) -> Result<Review> {
+    Ok(Review {
+        id: r.get("id"),
+        kind: from_wire(&r.get::<String, _>("kind"))?,
+        status: from_wire(&r.get::<String, _>("status"))?,
+        week_id: r.get("week_id"),
+        period: r.get("period"),
+        body: r.get("body"),
+        created_at: r.get("created_at"),
+        updated_at: r.get("updated_at"),
+    })
+}
+
+const REVIEW_COLUMNS: &str = "id, kind, status, week_id, period, body, created_at, updated_at";
+
 /// L3 (T3.1.1 review): an `i64` column value read back as `u32` goes through
 /// a checked conversion, not `as u32` — `as` silently truncates/wraps on
 /// overflow (e.g. a stray negative value would `as`-cast to a huge positive
@@ -233,6 +265,39 @@ fn check_positive_target(value: Option<u32>, field: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Format-validate a [`NewReview`]/[`Review`]`.period` against its `kind`
+/// (T4.1.1, design §2/§3.2/§4.1): returns the CANONICAL form (same
+/// normalize-then-validate convention [`canonical_iso_week`] already uses
+/// for `Week.iso_week`) or a clean [`StoreError::Invalid`]. This is a PURE
+/// check — no I/O — so it does not confirm a `rhythm` period actually
+/// references an existing [`crate::core::RhythmId`]; that is a relational
+/// check `create_review` does separately, under its write transaction (same
+/// split `create_routine` uses for `area_id`/`direction_id` vs.
+/// `validate_cron`/`validate_tz`).
+fn validate_review_period(kind: ReviewKind, period: &str) -> Result<String> {
+    match kind {
+        ReviewKind::Daily => canonical_iso_date(period).ok_or_else(|| {
+            StoreError::Invalid(format!(
+                "daily review period must be a calendar date like 2026-09-24, got {period:?}"
+            ))
+        }),
+        ReviewKind::Weekly => canonical_iso_week(period).ok_or_else(|| {
+            StoreError::Invalid(format!(
+                "weekly review period must be an ISO-8601 week like 2026-W39, got {period:?}"
+            ))
+        }),
+        ReviewKind::Rhythm => {
+            let trimmed = period.trim();
+            if trimmed.is_empty() {
+                return Err(StoreError::Invalid(
+                    "rhythm review period must be a non-empty rhythm id".into(),
+                ));
+            }
+            Ok(trimmed.to_string())
+        }
+    }
 }
 
 /// `GET /today`'s response shape (design M1). Every field is a plain read —
@@ -2145,6 +2210,240 @@ impl Sin90Store {
             applied_now: true,
         })
     }
+
+    // ----- Review (M4, T4.1.1, design §2/§3.2/§4.1) -------------------------
+    //
+    // Direct writes, human-gated at the HTTP layer (same convention as
+    // Area/Task/Week/Routine above) — there is no `Sin90Op::CreateReview` /
+    // `FinalizeReview` proposal variant, same reasoning `http::mod`'s Routine
+    // section doc gives for Routine. `create`/`update_body`/`finalize` each
+    // append exactly one `sin90_events` row per real write, same tx as the
+    // row change; a no-op `update_review_body` writes neither (mirrors
+    // `update_routine`'s L1 rule).
+
+    /// Create a Review (T4.1.1). `kind`+`period` format is checked first
+    /// ([`validate_review_period`], a pure check); a `rhythm` period is then
+    /// confirmed to reference an EXISTING [`crate::core::RhythmId`] under the
+    /// write transaction ([`read_rhythm_status`], reused from the Rhythm
+    /// section below purely for its existence check — the status it returns
+    /// is discarded) — an unknown rhythm id comes back as a clean
+    /// [`StoreError::NotFound`] (404), not a raw FK violation. `UNIQUE(kind,
+    /// period)` (migration 0007) is the backstop; checked explicitly first
+    /// (same convention `create_week` uses for `iso_week`) for a clean
+    /// [`StoreError::Conflict`] (409) rather than a raw SQLite constraint
+    /// error. A fresh Review always starts `draft` with an empty `body` —
+    /// [`NewReview`] does not accept one (see that type's doc) — and
+    /// `week_id` is always `NULL`: new code never sets it (design §3.2's
+    /// note that `period` replaces it as the identity axis).
+    pub async fn create_review(&self, new: &NewReview) -> Result<Review> {
+        let period = validate_review_period(new.kind, &new.period)?;
+
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        if matches!(new.kind, ReviewKind::Rhythm) {
+            // Existence-only: the status itself is not this check's concern.
+            read_rhythm_status(&mut tx, &period).await?;
+        }
+        let kind_str = to_wire(&new.kind)?;
+        let taken = sqlx::query("SELECT 1 FROM sin90_reviews WHERE kind = ? AND period = ?")
+            .bind(&kind_str)
+            .bind(&period)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if taken.is_some() {
+            return Err(StoreError::Conflict(format!(
+                "a {kind_str} review for period {period} already exists"
+            )));
+        }
+
+        let id = ulid();
+        let now = now_iso8601();
+        sqlx::query(
+            "INSERT INTO sin90_reviews (id, kind, status, week_id, period, body, created_at, updated_at)
+             VALUES (?, ?, 'draft', NULL, ?, '', ?, ?)",
+        )
+        .bind(&id)
+        .bind(&kind_str)
+        .bind(&period)
+        .bind(&now)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        append_event(
+            &mut tx,
+            "review",
+            &id,
+            "created",
+            None,
+            Some("draft"),
+            &json!({
+                "review_id": id, "kind": kind_str, "period": period, "status": "draft",
+            }),
+            &now,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Review {
+            id,
+            kind: new.kind,
+            status: ReviewStatus::Draft,
+            week_id: None,
+            period,
+            body: String::new(),
+            created_at: now.clone(),
+            updated_at: now,
+        })
+    }
+
+    /// A read: no transaction, no event. Missing id is [`StoreError::NotFound`].
+    pub async fn get_review(&self, id: &str) -> Result<Review> {
+        let row = sqlx::query(&format!(
+            "SELECT {REVIEW_COLUMNS} FROM sin90_reviews WHERE id = ?"
+        ))
+        .bind(id)
+        .fetch_optional(self.pool())
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("review {id}")))?;
+        row_to_review(row)
+    }
+
+    /// A read: no transaction, no event. `period` is matched exactly (already
+    /// canonical on write, same convention `list_routines`' `status` filter
+    /// uses) — a caller filtering by a non-canonical period (e.g. lowercase
+    /// `w`) simply gets zero rows, same as any other exact-match filter.
+    pub async fn list_reviews(
+        &self,
+        kind: Option<ReviewKind>,
+        period: Option<&str>,
+    ) -> Result<Vec<Review>> {
+        let mut sql = format!("SELECT {REVIEW_COLUMNS} FROM sin90_reviews WHERE 1=1");
+        if kind.is_some() {
+            sql.push_str(" AND kind = ?");
+        }
+        if period.is_some() {
+            sql.push_str(" AND period = ?");
+        }
+        sql.push_str(" ORDER BY created_at DESC, rowid DESC");
+
+        let mut q = sqlx::query(&sql);
+        if let Some(k) = kind {
+            q = q.bind(to_wire(&k)?);
+        }
+        if let Some(p) = period {
+            q = q.bind(p);
+        }
+        let rows = q.fetch_all(self.pool()).await?;
+        rows.into_iter().map(row_to_review).collect()
+    }
+
+    /// Apply a [`ReviewPatch`] (T4.1.1) — the only mutable field is `body`.
+    /// - A `finalized` Review is a closed door, same as `update_routine`'s H2
+    ///   for `retired`: rejected with [`StoreError::Conflict`] (409) BEFORE
+    ///   the no-op comparison below, so even a patch that would otherwise
+    ///   change nothing is still refused once finalized.
+    /// - The new `body` is compared against the CURRENT row, not against
+    ///   "was a value supplied" (there is only one field, so this is simpler
+    ///   than `update_routine`'s L1, but the same rule): re-stating the
+    ///   current body writes no `UPDATE` and appends no event.
+    pub async fn update_review_body(&self, id: &str, body: &str) -> Result<ReviewUpdate> {
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let row = sqlx::query(&format!(
+            "SELECT {REVIEW_COLUMNS} FROM sin90_reviews WHERE id = ?"
+        ))
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            return Err(StoreError::NotFound(format!("review {id}")));
+        };
+        let current = row_to_review(row)?;
+
+        if review_is_terminal(current.status) {
+            return Err(StoreError::Conflict(format!(
+                "review {id} is finalized; no further changes are accepted"
+            )));
+        }
+
+        if body == current.body {
+            // Dropping `tx` here rolls back the `BEGIN IMMEDIATE` we opened
+            // to read `current` — no row, no event, `updated_at` untouched.
+            return Ok(ReviewUpdate {
+                review: current,
+                changed: false,
+            });
+        }
+
+        let now = now_iso8601();
+        sqlx::query("UPDATE sin90_reviews SET body = ?, updated_at = ? WHERE id = ?")
+            .bind(body)
+            .bind(&now)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        let updated = Review {
+            body: body.to_string(),
+            updated_at: now.clone(),
+            ..current
+        };
+        append_event(
+            &mut tx,
+            "review",
+            id,
+            "updated",
+            None,
+            None,
+            &json!({"review_id": id, "body": updated.body}),
+            &now,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(ReviewUpdate {
+            review: updated,
+            changed: true,
+        })
+    }
+
+    /// Transition a Review `draft -> finalized` (design §3.2 — the only
+    /// legal edge, [`check_review_transition`]; `finalized` is terminal, so
+    /// finalizing twice is a [`crate::core::TransitionError`] -> 409, same
+    /// convention every other transition endpoint above uses).
+    pub async fn finalize_review(&self, id: &str) -> Result<Review> {
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let row = sqlx::query(&format!(
+            "SELECT {REVIEW_COLUMNS} FROM sin90_reviews WHERE id = ?"
+        ))
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            return Err(StoreError::NotFound(format!("review {id}")));
+        };
+        let current = row_to_review(row)?;
+        check_review_transition(current.status, ReviewStatus::Finalized)?;
+
+        let now = now_iso8601();
+        sqlx::query("UPDATE sin90_reviews SET status = 'finalized', updated_at = ? WHERE id = ?")
+            .bind(&now)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        append_event(
+            &mut tx,
+            "review",
+            id,
+            "finalized",
+            Some("draft"),
+            Some("finalized"),
+            &json!({"review_id": id}),
+            &now,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Review {
+            status: ReviewStatus::Finalized,
+            updated_at: now,
+            ..current
+        })
+    }
 }
 
 /// A read-only snapshot of the entities a proposal references, so
@@ -3404,6 +3703,245 @@ mod routine_tests {
     }
 }
 
+// ----- T4.1.1: Review three-kind period store layer (design §2/§3.2/§4.1) -
+
+#[cfg(test)]
+mod review_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::store::test_hooks;
+
+    async fn new_store() -> Sin90Store {
+        Sin90Store::open_memory().await.unwrap()
+    }
+
+    fn nr(kind: ReviewKind, period: &str) -> NewReview {
+        NewReview {
+            kind,
+            period: period.to_string(),
+        }
+    }
+
+    async fn create_ok(store: &Sin90Store, kind: ReviewKind, period: &str) -> Review {
+        store.create_review(&nr(kind, period)).await.unwrap()
+    }
+
+    // ----- creation: period format validation -------------------------------
+
+    #[tokio::test]
+    async fn review_create_daily_accepts_valid_date_rejects_invalid() {
+        let store = new_store().await;
+        let review = create_ok(&store, ReviewKind::Daily, "2026-09-24").await;
+        assert_eq!(review.period, "2026-09-24");
+        assert_eq!(review.status, ReviewStatus::Draft);
+        assert_eq!(review.body, "");
+
+        for bad in ["2026-13-01", "2026-02-30", "not-a-date", "2026-9-24"] {
+            let err = store
+                .create_review(&nr(ReviewKind::Daily, bad))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, StoreError::Invalid(_)), "{bad}: {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn review_create_weekly_accepts_valid_week_rejects_invalid() {
+        let store = new_store().await;
+        let review = create_ok(&store, ReviewKind::Weekly, "2026-w39").await;
+        // Canonicalized, same convention `canonical_iso_week` guarantees for
+        // `create_week`'s `iso_week` — lowercase `w` in, uppercase out.
+        assert_eq!(review.period, "2026-W39");
+
+        for bad in ["2026-W99", "2026-W00", "garbage", "2026-39"] {
+            let err = store
+                .create_review(&nr(ReviewKind::Weekly, bad))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, StoreError::Invalid(_)), "{bad}: {err:?}");
+        }
+    }
+
+    /// A `rhythm` period must reference an EXISTING `sin90_rhythms.id` — a
+    /// relational check, not a pure format one (`validate_review_period`'s
+    /// doc). Positive control: seeding one via `test_hooks::insert_rhythm`
+    /// (T3.4.1 has no production create path yet) makes the same call
+    /// succeed.
+    #[tokio::test]
+    async fn review_create_rhythm_requires_existing_rhythm() {
+        let store = new_store().await;
+        let err = store
+            .create_review(&nr(ReviewKind::Rhythm, "no-such-rhythm"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotFound(_)), "{err:?}");
+
+        test_hooks::insert_rhythm(&store, "rhythm-1").await.unwrap();
+        let review = create_ok(&store, ReviewKind::Rhythm, "rhythm-1").await;
+        assert_eq!(review.period, "rhythm-1");
+    }
+
+    // ----- creation: UNIQUE(kind, period) ------------------------------------
+
+    #[tokio::test]
+    async fn review_create_duplicate_kind_period_conflicts_distinct_period_succeeds() {
+        let store = new_store().await;
+        create_ok(&store, ReviewKind::Daily, "2026-09-24").await;
+
+        let err = store
+            .create_review(&nr(ReviewKind::Daily, "2026-09-24"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Conflict(_)), "{err:?}");
+
+        // Positive control: a different period for the same kind succeeds.
+        let other = store
+            .create_review(&nr(ReviewKind::Daily, "2026-09-25"))
+            .await
+            .unwrap();
+        assert_eq!(other.period, "2026-09-25");
+
+        // Positive control: the SAME period under a different kind also
+        // succeeds — the constraint is on the (kind, period) pair, not
+        // `period` alone.
+        let weekly = store
+            .create_review(&nr(ReviewKind::Weekly, "2026-W40"))
+            .await
+            .unwrap();
+        assert_eq!(weekly.period, "2026-W40");
+    }
+
+    // ----- update body: no-op writes zero events, real change writes one ----
+
+    #[tokio::test]
+    async fn review_update_body_noop_writes_zero_events_real_change_writes_one() {
+        let store = new_store().await;
+        let review = create_ok(&store, ReviewKind::Daily, "2026-09-24").await;
+
+        // No-op: re-stating the current (empty) body.
+        let outcome = store.update_review_body(&review.id, "").await.unwrap();
+        assert!(!outcome.changed);
+        assert_eq!(
+            test_hooks::event_count(&store, "review", &review.id)
+                .await
+                .unwrap(),
+            1, // only `created` so far
+            "a no-op PATCH must not append an event"
+        );
+
+        // Positive control: an actual change appends exactly one more event.
+        let outcome = store
+            .update_review_body(&review.id, "today went well")
+            .await
+            .unwrap();
+        assert!(outcome.changed);
+        assert_eq!(outcome.review.body, "today went well");
+        assert_eq!(
+            test_hooks::event_count(&store, "review", &review.id)
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn review_update_body_on_finalized_is_conflict() {
+        let store = new_store().await;
+        let review = create_ok(&store, ReviewKind::Daily, "2026-09-24").await;
+        store.finalize_review(&review.id).await.unwrap();
+
+        let err = store
+            .update_review_body(&review.id, "too late")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Conflict(_)), "{err:?}");
+    }
+
+    // ----- finalize: draft -> finalized once, twice is a conflict -----------
+
+    #[tokio::test]
+    async fn review_finalize_draft_to_finalized_then_twice_is_conflict() {
+        let store = new_store().await;
+        let review = create_ok(&store, ReviewKind::Daily, "2026-09-24").await;
+
+        let finalized = store.finalize_review(&review.id).await.unwrap();
+        assert_eq!(finalized.status, ReviewStatus::Finalized);
+
+        // Mutation target: removing `finalize_review`'s
+        // `check_review_transition` call (or `review_transition_allowed`'s
+        // `(Draft, Finalized)`-only arm) would let this second call succeed
+        // instead of 409ing — this test goes red under either mutation.
+        let err = store.finalize_review(&review.id).await.unwrap_err();
+        assert!(matches!(err, StoreError::Transition(_)), "{err:?}");
+    }
+
+    // ----- exact event sequence: create -> update -> finalize ---------------
+
+    #[tokio::test]
+    async fn review_event_sequence_is_exact() {
+        let store = new_store().await;
+        let review = create_ok(&store, ReviewKind::Daily, "2026-09-24").await;
+        store.update_review_body(&review.id, "notes").await.unwrap();
+        store.finalize_review(&review.id).await.unwrap();
+
+        let events = store
+            .list_events(Some("review"), Some(&review.id), None, None)
+            .await
+            .unwrap();
+        let seq: Vec<(String, Option<String>, Option<String>)> = events
+            .iter()
+            .map(|e| (e.kind.clone(), e.from_state.clone(), e.to_state.clone()))
+            .collect();
+        assert_eq!(
+            seq,
+            vec![
+                ("created".to_string(), None, Some("draft".to_string())),
+                ("updated".to_string(), None, None),
+                (
+                    "finalized".to_string(),
+                    Some("draft".to_string()),
+                    Some("finalized".to_string())
+                ),
+            ]
+        );
+    }
+
+    // ----- reads --------------------------------------------------------
+
+    #[tokio::test]
+    async fn review_get_unknown_id_is_not_found() {
+        let store = new_store().await;
+        let err = store.get_review("no-such-review").await.unwrap_err();
+        assert!(matches!(err, StoreError::NotFound(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn review_list_filters_by_kind_and_period() {
+        let store = new_store().await;
+        create_ok(&store, ReviewKind::Daily, "2026-09-24").await;
+        create_ok(&store, ReviewKind::Daily, "2026-09-25").await;
+        create_ok(&store, ReviewKind::Weekly, "2026-W39").await;
+
+        let daily = store
+            .list_reviews(Some(ReviewKind::Daily), None)
+            .await
+            .unwrap();
+        assert_eq!(daily.len(), 2);
+        assert!(daily.iter().all(|r| r.kind == ReviewKind::Daily));
+
+        let one = store
+            .list_reviews(Some(ReviewKind::Daily), Some("2026-09-24"))
+            .await
+            .unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].period, "2026-09-24");
+
+        let all = store.list_reviews(None, None).await.unwrap();
+        assert_eq!(all.len(), 3);
+    }
+}
+
 // ----- T3.3.1: Routine changes write `sin90_outbox` in the same tx --------
 
 #[cfg(test)]
@@ -3785,6 +4323,129 @@ mod outbox_tests {
             "migration version numbers must be contiguous starting at 1, no gaps \
              (found {versions:?}) — a gap means a future migration filling it in \
              would apply out of chronological order on an already-upgraded db"
+        );
+    }
+}
+
+// ----- T4.1.1: migration 0007 backfill on an existing (0006-era) db -------
+
+#[cfg(test)]
+mod review_migration_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use sqlx::Row;
+    use std::str::FromStr;
+
+    /// A `sin90.db` with only migrations 0001-0006 applied — pre-`period`,
+    /// the state every real user's db is in before this task's migration.
+    async fn old_pool() -> sqlx::SqlitePool {
+        let options = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        for file in [
+            "0001_sin90.sql",
+            "0002_lifeos.sql",
+            "0003_week_iso_unique.sql",
+            "0004_routines.sql",
+            "0005_outbox_failed.sql",
+            "0006_routine_fires.sql",
+        ] {
+            let sql = std::fs::read_to_string(format!("./src/store/migrations/{file}")).unwrap();
+            sqlx::raw_sql(&sql).execute(&pool).await.unwrap();
+        }
+        pool
+    }
+
+    /// Backfill rule (0007's own header comment, and T4.1.1's task doc): a
+    /// pre-existing row whose `week_id` resolves to a real `sin90_weeks` row
+    /// gets that week's `iso_week` as its `period`; a row that does NOT
+    /// resolve that way gets `'legacy-' || id`. This db predates ANY code
+    /// path that ever wrote `sin90_reviews` (0007's comment), so both rows
+    /// here are inserted by hand, standing in for the "if such a row existed"
+    /// case the migration must still handle correctly.
+    #[tokio::test]
+    async fn migration_0007_backfills_week_id_rows_and_legacy_placeholders() {
+        let pool = old_pool().await;
+
+        sqlx::query(
+            "INSERT INTO sin90_weeks (id, status, iso_week, created_at, updated_at)
+             VALUES ('week-1', 'planning', '2026-W39', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sin90_reviews (id, kind, status, week_id, body, created_at, updated_at)
+             VALUES ('rev-with-week', 'weekly', 'draft', 'week-1', '', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sin90_reviews (id, kind, status, week_id, body, created_at, updated_at)
+             VALUES ('rev-orphan', 'daily', 'draft', NULL, '', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // A second orphan of the SAME kind — proves the `legacy-<id>`
+        // fallback is unique per row (guards the `UNIQUE(kind, period)`
+        // index below from ever rejecting the migration itself).
+        sqlx::query(
+            "INSERT INTO sin90_reviews (id, kind, status, week_id, body, created_at, updated_at)
+             VALUES ('rev-orphan-2', 'daily', 'draft', NULL, '', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let sql = std::fs::read_to_string("./src/store/migrations/0007_review_period.sql").unwrap();
+        sqlx::raw_sql(&sql).execute(&pool).await.unwrap();
+
+        let with_week: String =
+            sqlx::query("SELECT period FROM sin90_reviews WHERE id = 'rev-with-week'")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .get("period");
+        assert_eq!(with_week, "2026-W39", "backfilled from the row's week_id");
+
+        let orphan: String =
+            sqlx::query("SELECT period FROM sin90_reviews WHERE id = 'rev-orphan'")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .get("period");
+        assert_eq!(orphan, "legacy-rev-orphan");
+
+        let orphan2: String =
+            sqlx::query("SELECT period FROM sin90_reviews WHERE id = 'rev-orphan-2'")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .get("period");
+        assert_eq!(orphan2, "legacy-rev-orphan-2");
+        assert_ne!(
+            orphan, orphan2,
+            "each legacy row must get a distinct period"
+        );
+
+        // The UNIQUE(kind, period) index itself must now exist and be live.
+        let dup = sqlx::query(
+            "INSERT INTO sin90_reviews (id, kind, status, week_id, period, body, created_at, updated_at)
+             VALUES ('rev-dup', 'weekly', 'draft', NULL, '2026-W39', '', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(
+            dup.is_err(),
+            "UNIQUE(kind, period) must reject a second weekly/2026-W39 row"
         );
     }
 }

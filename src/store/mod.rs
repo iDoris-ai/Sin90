@@ -19,8 +19,8 @@ pub mod repo;
 pub use attention::{AttentionRow, WeekAttention};
 pub use packs::{five_life_systems, SeedArea};
 pub use repo::{
-    AppliedProposal, ApplyOutcome, EventRow, RoutineFireOutcome, RoutineUpdate, StoredProposal,
-    TodayView,
+    AppliedProposal, ApplyOutcome, EventRow, ReviewUpdate, RoutineFireOutcome, RoutineUpdate,
+    StoredProposal, TodayView,
 };
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -325,6 +325,27 @@ pub mod test_hooks {
             .bind(fire_id)
             .execute(store.pool())
             .await?;
+        Ok(())
+    }
+
+    // ----- T4.1.1 Review test scaffolding ----------------------------------
+
+    /// Insert a bare `active` `sin90_rhythms` row via raw SQL. T3.4.1 (`POST
+    /// /rhythms`) has not landed yet — there is no production way to create
+    /// a Rhythm — so a `kind: rhythm` Review's "period must reference an
+    /// EXISTING rhythm" test needs some way to seed one. Test-only; not a
+    /// stand-in for T3.4.1's eventual real create path.
+    pub async fn insert_rhythm(store: &Sin90Store, id: &str) -> Result<()> {
+        let now = crate::core::now_iso8601();
+        sqlx::query(
+            "INSERT INTO sin90_rhythms (id, status, allocations, created_at, updated_at)
+             VALUES (?, 'active', '[]', ?, ?)",
+        )
+        .bind(id)
+        .bind(&now)
+        .bind(&now)
+        .execute(store.pool())
+        .await?;
         Ok(())
     }
 }
