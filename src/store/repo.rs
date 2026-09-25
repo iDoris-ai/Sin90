@@ -3169,7 +3169,11 @@ pub(crate) async fn apply_op(
                     "created",
                     None,
                     Some("planned"),
-                    &json!({"id": id, "week_id": week_id, "title": t.title}),
+                    // §2 #25 / §11.2.1's replay rule #2 (T5.4.1): `direction_id`
+                    // added so a task created directly INTO a Direction by
+                    // `propose.create` (never assigned via `AssignTaskDirection`)
+                    // still has a self-contained ownership fact to replay from.
+                    &json!({"id": id, "week_id": week_id, "title": t.title, "direction_id": t.direction_id}),
                     &now,
                 )
                 .await?;
@@ -3312,7 +3316,11 @@ pub(crate) async fn apply_op(
                 "created",
                 None,
                 Some("planned"),
-                &json!({"id": new_id, "week_id": to_week, "carried_from": task_id}),
+                // §2 #25 (T5.4.1): `direction_id` = the SOURCE task's
+                // ownership (read into `direction_id` above, before this
+                // INSERT) — the carried-over task inherits it, same as the
+                // row itself does.
+                &json!({"id": new_id, "week_id": to_week, "carried_from": task_id, "direction_id": direction_id}),
                 &now,
             )
             .await?;

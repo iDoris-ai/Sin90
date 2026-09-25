@@ -28,8 +28,9 @@ use crate::ai::ports::{
 };
 use crate::ai::source_for;
 use crate::core::{
-    direction_is_terminal, task_is_terminal, validate, DirectionId, DirectionStatus,
-    ProposalStatus, Review, Sin90Op, Sin90Proposal, Task, TaskStatus, WeekId,
+    direction_is_terminal, task_is_terminal, validate, week_is_open, Alloc, DirectionId,
+    DirectionStatus, ProposalStatus, Review, Sin90Op, Sin90Proposal, Task, TaskStatus, Week,
+    WeekId, WeekStatus,
 };
 use crate::store::repo::{
     append_event, apply_op, build_snapshot, from_wire, row_to_review, row_to_task, to_wire,
@@ -230,6 +231,34 @@ impl AiReadModel for AiReader {
             .collect()
     }
 
+    /// New (T5.4.1, 2026-09-24 review L1): a precise, single-id lookup — see
+    /// the trait method's doc for why this exists ALONGSIDE
+    /// `direction_candidates` rather than reusing it with `limit`
+    /// artificially raised. Deliberately does NOT filter by status (unlike
+    /// `direction_candidates`'s terminal exclusion) — the caller decides.
+    async fn direction(&self, id: &DirectionId) -> Result<Option<DirectionCandidate>, ReadError> {
+        let row = sqlx::query(
+            "SELECT d.id AS id, d.title AS title, d.status AS status, a.title AS area_title
+             FROM sin90_directions d
+             LEFT JOIN sin90_areas a ON a.id = d.area_id
+             WHERE d.id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.0)
+        .await
+        .map_err(rerr)?;
+        row.map(|r| {
+            Ok(DirectionCandidate {
+                direction_id: r.get::<String, _>("id"),
+                title: r.get("title"),
+                status: from_wire::<DirectionStatus>(&r.get::<String, _>("status"))
+                    .map_err(rerr)?,
+                area_title: r.get("area_title"),
+            })
+        })
+        .transpose()
+    }
+
     /// R1's history lookup (§11.4.1, T5.2.1b): every ALREADY-classified task
     /// whose Direction is still non-terminal, normalized through the real
     /// `normalize_title` (`crate::ai::classify`, not a local approximation —
@@ -293,6 +322,77 @@ impl AiReadModel for AiReader {
             .collect::<StoreResult<_>>()
             .map_err(rerr)
     }
+
+    /// T5.4.1 (§11.4.3's "输入"): existence + status/`iso_week` of a Week.
+    async fn week(&self, id: &WeekId) -> Result<Option<Week>, ReadError> {
+        let row = sqlx::query(
+            "SELECT id, status, iso_week, created_at, updated_at FROM sin90_weeks WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.0)
+        .await
+        .map_err(rerr)?;
+        row.map(row_to_week).transpose().map_err(rerr)
+    }
+
+    /// T5.4.1's "P" (design §11.4.3, 2026-09-24 review H1): the SINGLE
+    /// NEAREST week (by `iso_week`, regardless of status) strictly before
+    /// `iso_week` — NOT "the most recent OPEN week, skipping over closed
+    /// ones to find an older open one". If that nearest week is not open
+    /// (`week_is_open`), there is NO `P` at all (§11.4.3: "P 不存在或已关就
+    /// 没有顺延建议") — this function does not look further back for a
+    /// still-open week beyond it. `canonical_iso_week`'s fixed-width
+    /// `YYYY-Www` output (migration 0001/§11.6) makes a plain
+    /// `ORDER BY iso_week DESC` correct for "nearest" — lexicographic and
+    /// chronological order coincide.
+    async fn previous_open_week(&self, iso_week: &str) -> Result<Option<Week>, ReadError> {
+        let row = sqlx::query(
+            "SELECT id, status, iso_week, created_at, updated_at FROM sin90_weeks
+             WHERE iso_week < ?
+             ORDER BY iso_week DESC
+             LIMIT 1",
+        )
+        .bind(iso_week)
+        .fetch_optional(&self.0)
+        .await
+        .map_err(rerr)?;
+        let nearest = row.map(row_to_week).transpose().map_err(rerr)?;
+        Ok(nearest.filter(|w| week_is_open(w.status)))
+    }
+
+    /// T5.4.1: the most recently CREATED non-retired `sin90_rhythms` row's
+    /// `allocations` — empty if none exists. There is no production "list
+    /// rhythms ordered by recency" query yet (T3.4.1 hasn't landed a create
+    /// route either, see `store::test_hooks::insert_rhythm`'s doc), so this
+    /// is a fresh, minimal query rather than a reuse of an existing one.
+    async fn rhythm_alloc(&self) -> Result<Vec<Alloc>, ReadError> {
+        let row = sqlx::query(
+            "SELECT allocations FROM sin90_rhythms
+             WHERE status <> 'retired'
+             ORDER BY created_at DESC, rowid DESC
+             LIMIT 1",
+        )
+        .fetch_optional(&self.0)
+        .await
+        .map_err(rerr)?;
+        match row {
+            None => Ok(Vec::new()),
+            Some(r) => {
+                let raw: String = r.get("allocations");
+                serde_json::from_str(&raw).map_err(rerr)
+            }
+        }
+    }
+}
+
+fn row_to_week(r: sqlx::sqlite::SqliteRow) -> StoreResult<Week> {
+    Ok(Week {
+        id: r.get("id"),
+        status: from_wire::<WeekStatus>(&r.get::<String, _>("status"))?,
+        iso_week: r.get("iso_week"),
+        created_at: r.get("created_at"),
+        updated_at: r.get("updated_at"),
+    })
 }
 
 async fn read_ai_settings(pool: &SqlitePool) -> Result<AiSettings, ReadError> {
@@ -623,6 +723,38 @@ impl Sin90Store {
             })
             .collect())
     }
+
+    /// M-2 (2026-09-24 review round 3, design §11.4.3): the set of
+    /// `sin90_proposals.id` that are AI-PRODUCED for one capability — the
+    /// join `sin90_ai_calls.proposal_id` (with `task_kind = <capability>`,
+    /// `ok = 1`) is the ONLY authoritative signal (§11.4 公共's own "提议
+    /// 形状": "是不是 AI 产出以 sin90_ai_calls.proposal_id 关联为准，J24"),
+    /// NOT the `"ai-<capability>-<ulid>"` id PREFIX `ai::propose::submit_one`
+    /// mints for readability — a human or automation client submitting
+    /// through `POST /proposals` supplies their OWN id and could pick
+    /// anything, including a string that happens to start with
+    /// `"ai-propose-"`; propose's dedup (§11.4 公共's "去重") must never let
+    /// such a proposal block a fresh AI decision.
+    /// L-a (2026-09-24 review round 4): joined against `sin90_proposals`
+    /// and filtered to `status = 'pending'` directly in SQL — dedup only
+    /// ever cares about STILL-PENDING proposals (an accepted/rejected one
+    /// cannot block anything), so there is no reason to hand the caller ids
+    /// for proposals it would immediately have to filter back out again
+    /// after a SEPARATE `list_pending_proposals()` call.
+    pub async fn list_ai_produced_proposal_ids(
+        &self,
+        task_kind: &str,
+    ) -> StoreResult<std::collections::HashSet<String>> {
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT p.id FROM sin90_proposals p \
+             JOIN sin90_ai_calls c ON c.proposal_id = p.id \
+             WHERE p.status = 'pending' AND c.task_kind = ? AND c.ok = 1",
+        )
+        .bind(task_kind)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(ids.into_iter().collect())
+    }
 }
 
 /// One `sin90_ai_calls` row, as `GET /ai/runs/{run_id}` serializes it
@@ -679,80 +811,18 @@ mod tests {
         }
     }
 
-    /// Every table in the db, one canonical string per row (SQLite's own
-    /// `quote()` — handles NULL/INTEGER/TEXT/BLOB uniformly), ordered by
-    /// `rowid` so insertion order is stable. Schema-agnostic on purpose:
-    /// this test must not need updating every time a column is added
-    /// elsewhere.
-    ///
-    /// 2026-09-24 review (M1): `sin90_events` is split into TWO keys —
-    /// `entity = 'proposal'` rows and everything else — instead of one
-    /// blob. §11.5's own exclusion list names exactly three things a
-    /// capability run may change: `sin90_proposals`, `sin90_ai_calls`, and
-    /// `sin90_events WHERE entity = 'proposal'`. A single `sin90_events` key
-    /// could not tell "the expected proposal.submitted row landed" apart
-    /// from "something ALSO wrote a task/direction/review event it had no
-    /// business writing" — both just say "sin90_events changed". Splitting
-    /// the key lets `ai_boundary_tables_unchanged` assert the narrower,
-    /// actually-designed claim: the `entity <> 'proposal'` half must NEVER
-    /// change from anything in `ai/`'s reach.
+    // 2026-09-24 review (M4): moved to `store::test_hooks::{snapshot_all_
+    // tables, diff_snapshot_keys}` so `ai::propose`'s own J21 table-diff test
+    // can reuse the SAME implementation instead of a second copy — thin
+    // local aliases below keep every call site in this file unchanged.
     async fn snapshot_all_tables(pool: &SqlitePool) -> BTreeMap<String, Vec<String>> {
-        let tables: Vec<String> = sqlx::query_scalar(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
-             ORDER BY name",
-        )
-        .fetch_all(pool)
-        .await
-        .unwrap();
-        let mut out = BTreeMap::new();
-        for t in tables {
-            let cols: Vec<String> =
-                sqlx::query_scalar(&format!("SELECT name FROM pragma_table_info('{t}')"))
-                    .fetch_all(pool)
-                    .await
-                    .unwrap();
-            let expr = cols
-                .iter()
-                .map(|c| format!("quote({c})"))
-                .collect::<Vec<_>>()
-                .join(" || '|' || ");
-            if t == "sin90_events" {
-                for (key, where_clause) in [
-                    ("sin90_events(entity=proposal)", "WHERE entity = 'proposal'"),
-                    (
-                        "sin90_events(entity<>proposal)",
-                        "WHERE entity <> 'proposal'",
-                    ),
-                ] {
-                    let rows: Vec<String> = sqlx::query_scalar(&format!(
-                        "SELECT {expr} AS r FROM {t} {where_clause} ORDER BY rowid"
-                    ))
-                    .fetch_all(pool)
-                    .await
-                    .unwrap();
-                    out.insert(key.to_string(), rows);
-                }
-                continue;
-            }
-            let rows: Vec<String> =
-                sqlx::query_scalar(&format!("SELECT {expr} AS r FROM {t} ORDER BY rowid"))
-                    .fetch_all(pool)
-                    .await
-                    .unwrap();
-            out.insert(t, rows);
-        }
-        out
+        crate::store::test_hooks::snapshot_all_tables(pool).await
     }
-
     fn diff_keys(
         before: &BTreeMap<String, Vec<String>>,
         after: &BTreeMap<String, Vec<String>>,
     ) -> Vec<String> {
-        before
-            .keys()
-            .filter(|k| before.get(*k) != after.get(*k))
-            .cloned()
-            .collect()
+        crate::store::test_hooks::diff_snapshot_keys(before, after)
     }
 
     /// Seeds one open week with two planned tasks, via the EXISTING (non-AI)
@@ -1285,6 +1355,102 @@ mod tests {
         // task is unusable as an explicit classify target; the new one isn't.
         assert!(reader.inbox_task(&t1).await.unwrap().is_none());
         assert!(reader.inbox_task(&child).await.unwrap().is_some());
+    }
+
+    /// §2 #25 (T5.4.1, layer split 2026-09-24 — kept here at layer A, NOT
+    /// moved with `ai::propose` to layer B, since `repo::apply_op` is where
+    /// the change actually lives and this exercises it directly through the
+    /// existing non-AI `submit_proposal`/`apply_proposal` path, with no
+    /// dependency on `ai::propose` at all): both `CreateTasks` (a task
+    /// created directly INTO a Direction, never touched by
+    /// `AssignTaskDirection`) and `CarryOverTask` (the new task inherits the
+    /// SOURCE task's Direction) must stamp the owning Direction into the
+    /// `task.created` event's payload, not just the `sin90_tasks` row —
+    /// §11.2.1's replay rule #2 needs a self-contained ownership fact per
+    /// event. Mutation target: drop `"direction_id": t.direction_id` /
+    /// `"direction_id": direction_id` from either `json!` call in
+    /// `apply_op` (`store/repo.rs`) and the corresponding assertion below
+    /// goes red — the key disappears from the payload entirely (an
+    /// `Option<DirectionId>`'s `Some` serializes as a plain string; removing
+    /// the field is the only way the mutation could hide, not turning it
+    /// null).
+    #[tokio::test]
+    async fn task_created_event_payload_carries_direction_id_for_create_and_carry_over() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let dir = store
+            .create_direction("Ship it", "2026-Q4", None)
+            .await
+            .unwrap();
+        let week = store.create_week("2026-W40").await.unwrap();
+
+        // CreateTasks: a task created directly INTO a Direction.
+        let create = Sin90Proposal {
+            id: "create-with-dir".into(),
+            status: ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![Sin90Op::CreateTasks {
+                week_id: week.id.clone(),
+                tasks: vec![NewTask {
+                    title: "owned task".into(),
+                    direction_id: Some(dir.id.clone()),
+                }],
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&create).await.unwrap();
+        store.apply_proposal(&create.id).await.unwrap();
+        let created_id: String =
+            sqlx::query_scalar("SELECT id FROM sin90_tasks WHERE title = 'owned task'")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        let payload: String = sqlx::query_scalar(
+            "SELECT payload FROM sin90_events WHERE entity = 'task' AND entity_id = ? AND kind = 'created'",
+        )
+        .bind(&created_id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            payload.get("direction_id").and_then(|v| v.as_str()),
+            Some(dir.id.as_str()),
+            "CreateTasks's task.created payload must carry the task's Direction: {payload:?}"
+        );
+
+        // CarryOverTask: the new task inherits the SOURCE task's Direction.
+        let next_week = store.create_week("2026-W41").await.unwrap();
+        let carry = Sin90Proposal {
+            id: "carry-with-dir".into(),
+            status: ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![Sin90Op::CarryOverTask {
+                task_id: created_id.clone(),
+                to_week: next_week.id.clone(),
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&carry).await.unwrap();
+        store.apply_proposal(&carry.id).await.unwrap();
+        let carried_id: String =
+            sqlx::query_scalar("SELECT id FROM sin90_tasks WHERE carried_from = ?")
+                .bind(&created_id)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        let payload: String = sqlx::query_scalar(
+            "SELECT payload FROM sin90_events WHERE entity = 'task' AND entity_id = ? AND kind = 'created'",
+        )
+        .bind(&carried_id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            payload.get("direction_id").and_then(|v| v.as_str()),
+            Some(dir.id.as_str()),
+            "CarryOverTask's task.created payload must inherit the source task's Direction: {payload:?}"
+        );
     }
 
     /// 2026-09-24 review (round 2, #4): `title_history` must exclude a
