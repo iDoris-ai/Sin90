@@ -22,8 +22,8 @@ pub use ai_port::{AiCallSummary, AiReader};
 pub use attention::{AttentionRow, WeekAttention};
 pub use packs::{five_life_systems, SeedArea};
 pub use repo::{
-    AppliedProposal, ApplyOutcome, AutoReviewCreated, EventRow, ReviewUpdate, RoutineFireOutcome,
-    RoutineUpdate, StoredProposal, TodayView,
+    AppliedProposal, ApplyOutcome, AutoReviewCreated, EventRow, RejectOutcome, ReviewUpdate,
+    RoutineFireOutcome, RoutineUpdate, StoredProposal, TodayView,
 };
 pub use weekly_draft::{
     render_weekly_draft_markdown, AreaMinutes, DirectionMinutes, RoutineDraftRow, WeeklyDraft,
@@ -301,6 +301,77 @@ pub mod test_hooks {
                 .await?
                 .map(|r| r.get::<String, _>("status")),
         )
+    }
+
+    /// Backdate a `sin90_proposals.created_at` via raw SQL — the only way a
+    /// test can put real clock distance between "submitted" and "rejected"
+    /// without sleeping (mirrors `set_task_created_at`). Needed because
+    /// `now_iso8601()` is second-resolution: a submit immediately followed
+    /// by a reject in the same test can legitimately produce the SAME
+    /// timestamp string, which would let a `proposed_at` bug (e.g. binding
+    /// `now` instead of the proposal's own `created_at`) slip through
+    /// undetected by coincidence.
+    pub async fn set_proposal_created_at(
+        store: &Sin90Store,
+        id: &str,
+        created_at: &str,
+    ) -> Result<()> {
+        sqlx::query("UPDATE sin90_proposals SET created_at = ? WHERE id = ?")
+            .bind(created_at)
+            .bind(id)
+            .execute(store.pool())
+            .await?;
+        Ok(())
+    }
+
+    // ----- T5.7.1 proposal-rejection-log peeks -----------------------------
+
+    /// One `sin90_proposal_rejections` row, as read back for assertions — no
+    /// HTTP route surfaces this log (it exists purely to accumulate data for
+    /// future analysis, `tasks.md` T5.7.1), so a test needs a direct peek.
+    #[derive(Debug, Clone)]
+    pub struct ProposalRejectionRow {
+        pub proposal_id: String,
+        pub capability_source: String,
+        pub proposal_source: String,
+        pub ops_summary: String,
+        pub rationale: Option<String>,
+        pub reason: Option<String>,
+        pub proposed_at: String,
+        pub rejected_at: String,
+    }
+
+    /// All `sin90_proposal_rejections` rows for one `proposal_id`, oldest
+    /// first — a proposal can only ever be rejected once (`reject_proposal`'s
+    /// CAS only fires from `pending`), so callers typically expect exactly
+    /// one row, but this returns the full list rather than assuming that so
+    /// a bug that somehow wrote two rows shows up as a length mismatch, not
+    /// a silent `fetch_one` panic.
+    pub async fn proposal_rejection_rows(
+        store: &Sin90Store,
+        proposal_id: &str,
+    ) -> Result<Vec<ProposalRejectionRow>> {
+        let rows = sqlx::query(
+            "SELECT proposal_id, capability_source, proposal_source, ops_summary, rationale,
+                    reason, proposed_at, rejected_at
+             FROM sin90_proposal_rejections WHERE proposal_id = ? ORDER BY rowid ASC",
+        )
+        .bind(proposal_id)
+        .fetch_all(store.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| ProposalRejectionRow {
+                proposal_id: r.get("proposal_id"),
+                capability_source: r.get("capability_source"),
+                proposal_source: r.get("proposal_source"),
+                ops_summary: r.get("ops_summary"),
+                rationale: r.get("rationale"),
+                reason: r.get("reason"),
+                proposed_at: r.get("proposed_at"),
+                rejected_at: r.get("rejected_at"),
+            })
+            .collect())
     }
 
     // ----- T3.3.1 outbox peeks -------------------------------------------
