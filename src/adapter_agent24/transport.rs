@@ -101,7 +101,13 @@ const WRITER_QUEUE_CAPACITY: usize = 2 * MAX_IN_FLIGHT_PER_CONNECTION + 8;
 /// A hook run exactly once, the moment a [`Transport`] decides its
 /// connection is dead. Production code (`main.rs`) makes this exit the
 /// process; tests make it record that it ran.
-pub(crate) type FatalHook = Arc<dyn Fn() + Send + Sync>;
+/// `pub`, not `pub(crate)` (L-1): `KernelClients::handshake`'s public
+/// signature takes one, and `main.rs` (a different crate from this lib)
+/// needs to be able to construct that argument's type — `TransportError` and
+/// `RpcErrorInfo` stay `pub(crate)` since nothing outside this crate needs to
+/// name them (`KernelClients::call` is `pub(crate)` too; only
+/// `KernelEventSink`, inside this crate, calls it).
+pub type FatalHook = Arc<dyn Fn() + Send + Sync>;
 
 /// The kernel's `error.data.kind` and the rest of an RPC error, parsed once
 /// here rather than left as a `Value` every caller re-navigates. `T3.2.1`'s
