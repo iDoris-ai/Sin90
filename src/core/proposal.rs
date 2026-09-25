@@ -16,13 +16,16 @@
 //! needs in one pass).
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use std::collections::HashSet;
 
-use crate::core::transitions::{check_task_transition, week_is_open, TransitionError};
+use crate::core::transitions::{
+    check_task_transition, direction_is_terminal, task_is_terminal, week_is_open, TransitionError,
+};
 use crate::core::types::{
-    Alloc, AreaId, DirectionId, Energy, ProposalStatus, RhythmId, TaskId, TaskKind, TaskStatus,
-    WeekId, WeekStatus,
+    Alloc, AreaId, DirectionId, DirectionStatus, Energy, ProposalStatus, ReviewId, ReviewStatus,
+    RhythmId, TaskId, TaskKind, TaskStatus, WeekId, WeekStatus,
 };
 
 /// A new task to create inside a week (fields the AI proposes; ids/timestamps
@@ -90,6 +93,90 @@ pub enum Sin90Op {
         task_id: TaskId,
         to_week: WeekId,
     },
+    /// New (design §11.2.1, T5.2.1): assign a still-unclassified ("inbox")
+    /// task to a Direction. This is the classify capability's ONLY writable
+    /// op (`store::ai_port::allowed_ops(Capability::Classify)`), though the
+    /// Op itself is not gated to the AI path at the type level — a
+    /// human/automation client may submit it directly through the existing
+    /// `POST /proposals` (F-2), same as every other `Sin90Op`.
+    ///
+    /// **`deny_unknown_fields` (SFU-9, commit `9404756`, an independent PR
+    /// not yet merged into this branch — see `docs/DESIGN-LIFEOS.md` §11.2)
+    /// is deliberately NOT applied to this variant.** That commit's own doc
+    /// comment claims serde honors `#[serde(deny_unknown_fields)]` "per
+    /// variant" when placed on the ENUM's shared `#[serde(tag = "op", ...)]`
+    /// attribute — true, but that is an enum-level attribute, not a
+    /// per-variant one: `#[serde(deny_unknown_fields)]` written directly
+    /// above ONE variant, as this task was first asked to try, does not
+    /// compile (`error: unknown serde variant attribute
+    /// "deny_unknown_fields"` — serde does not recognize it as a
+    /// variant-level attribute at all). So there is no way to give only this
+    /// new variant the protection without editing the enum's own
+    /// `#[serde(...)]` line, which is exactly the line SFU-9's independent
+    /// PR touches. Rather than risk that merge conflict, this variant is left
+    /// with the SAME (temporary) lack of protection every one of the other
+    /// eight variants has today — SFU-9, whenever it lands, adds
+    /// `deny_unknown_fields` to the enum once and every variant (including
+    /// this one) gains it uniformly, with zero special-casing needed here.
+    AssignTaskDirection {
+        task_id: TaskId,
+        direction_id: DirectionId,
+    },
+    /// New (design §11.2.2, T5.2.1's "一次加齐" per §11.2.3/§11.8 — this Op
+    /// itself is not summarize's capability logic, only its data-write
+    /// primitive; `store::ai_port::allowed_ops(Capability::Summarize)` stays
+    /// the empty set until T5.3.1 actually builds summarize and opens it):
+    /// overwrite a `draft` Review's ENTIRE body. Not gated to the AI path at
+    /// the type level, same as every other `Sin90Op` (F-2) — though in
+    /// practice a human edits a Review body through `PATCH /reviews/{id}`
+    /// (`update_review_body`, no CAS, no size cap, §11.9 R8), not this Op.
+    ///
+    /// **Why `base_body_sha256`**: an AI-drafted rewrite is generated from a
+    /// body snapshot taken at propose time; if a human edits the SAME review
+    /// while that proposal is still pending, accepting it must not silently
+    /// clobber the human's edit. `base_body_sha256` pins the proposal to the
+    /// body it was generated against — D6 rejects the accept if the review's
+    /// current body has moved on (`StaleBase`), the same "AI does not get to
+    /// overrule a human out from under them" posture §11.2.1's inbox check
+    /// (A3) gives tasks.
+    DraftReviewBody {
+        review_id: ReviewId,
+        base_body_sha256: String,
+        body: String,
+    },
+}
+
+/// ⚖️ design §11.2.2's 64 KiB cap — UTF-8 BYTES (`body.len()`, not char
+/// count). Only constrains the AI path (D2); the human `PATCH
+/// /reviews/{id}` path has no size cap today (§11.9 R8).
+pub const MAX_REVIEW_BODY_BYTES: usize = 64 * 1024;
+
+/// Lowercase-hex SHA-256 of a Review body — the "compare and swap" token
+/// `DraftReviewBody.base_body_sha256` is checked against (D6) and
+/// `Working.review_hash`/`ReviewSnap.body_sha256` store. Computed in Rust
+/// (not SQL, per design §11.2.2's apply note), same `sha2`/`hex` pattern
+/// `adapter_agent24::manifest_digest` already uses in this crate.
+#[must_use]
+pub fn body_sha256(body: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(body.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn is_lowercase_hex_sha256(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// New (design §11.2.3, T5.2.1): a Review's status + body digest, as
+/// `ValidationCtx::review_snap` hands it to `validate` — `body_sha256` is
+/// ALREADY the digest (never the raw body), so the pure validator never
+/// needs to see Review bodies, only compare tokens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewSnap {
+    pub status: ReviewStatus,
+    pub body_sha256: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,6 +224,28 @@ pub trait ValidationCtx {
     /// task exists but has no parent. Used to enforce the one-level-deep
     /// constraint (design §3.2) at proposal time, not just at apply time.
     fn task_parent(&self, id: &str) -> Option<Option<TaskId>>;
+    /// New (design §11.2.3, T5.2.1): does this Direction id exist, and if so
+    /// what's its current status? Used by `AssignTaskDirection`'s A4/A5.
+    fn direction_status(&self, id: &str) -> Option<DirectionStatus>;
+    /// New (design §11.2.3, T5.2.1): outer `None` = the task does not exist;
+    /// inner `None` = the task exists and is currently "in the inbox" (no
+    /// Direction assigned yet). Used by `AssignTaskDirection`'s A1/A3.
+    fn task_direction(&self, id: &str) -> Option<Option<DirectionId>>;
+    /// New (design §11.2.3, T5.2.1): a Review's status + body digest, or
+    /// `None` if it does not exist. Used by `DraftReviewBody`'s D4-D6.
+    ///
+    /// §11.2.3/§11.8's "一次加齐": this trait is widened ONCE, for BOTH new
+    /// Ops (`AssignTaskDirection` AND `DraftReviewBody`) in the same pass,
+    /// even though only the former's capability (classify) is in scope this
+    /// task — widening `ValidationCtx` is a breaking change for every
+    /// implementor, so the design deliberately does not want to pay that cost
+    /// twice. `DraftReviewBody` itself (the Op's validate/apply) is added
+    /// alongside this method for the same reason; the `summarize`
+    /// CAPABILITY that will eventually PRODUCE this Op (T5.3.1) is not —
+    /// `store::ai_port::allowed_ops(Capability::Summarize)` stays the empty
+    /// set here, same as `Sin90Op::AssignTaskDirection` needed nothing from
+    /// `ai::classify` (which doesn't exist yet) to be a valid, applyable Op.
+    fn review_snap(&self, id: &str) -> Option<ReviewSnap>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -170,6 +279,55 @@ pub enum ProposalError {
     BlankField { field: &'static str },
     #[error("task {parent_id} already has a parent; a task may only be nested one level deep")]
     NestedProject { parent_id: TaskId },
+    /// New (design §11.2.1, T5.2.1): the task is not (or no longer) in the
+    /// inbox — it already has a Direction, possibly assigned earlier in the
+    /// SAME batch (A3).
+    #[error("task {task_id} is not in the inbox (already assigned to direction {direction_id})")]
+    NotInInbox {
+        task_id: TaskId,
+        direction_id: DirectionId,
+    },
+    /// New (design §11.2.1, T5.2.1): the task's current status (as of this
+    /// point in the batch) is terminal — a closed task cannot be assigned a
+    /// Direction (A2).
+    #[error("task {task_id} is closed (status {status:?}); cannot assign a direction")]
+    TaskClosed { task_id: TaskId, status: TaskStatus },
+    /// New (design §11.2.1, T5.2.1): the target Direction is terminal
+    /// (achieved/abandoned) — a closed Direction cannot receive new tasks (A5).
+    #[error("direction {direction_id} is closed (status {status:?}); cannot assign")]
+    DirectionClosed {
+        direction_id: DirectionId,
+        status: DirectionStatus,
+    },
+    /// New (design §11.2.2, T5.2.1): the Review is not `draft` (either
+    /// already `finalized`, or — same effect — was finalized after this
+    /// proposal was generated but before it was accepted) (D5).
+    #[error("review {review_id} is not a draft; no further body changes are accepted")]
+    ReviewNotDraft { review_id: ReviewId },
+    /// New (design §11.2.2, T5.2.1): the entity's current body digest (as of
+    /// this point in the batch) does not match the proposal's
+    /// `base_body_sha256` — someone else changed it since this proposal was
+    /// generated (D6). `entity`/`id` are generic (design §11.2.3's own
+    /// signature) even though only `"review"` is reachable today.
+    #[error("{entity} {id}'s body has changed since this proposal was generated")]
+    StaleBase { entity: &'static str, id: String },
+    /// New (design §11.2.2, T5.2.1): the proposed body is byte-identical to
+    /// the current one — a no-op write is rejected rather than silently
+    /// producing an empty diff (D7).
+    #[error("{op} would not change anything")]
+    NoChange { op: &'static str },
+    /// New (design §11.2.2, T5.2.1): `field` exceeds its byte-size cap (D2 —
+    /// today only `DraftReviewBody.body`, capped at
+    /// [`MAX_REVIEW_BODY_BYTES`]).
+    #[error("{field} exceeds the {max_bytes}-byte limit")]
+    TooLarge {
+        field: &'static str,
+        max_bytes: usize,
+    },
+    /// New (design §11.2.2, T5.2.1): `base_body_sha256` is not 64 lowercase
+    /// hex characters (D3) — malformed input, not a stale-base mismatch.
+    #[error("base_body_sha256 must be 64 lowercase hex characters")]
+    BadHash,
 }
 
 /// A working view that overlays the pending effects of earlier ops in the SAME
@@ -180,6 +338,16 @@ pub enum ProposalError {
 struct Working<'c> {
     ctx: &'c dyn ValidationCtx,
     task: std::collections::HashMap<String, TaskStatus>,
+    /// New (design §11.2.3, T5.2.1): overlay for `AssignTaskDirection` — lets
+    /// `[Assign(t,d1), Assign(t,d2)]` see `t` as already assigned after the
+    /// first op, in the SAME batch, without a DB round-trip.
+    task_directions: std::collections::HashMap<String, Option<DirectionId>>,
+    /// New (design §11.2.3, T5.2.1): overlay for `DraftReviewBody` — the
+    /// CURRENT body digest of a review, updated after each op in the batch
+    /// that touches it. Two `DraftReviewBody` ops on the SAME review in one
+    /// batch chain: the second's `base_body_sha256` must match the FIRST's
+    /// new digest, not the pre-batch one.
+    review_hash: std::collections::HashMap<String, String>,
 }
 
 impl<'c> Working<'c> {
@@ -187,6 +355,8 @@ impl<'c> Working<'c> {
         Self {
             ctx,
             task: std::collections::HashMap::new(),
+            task_directions: std::collections::HashMap::new(),
+            review_hash: std::collections::HashMap::new(),
         }
     }
     fn task_status(&self, id: &str) -> Option<TaskStatus> {
@@ -197,6 +367,26 @@ impl<'c> Working<'c> {
     }
     fn set_task(&mut self, id: &str, s: TaskStatus) {
         self.task.insert(id.to_string(), s);
+    }
+    fn task_direction(&self, id: &str) -> Option<Option<DirectionId>> {
+        self.task_directions
+            .get(id)
+            .cloned()
+            .or_else(|| self.ctx.task_direction(id))
+    }
+    fn set_task_direction(&mut self, id: &str, direction_id: Option<DirectionId>) {
+        self.task_directions.insert(id.to_string(), direction_id);
+    }
+    /// The review's CURRENT body digest, overlay-first — `None` only if the
+    /// review does not exist at all (`ctx.review_snap` returned `None`).
+    fn review_body_hash(&self, id: &str) -> Option<String> {
+        self.review_hash
+            .get(id)
+            .cloned()
+            .or_else(|| self.ctx.review_snap(id).map(|s| s.body_sha256))
+    }
+    fn set_review_hash(&mut self, id: &str, hash: String) {
+        self.review_hash.insert(id.to_string(), hash);
     }
 }
 
@@ -312,6 +502,108 @@ fn validate_op(op: &Sin90Op, w: &mut Working<'_>) -> Result<(), ProposalError> {
             w.set_task(task_id, TaskStatus::CarriedOver);
             Ok(())
         }
+
+        Sin90Op::AssignTaskDirection {
+            task_id,
+            direction_id,
+        } => {
+            // A1: the task must exist — `task_direction`'s OUTER `None` is
+            // "no such task" (design §11.2.1's own wording: checked via
+            // `task_direction`, not `task_status`).
+            let current_direction =
+                w.task_direction(task_id)
+                    .ok_or_else(|| ProposalError::UnknownEntity {
+                        entity: "task",
+                        id: task_id.clone(),
+                    })?;
+            // A2: the task's current status (overlaid) must not be terminal.
+            let status = task_status(w, task_id)?;
+            if task_is_terminal(status) {
+                return Err(ProposalError::TaskClosed {
+                    task_id: task_id.clone(),
+                    status,
+                });
+            }
+            // A3: the task must still be in the inbox (no Direction yet) —
+            // this is what makes `[Assign(t,d1), Assign(t,d2)]` reject the
+            // second op (the overlay set by the first op is visible here).
+            // 2026-09-24 review (round 2, M2): `direction_id` here must be
+            // the task's CURRENT (already-assigned) Direction, not the
+            // TARGET one this op was trying to assign — the error is "you
+            // can't assign, it's already assigned to X", and X is
+            // `current_direction`, not `direction_id`.
+            if let Some(existing_direction_id) = current_direction {
+                return Err(ProposalError::NotInInbox {
+                    task_id: task_id.clone(),
+                    direction_id: existing_direction_id,
+                });
+            }
+            // A4: the target Direction must exist.
+            let dstatus = w.ctx.direction_status(direction_id).ok_or_else(|| {
+                ProposalError::UnknownEntity {
+                    entity: "direction",
+                    id: direction_id.clone(),
+                }
+            })?;
+            // A5: the target Direction must not be terminal.
+            if direction_is_terminal(dstatus) {
+                return Err(ProposalError::DirectionClosed {
+                    direction_id: direction_id.clone(),
+                    status: dstatus,
+                });
+            }
+            w.set_task_direction(task_id, Some(direction_id.clone()));
+            Ok(())
+        }
+
+        Sin90Op::DraftReviewBody {
+            review_id,
+            base_body_sha256,
+            body,
+        } => {
+            non_blank("body", body)?; // D1
+            if body.len() > MAX_REVIEW_BODY_BYTES {
+                // D2 (UTF-8 bytes)
+                return Err(ProposalError::TooLarge {
+                    field: "body",
+                    max_bytes: MAX_REVIEW_BODY_BYTES,
+                });
+            }
+            if !is_lowercase_hex_sha256(base_body_sha256) {
+                return Err(ProposalError::BadHash); // D3
+            }
+            let snap =
+                w.ctx
+                    .review_snap(review_id)
+                    .ok_or_else(|| ProposalError::UnknownEntity {
+                        entity: "review",
+                        id: review_id.clone(),
+                    })?; // D4
+            if snap.status != ReviewStatus::Draft {
+                return Err(ProposalError::ReviewNotDraft {
+                    review_id: review_id.clone(),
+                }); // D5
+            }
+            // Overlay-aware: a prior `DraftReviewBody` on the SAME review
+            // earlier in this batch already moved the digest forward.
+            let current_hash = w
+                .review_body_hash(review_id)
+                .unwrap_or(snap.body_sha256.clone());
+            if current_hash != *base_body_sha256 {
+                return Err(ProposalError::StaleBase {
+                    entity: "review",
+                    id: review_id.clone(),
+                }); // D6
+            }
+            let new_hash = body_sha256(body);
+            if new_hash == current_hash {
+                return Err(ProposalError::NoChange {
+                    op: "draft_review_body",
+                }); // D7
+            }
+            w.set_review_hash(review_id, new_hash);
+            Ok(())
+        }
     }
 }
 
@@ -421,6 +713,10 @@ mod tests {
         weeks: HashMap<WeekId, WeekStatus>,
         rhythms_retired: HashMap<RhythmId, bool>,
         areas: HashSet<AreaId>,
+        directions: HashMap<DirectionId, DirectionStatus>,
+        /// Outer presence = task exists; `None` inner = task is in the inbox.
+        task_directions: HashMap<TaskId, Option<DirectionId>>,
+        reviews: HashMap<ReviewId, ReviewSnap>,
     }
 
     impl ValidationCtx for MockCtx {
@@ -438,6 +734,15 @@ mod tests {
         }
         fn task_parent(&self, id: &str) -> Option<Option<TaskId>> {
             self.task_parents.get(id).cloned()
+        }
+        fn direction_status(&self, id: &str) -> Option<DirectionStatus> {
+            self.directions.get(id).copied()
+        }
+        fn task_direction(&self, id: &str) -> Option<Option<DirectionId>> {
+            self.task_directions.get(id).cloned()
+        }
+        fn review_snap(&self, id: &str) -> Option<ReviewSnap> {
+            self.reviews.get(id).cloned()
         }
     }
 
@@ -1019,5 +1324,393 @@ mod tests {
         let j = serde_json::to_string(&op).unwrap();
         assert!(j.contains("\"op\":\"transition_task\""), "{j}");
         assert!(j.contains("\"to\":\"done\""), "{j}");
+    }
+
+    // ---- AssignTaskDirection (design §11.2.1, T5.2.1) ----------------------
+
+    fn inbox_ctx() -> MockCtx {
+        let mut ctx = MockCtx::default();
+        ctx.tasks.insert("t1".into(), TaskStatus::Backlog);
+        ctx.task_directions.insert("t1".into(), None); // in the inbox
+        ctx.directions.insert("d1".into(), DirectionStatus::Active);
+        ctx
+    }
+
+    fn assign(task_id: &str, direction_id: &str) -> Sin90Op {
+        Sin90Op::AssignTaskDirection {
+            task_id: task_id.into(),
+            direction_id: direction_id.into(),
+        }
+    }
+
+    #[test]
+    fn assign_task_direction_happy_path() {
+        let ctx = inbox_ctx();
+        let p = proposal(vec![assign("t1", "d1")]);
+        assert!(validate(&p, &ctx).is_ok());
+    }
+
+    #[test]
+    fn assign_task_direction_unknown_task_rejected() {
+        // A1: `task_direction` has no entry at all for "ghost".
+        let ctx = inbox_ctx();
+        let p = proposal(vec![assign("ghost", "d1")]);
+        assert_eq!(
+            validate(&p, &ctx),
+            Err(ProposalError::UnknownEntity {
+                entity: "task",
+                id: "ghost".into()
+            })
+        );
+    }
+
+    #[test]
+    fn assign_task_direction_closed_task_rejected() {
+        // A2: task exists, is in the inbox, but its status is terminal.
+        let mut ctx = inbox_ctx();
+        ctx.tasks.insert("t1".into(), TaskStatus::Done);
+        let p = proposal(vec![assign("t1", "d1")]);
+        assert_eq!(
+            validate(&p, &ctx),
+            Err(ProposalError::TaskClosed {
+                task_id: "t1".into(),
+                status: TaskStatus::Done
+            })
+        );
+    }
+
+    #[test]
+    fn assign_task_direction_already_classified_rejected() {
+        // A3: task exists but already has a Direction (not in the inbox).
+        let mut ctx = inbox_ctx();
+        ctx.task_directions
+            .insert("t1".into(), Some("d-existing".into()));
+        let p = proposal(vec![assign("t1", "d1")]);
+        assert_eq!(
+            validate(&p, &ctx),
+            Err(ProposalError::NotInInbox {
+                task_id: "t1".into(),
+                // 2026-09-24 review (round 2, M2): the error must name the
+                // task's CURRENT (already-assigned) Direction — "d-existing"
+                // — not the TARGET one ("d1") this op was trying to assign.
+                direction_id: "d-existing".into()
+            })
+        );
+    }
+
+    #[test]
+    fn assign_task_direction_unknown_direction_rejected() {
+        // A4: the target Direction does not exist.
+        let ctx = inbox_ctx();
+        let p = proposal(vec![assign("t1", "ghost-direction")]);
+        assert_eq!(
+            validate(&p, &ctx),
+            Err(ProposalError::UnknownEntity {
+                entity: "direction",
+                id: "ghost-direction".into()
+            })
+        );
+    }
+
+    #[test]
+    fn assign_task_direction_closed_direction_rejected() {
+        // A5: the target Direction is terminal (achieved/abandoned).
+        let mut ctx = inbox_ctx();
+        ctx.directions
+            .insert("d1".into(), DirectionStatus::Abandoned);
+        let p = proposal(vec![assign("t1", "d1")]);
+        assert_eq!(
+            validate(&p, &ctx),
+            Err(ProposalError::DirectionClosed {
+                direction_id: "d1".into(),
+                status: DirectionStatus::Abandoned
+            })
+        );
+
+        // Positive control: `achieved` is ALSO terminal.
+        let mut ctx2 = inbox_ctx();
+        ctx2.directions
+            .insert("d1".into(), DirectionStatus::Achieved);
+        assert!(matches!(
+            validate(&proposal(vec![assign("t1", "d1")]), &ctx2),
+            Err(ProposalError::DirectionClosed { .. })
+        ));
+
+        // Positive control: every NON-terminal status is accepted.
+        for s in [
+            DirectionStatus::Draft,
+            DirectionStatus::Active,
+            DirectionStatus::Paused,
+        ] {
+            let mut ok_ctx = inbox_ctx();
+            ok_ctx.directions.insert("d1".into(), s);
+            assert!(
+                validate(&proposal(vec![assign("t1", "d1")]), &ok_ctx).is_ok(),
+                "{s:?} should be assignable"
+            );
+        }
+    }
+
+    /// Batch overlay (design §11.2.1's "同批次交互"): a second `Assign` on the
+    /// SAME task in the same batch sees the first one's effect and is
+    /// rejected — no DB round-trip needed to catch this at validate time.
+    #[test]
+    fn assign_task_direction_batch_duplicate_rejected() {
+        let mut ctx = inbox_ctx();
+        ctx.directions.insert("d2".into(), DirectionStatus::Active);
+        let p = proposal(vec![assign("t1", "d1"), assign("t1", "d2")]);
+        assert_eq!(
+            validate(&p, &ctx),
+            Err(ProposalError::NotInInbox {
+                task_id: "t1".into(),
+                // 2026-09-24 review (round 2, M2): the SECOND op's A3 check
+                // sees the batch overlay set by the FIRST op — the task is
+                // now "already assigned to d1" (not "d2", the second op's
+                // own target).
+                direction_id: "d1".into()
+            })
+        );
+    }
+
+    /// `[TransitionTask(t→dropped), Assign(t,d)]`: the existing task-status
+    /// overlay (used by `TransitionTask`/`CarryOverTask`) is what
+    /// `AssignTaskDirection`'s A2 reads too — no separate bookkeeping needed.
+    #[test]
+    fn assign_task_direction_after_batch_drop_rejected() {
+        let mut ctx = inbox_ctx();
+        ctx.tasks.insert("t1".into(), TaskStatus::Backlog);
+        let p = proposal(vec![
+            Sin90Op::TransitionTask {
+                task_id: "t1".into(),
+                to: TaskStatus::Dropped,
+            },
+            assign("t1", "d1"),
+        ]);
+        assert_eq!(
+            validate(&p, &ctx),
+            Err(ProposalError::TaskClosed {
+                task_id: "t1".into(),
+                status: TaskStatus::Dropped
+            })
+        );
+    }
+
+    /// `[Assign(t,d), TransitionTask(t→planned)]` is legal: assigning a
+    /// Direction does not touch the task-status overlay, so the later
+    /// transition is validated against the task's ORIGINAL status.
+    #[test]
+    fn assign_task_direction_then_batch_transition_ok() {
+        let ctx = inbox_ctx(); // t1 starts Backlog
+        let p = proposal(vec![
+            assign("t1", "d1"),
+            Sin90Op::TransitionTask {
+                task_id: "t1".into(),
+                to: TaskStatus::Planned,
+            },
+        ]);
+        assert!(validate(&p, &ctx).is_ok());
+    }
+
+    // NOTE (2026-09-24 review, M6): a stray field on `AssignTaskDirection`
+    // (and every other `Sin90Op` variant) currently parses successfully and
+    // is silently dropped — `Sin90Op` has no enum-level `deny_unknown_fields`
+    // yet, and that attribute cannot be applied to a single variant on its
+    // own (serde rejects it as an "unknown serde variant attribute" — see
+    // this file's `AssignTaskDirection` doc). This is a known, TEMPORARY gap
+    // pending SFU-9 (#29)'s independent PR, not a behavior worth pinning as
+    // an expected-and-tested outcome: a test asserting "unknown field is
+    // ignored" would nail the defect down as a spec instead of just noting
+    // it, and would need to be manually flipped (not just left to fail) the
+    // day SFU-9 lands. So: no test here on purpose.
+
+    #[test]
+    fn assign_task_direction_json_tag_is_snake_case() {
+        let j = serde_json::to_string(&assign("t1", "d1")).unwrap();
+        assert!(j.contains("\"op\":\"assign_task_direction\""), "{j}");
+        assert!(j.contains("\"task_id\":\"t1\""), "{j}");
+        assert!(j.contains("\"direction_id\":\"d1\""), "{j}");
+    }
+
+    // ---- DraftReviewBody (design §11.2.2, T5.2.1's "一次加齐") -------------
+
+    fn draft_ctx() -> (MockCtx, String) {
+        let mut ctx = MockCtx::default();
+        let body = "line one\nline two";
+        let hash = body_sha256(body);
+        ctx.reviews.insert(
+            "r1".into(),
+            ReviewSnap {
+                status: ReviewStatus::Draft,
+                body_sha256: hash.clone(),
+            },
+        );
+        (ctx, hash)
+    }
+
+    fn draft(review_id: &str, base: &str, body: &str) -> Sin90Op {
+        Sin90Op::DraftReviewBody {
+            review_id: review_id.into(),
+            base_body_sha256: base.into(),
+            body: body.into(),
+        }
+    }
+
+    #[test]
+    fn draft_review_body_happy_path() {
+        let (ctx, hash) = draft_ctx();
+        let p = proposal(vec![draft("r1", &hash, "a whole new body")]);
+        assert!(validate(&p, &ctx).is_ok());
+    }
+
+    #[test]
+    fn draft_review_body_d1_blank_body_rejected() {
+        let (ctx, hash) = draft_ctx();
+        let p = proposal(vec![draft("r1", &hash, "   ")]);
+        assert_eq!(
+            validate(&p, &ctx),
+            Err(ProposalError::BlankField { field: "body" })
+        );
+    }
+
+    #[test]
+    fn draft_review_body_d2_over_size_limit_rejected_at_limit_ok() {
+        let (ctx, hash) = draft_ctx();
+        // Positive control: EXACTLY at the limit is fine.
+        let at_limit = "x".repeat(MAX_REVIEW_BODY_BYTES);
+        let ok = proposal(vec![draft("r1", &hash, &at_limit)]);
+        assert!(validate(&ok, &ctx).is_ok());
+
+        let over = "x".repeat(MAX_REVIEW_BODY_BYTES + 1);
+        let bad = proposal(vec![draft("r1", &hash, &over)]);
+        assert_eq!(
+            validate(&bad, &ctx),
+            Err(ProposalError::TooLarge {
+                field: "body",
+                max_bytes: MAX_REVIEW_BODY_BYTES
+            })
+        );
+    }
+
+    #[test]
+    fn draft_review_body_d3_malformed_hash_rejected() {
+        let (ctx, hash) = draft_ctx();
+        for bad_hash in [
+            "not-hex-at-all",
+            &hash[..63],          // one char short
+            &format!("{hash}0"),  // one char long
+            &hash.to_uppercase(), // must be LOWERCASE hex
+        ] {
+            let p = proposal(vec![draft("r1", bad_hash, "new body")]);
+            assert_eq!(
+                validate(&p, &ctx),
+                Err(ProposalError::BadHash),
+                "{bad_hash}"
+            );
+        }
+    }
+
+    #[test]
+    fn draft_review_body_d4_unknown_review_rejected() {
+        let (ctx, hash) = draft_ctx();
+        let p = proposal(vec![draft("ghost", &hash, "new body")]);
+        assert_eq!(
+            validate(&p, &ctx),
+            Err(ProposalError::UnknownEntity {
+                entity: "review",
+                id: "ghost".into()
+            })
+        );
+    }
+
+    #[test]
+    fn draft_review_body_d5_finalized_review_rejected() {
+        let (mut ctx, hash) = draft_ctx();
+        ctx.reviews.get_mut("r1").unwrap().status = ReviewStatus::Finalized;
+        let p = proposal(vec![draft("r1", &hash, "new body")]);
+        assert_eq!(
+            validate(&p, &ctx),
+            Err(ProposalError::ReviewNotDraft {
+                review_id: "r1".into()
+            })
+        );
+    }
+
+    #[test]
+    fn draft_review_body_d6_stale_base_rejected() {
+        let (ctx, _hash) = draft_ctx();
+        let p = proposal(vec![draft(
+            "r1",
+            &body_sha256("a different base"),
+            "new body",
+        )]);
+        assert_eq!(
+            validate(&p, &ctx),
+            Err(ProposalError::StaleBase {
+                entity: "review",
+                id: "r1".into()
+            })
+        );
+    }
+
+    #[test]
+    fn draft_review_body_d7_no_change_rejected() {
+        let (ctx, hash) = draft_ctx();
+        // Same body the snapshot already has (see `draft_ctx`).
+        let p = proposal(vec![draft("r1", &hash, "line one\nline two")]);
+        assert_eq!(
+            validate(&p, &ctx),
+            Err(ProposalError::NoChange {
+                op: "draft_review_body"
+            })
+        );
+    }
+
+    /// §11.2.2's CAS chain: two `DraftReviewBody` ops on the SAME review in
+    /// one batch — the second must use the FIRST's new digest as its base,
+    /// not the pre-batch one. Both directions pinned (scratch's
+    /// `draft_body_cas_chain_and_rejections`).
+    #[test]
+    fn draft_review_body_batch_chains_and_rejects_stale_second() {
+        let (ctx, hash) = draft_ctx();
+        let first_body = "first rewrite";
+        let chained = proposal(vec![
+            draft("r1", &hash, first_body),
+            draft("r1", &body_sha256(first_body), "second rewrite"),
+        ]);
+        assert!(validate(&chained, &ctx).is_ok());
+
+        // The second op still uses the ORIGINAL (pre-batch) hash — stale
+        // the moment the first op in the SAME batch already moved it.
+        let stale_second = proposal(vec![
+            draft("r1", &hash, first_body),
+            draft("r1", &hash, "second rewrite"),
+        ]);
+        assert_eq!(
+            validate(&stale_second, &ctx),
+            Err(ProposalError::StaleBase {
+                entity: "review",
+                id: "r1".into()
+            })
+        );
+    }
+
+    #[test]
+    fn draft_review_body_json_tag_is_snake_case() {
+        let j = serde_json::to_string(&draft("r1", "abc123", "hello")).unwrap();
+        assert!(j.contains("\"op\":\"draft_review_body\""), "{j}");
+        assert!(j.contains("\"review_id\":\"r1\""), "{j}");
+        assert!(j.contains("\"base_body_sha256\":\"abc123\""), "{j}");
+        assert!(j.contains("\"body\":\"hello\""), "{j}");
+    }
+
+    #[test]
+    fn body_sha256_is_lowercase_hex_and_stable() {
+        let h = body_sha256("hello world");
+        assert_eq!(h.len(), 64);
+        assert!(h
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        assert_eq!(h, body_sha256("hello world")); // deterministic
+        assert_ne!(h, body_sha256("hello World")); // sensitive to content
     }
 }

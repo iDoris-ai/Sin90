@@ -12,14 +12,15 @@
 use std::collections::HashMap;
 
 use crate::core::{
-    canonical_iso_date, canonical_iso_week, check_alloc, check_area_transition,
+    body_sha256, canonical_iso_date, canonical_iso_week, check_alloc, check_area_transition,
     check_review_transition, check_rhythm_transition, check_routine_transition,
     check_schedule_block_transition, check_task_transition, check_week_transition, now_iso8601,
     review_is_terminal, routine_is_terminal, ulid, validate, validate_cron, validate_tz,
     week_is_open, Alloc, Area, AreaStatus, Direction, DirectionStatus, Energy, FireTrigger,
-    NewReview, NewRoutine, ProposalSource, ProposalStatus, Review, ReviewKind, ReviewStatus,
-    Rhythm, RhythmStatus, Routine, RoutinePatch, RoutineStatus, ScheduleBlock, ScheduleBlockStatus,
-    Sin90Op, Sin90Proposal, Task, TaskKind, TaskStatus, ValidationCtx, Week, WeekStatus,
+    NewReview, NewRoutine, ProposalSource, ProposalStatus, Review, ReviewKind, ReviewSnap,
+    ReviewStatus, Rhythm, RhythmStatus, Routine, RoutinePatch, RoutineStatus, ScheduleBlock,
+    ScheduleBlockStatus, Sin90Op, Sin90Proposal, Task, TaskKind, TaskStatus, ValidationCtx, Week,
+    WeekStatus,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -2799,6 +2800,13 @@ pub(crate) struct DbSnapshot {
     weeks: HashMap<String, WeekStatus>,
     rhythms_retired: HashMap<String, bool>,
     areas: std::collections::HashSet<String>,
+    /// New (design §11.2.3, T5.2.1): outer presence = the Direction exists.
+    direction_statuses: HashMap<String, DirectionStatus>,
+    /// New (design §11.2.3, T5.2.1): outer presence = the task exists; `None`
+    /// inner = the task is currently in the inbox.
+    task_directions: HashMap<String, Option<String>>,
+    /// New (design §11.2.3, T5.2.1): outer presence = the Review exists.
+    reviews: HashMap<String, ReviewSnap>,
 }
 
 impl ValidationCtx for DbSnapshot {
@@ -2816,6 +2824,15 @@ impl ValidationCtx for DbSnapshot {
     }
     fn task_parent(&self, id: &str) -> Option<Option<String>> {
         self.task_parents.get(id).cloned()
+    }
+    fn direction_status(&self, id: &str) -> Option<DirectionStatus> {
+        self.direction_statuses.get(id).copied()
+    }
+    fn task_direction(&self, id: &str) -> Option<Option<String>> {
+        self.task_directions.get(id).cloned()
+    }
+    fn review_snap(&self, id: &str) -> Option<ReviewSnap> {
+        self.reviews.get(id).cloned()
     }
 }
 
@@ -2839,6 +2856,17 @@ pub(crate) async fn build_snapshot(tx: &mut Tx<'_>, ops: &[Sin90Op]) -> Result<D
             Sin90Op::CarryOverTask { task_id, to_week } => {
                 load_task(tx, task_id, &mut snap).await?;
                 load_week(tx, to_week, &mut snap).await?;
+            }
+            Sin90Op::AssignTaskDirection {
+                task_id,
+                direction_id,
+            } => {
+                load_task(tx, task_id, &mut snap).await?; // A2's task_status
+                load_task_direction(tx, task_id, &mut snap).await?; // A1/A3
+                load_direction_status(tx, direction_id, &mut snap).await?; // A4/A5
+            }
+            Sin90Op::DraftReviewBody { review_id, .. } => {
+                load_review_snap(tx, review_id, &mut snap).await?; // D4-D6
             }
         }
     }
@@ -2877,6 +2905,56 @@ async fn load_week(tx: &mut Tx<'_>, id: &str, snap: &mut DbSnapshot) -> Result<(
     {
         snap.weeks
             .insert(id.to_string(), from_wire(&row.get::<String, _>("status"))?);
+    }
+    Ok(())
+}
+
+/// New (design §11.2.3, T5.2.1): outer presence in `snap.task_directions` =
+/// the task exists; the `Option<String>` inside is its current
+/// `direction_id` (`None` = still in the inbox).
+async fn load_task_direction(tx: &mut Tx<'_>, id: &str, snap: &mut DbSnapshot) -> Result<()> {
+    if let Some(row) = sqlx::query("SELECT direction_id FROM sin90_tasks WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?
+    {
+        let direction_id: Option<String> = row.get("direction_id");
+        snap.task_directions.insert(id.to_string(), direction_id);
+    }
+    Ok(())
+}
+
+/// New (design §11.2.3, T5.2.1): existence + current status of a Direction.
+async fn load_direction_status(tx: &mut Tx<'_>, id: &str, snap: &mut DbSnapshot) -> Result<()> {
+    if let Some(row) = sqlx::query("SELECT status FROM sin90_directions WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?
+    {
+        snap.direction_statuses
+            .insert(id.to_string(), from_wire(&row.get::<String, _>("status"))?);
+    }
+    Ok(())
+}
+
+/// New (design §11.2.2/§11.2.3, T5.2.1): `DraftReviewBody`'s snapshot —
+/// status plus the body digest, computed in RUST from the stored body
+/// (`crate::core::body_sha256`), never in SQL (design §11.2.2's apply note).
+async fn load_review_snap(tx: &mut Tx<'_>, id: &str, snap: &mut DbSnapshot) -> Result<()> {
+    if let Some(row) = sqlx::query("SELECT status, body FROM sin90_reviews WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?
+    {
+        let status: ReviewStatus = from_wire(&row.get::<String, _>("status"))?;
+        let body: String = row.get("body");
+        snap.reviews.insert(
+            id.to_string(),
+            ReviewSnap {
+                status,
+                body_sha256: body_sha256(&body),
+            },
+        );
     }
     Ok(())
 }
@@ -3222,6 +3300,127 @@ pub(crate) async fn apply_op(
             )
             .await?;
             event_ids.push(create_ev);
+        }
+
+        Sin90Op::AssignTaskDirection {
+            task_id,
+            direction_id,
+        } => {
+            require_task_week_open(tx, task_id).await?; // relational invariant
+                                                        // Read at apply time (not the validate-time snapshot) for the
+                                                        // event payload's self-contained `area_id` (design §11.2.1);
+                                                        // `None` if the Direction row is somehow gone by apply time (an
+                                                        // FK/race edge case the design accepts rather than errors on).
+            let area_id: Option<String> =
+                sqlx::query("SELECT area_id FROM sin90_directions WHERE id = ?")
+                    .bind(direction_id)
+                    .fetch_optional(&mut **tx)
+                    .await?
+                    .and_then(|r| r.get::<Option<String>, _>("area_id"));
+            // Second CAS (design §11.2.1 step 3): `validate`'s A3 already
+            // checked "still in the inbox" against the snapshot taken at the
+            // start of this transaction; this UPDATE re-checks it against the
+            // CURRENT row, under the same write lock, closing any gap between
+            // snapshot and apply.
+            //
+            // 2026-09-24 review (round 2, low): this branch is DEFENSE IN
+            // DEPTH, not something a unit test can currently force to fire
+            // independently of A3 — every caller of `apply_op` (both
+            // `AiSink::submit`'s dry run and `Sin90Store::apply_proposal`)
+            // calls `build_snapshot` + `validate` immediately before, in the
+            // SAME transaction, so by construction the snapshot `validate`
+            // saw is never stale by the time this UPDATE runs; there is no
+            // window today where A3 passes but this `affected != 1`. It
+            // exists so a FUTURE caller that reuses `apply_op` without that
+            // same validate-then-apply discipline (e.g. a batch/retry path
+            // that re-applies an already-decided op) fails safely instead of
+            // silently overwriting a task's Direction a second time.
+            let affected = sqlx::query(
+                "UPDATE sin90_tasks SET direction_id = ?, updated_at = ?
+                 WHERE id = ? AND direction_id IS NULL",
+            )
+            .bind(direction_id)
+            .bind(&now)
+            .bind(task_id)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected();
+            if affected != 1 {
+                return Err(StoreError::Conflict(format!(
+                    "task {task_id} is no longer in the inbox (assign_task_direction CAS)"
+                )));
+            }
+            let ev = append_event(
+                tx,
+                "task",
+                task_id,
+                "direction_assigned",
+                None, // status did not change
+                None,
+                &json!({
+                    "task_id": task_id,
+                    "from_direction_id": null,
+                    "direction_id": direction_id,
+                    "area_id": area_id,
+                }),
+                &now,
+            )
+            .await?;
+            event_ids.push(ev);
+        }
+
+        Sin90Op::DraftReviewBody {
+            review_id, body, ..
+        } => {
+            // Second CAS (design §11.2.2 apply step): `validate`'s D5/D6
+            // already checked "still draft" / "base matches" against the
+            // snapshot taken at the start of this transaction; this UPDATE
+            // re-checks `status = 'draft'` against the CURRENT row, under the
+            // same write lock (closes the same snapshot/apply gap
+            // `AssignTaskDirection`'s CAS closes for tasks). `base_body_sha256`
+            // itself is not re-checked here — that would need a second SELECT
+            // to recompute the digest; the `status = 'draft'` CAS is the one
+            // race this design accepts fixing at this layer (§11.2.2: the
+            // dry-run `submit` path validates a beat before this, and the
+            // human-accept path's `apply_proposal` re-runs `build_snapshot` +
+            // `validate` immediately before calling `apply_op`, so D6 is
+            // freshly re-checked either way, not stale by the time it gets
+            // here). 2026-09-24 review (round 2, low): like
+            // `AssignTaskDirection`'s CAS above, this `status = 'draft'`
+            // check is DEFENSE IN DEPTH — no unit test today can force
+            // `affected != 1` independently of D5, since every caller
+            // validates in the same transaction immediately before applying.
+            // It guards a future caller that reuses `apply_op` without that
+            // discipline.
+            let affected = sqlx::query(
+                "UPDATE sin90_reviews SET body = ?, updated_at = ? WHERE id = ? AND status = 'draft'",
+            )
+            .bind(body)
+            .bind(&now)
+            .bind(review_id)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected();
+            if affected != 1 {
+                return Err(StoreError::Conflict(format!(
+                    "review {review_id} is not accepting further changes (draft_review_body CAS)"
+                )));
+            }
+            // Same event shape the human path (`update_review_body`) writes —
+            // a replay consumer never needs to know a body change came from a
+            // proposal (design §11.2.2's "与人类路径逐字段相同").
+            let ev = append_event(
+                tx,
+                "review",
+                review_id,
+                "updated",
+                None,
+                None,
+                &json!({"review_id": review_id, "body": body}),
+                &now,
+            )
+            .await?;
+            event_ids.push(ev);
         }
     }
     Ok(())

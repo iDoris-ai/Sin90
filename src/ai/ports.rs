@@ -338,6 +338,13 @@ pub trait SettingsRead: Send + Sync {
 /// `AiReader` in `store/ai_port.rs`.
 pub trait AiReadModel: SettingsRead {
     fn inbox(&self, limit: u32) -> impl Future<Output = Result<Vec<Task>, ReadError>> + Send;
+    /// New (2026-09-24 review, L4): point lookup — is task `id` CURRENTLY in
+    /// the inbox? `Ok(None)` covers both "no such task" and "exists but not
+    /// in the inbox" (closed, or already classified) — a caller validating
+    /// an explicitly-given id doesn't need to tell those apart, only
+    /// "usable as a target or not". Lets a caller check specific ids without
+    /// paging through the whole inbox with an arbitrarily large `limit`.
+    fn inbox_task(&self, id: &str) -> impl Future<Output = Result<Option<Task>, ReadError>> + Send;
     fn direction_candidates(
         &self,
         limit: u32,

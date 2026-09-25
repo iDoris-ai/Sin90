@@ -11,8 +11,8 @@ pub mod types;
 pub mod util;
 
 pub use proposal::{
-    check_alloc, validate, NewTask, ProposalError, ProposalSource, Sin90Op, Sin90Proposal,
-    ValidationCtx,
+    body_sha256, check_alloc, validate, NewTask, ProposalError, ProposalSource, ReviewSnap,
+    Sin90Op, Sin90Proposal, ValidationCtx, MAX_REVIEW_BODY_BYTES,
 };
 pub use transitions::{
     area_transition_allowed, check_area_transition, check_direction_transition,
