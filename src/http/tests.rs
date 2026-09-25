@@ -3567,6 +3567,106 @@ mod weekly_draft {
     }
 }
 
+// ---- T5.1.1: GET|PUT /settings/ai (J10b) ------------------------------------
+
+mod ai_settings {
+    use super::*;
+
+    /// Count of `sin90_events` rows — the real, persisted table, not just
+    /// what the in-process `EventSink` happened to observe (2026-09-24
+    /// review, M3: a mock-sink-only assertion can't tell "the mirror fired"
+    /// apart from "the store itself wrote the event too", which is the
+    /// actual claim `PUT /settings/ai`'s doc makes).
+    async fn event_count(store: &Sin90Store, kind: &str) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM sin90_events WHERE kind = ?")
+            .bind(kind)
+            .fetch_one(store.pool())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn settings_ai_get_defaults_to_false_when_no_row_exists() {
+        let (app, _sink) = test_app().await;
+        let resp = app.oneshot(get_req("/settings/ai")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["executive_enabled"], Value::Bool(false));
+    }
+
+    #[tokio::test]
+    async fn settings_ai_put_requires_human_key_and_mirrors_setting_changed() {
+        let (app, sink, store) = test_app_with_store().await;
+
+        // Automation key -> 403: no event in the sink, AND none in the
+        // actual database (M3 — the direct-write gate must have refused
+        // before touching `sin90_events` at all, not just before notifying
+        // the sink).
+        let resp = app
+            .clone()
+            .oneshot(automation_req(
+                "PUT",
+                "/settings/ai",
+                json!({"executive_enabled": true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(sink.0.lock().unwrap().is_empty());
+        assert_eq!(
+            event_count(&store, "changed").await,
+            0,
+            "a 403'd PUT must not have written any event to sin90_events"
+        );
+
+        // Positive control: human key -> 200, exactly one `setting.changed`
+        // in BOTH the sink and the real `sin90_events` table.
+        let resp = app
+            .clone()
+            .oneshot(human_req(
+                "PUT",
+                "/settings/ai",
+                json!({"executive_enabled": true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["executive_enabled"], Value::Bool(true));
+        {
+            let events = sink.0.lock().unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].0, "setting.changed");
+            assert_eq!(events[0].1["key"], "ai.executive_enabled");
+            assert_eq!(events[0].1["value"], Value::Bool(true));
+        }
+        assert_eq!(
+            event_count(&store, "changed").await,
+            1,
+            "a successful PUT must write EXACTLY one setting.changed row to sin90_events"
+        );
+
+        // GET now reflects the write.
+        let resp = app.oneshot(get_req("/settings/ai")).await.unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["executive_enabled"], Value::Bool(true));
+    }
+
+    #[tokio::test]
+    async fn settings_ai_put_rejects_unknown_field() {
+        let (app, _sink) = test_app().await;
+        let resp = app
+            .oneshot(human_req(
+                "PUT",
+                "/settings/ai",
+                json!({"executive_enabled": true, "bogus": 1}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
 // ---- T3.2.2: POST /_a24/scheduler/fired -------------------------------------
 
 mod fired {

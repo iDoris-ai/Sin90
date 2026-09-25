@@ -164,7 +164,8 @@ pub fn router(state: Sin90State, mounted: bool) -> axum::Router {
         .route("/reviews", post(create_review).get(list_reviews))
         .route("/reviews/{id}", get(get_review).patch(update_review))
         .route("/reviews/{id}/finalize", post(finalize_review))
-        .route("/review/weekly/draft", get(weekly_review_draft));
+        .route("/review/weekly/draft", get(weekly_review_draft))
+        .route("/settings/ai", get(get_ai_settings).put(put_ai_settings));
     if mounted {
         r = r.route("/_a24/scheduler/fired", post(scheduler_fired));
     }
@@ -1142,6 +1143,71 @@ async fn weekly_review_draft(
 ) -> Response {
     match state.store.weekly_draft(&q.week).await {
         Ok(draft) => Json(draft).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
+// ---- AI settings (T5.1.1, design §11.3.2, J10b) ----------------------------
+//
+// The one switch T5.1.1 exposes: `ai.executive_enabled`, stored generically
+// in `sin90_settings` (`store::ai_port`). Read is ungated (same convention
+// every other `GET` here uses); the write requires the human key — an AI run
+// reads this switch (`ai::SettingsRead`) but never has a route that could
+// flip it for itself.
+
+#[derive(serde::Serialize)]
+struct AiSettingsBody {
+    executive_enabled: bool,
+}
+impl From<crate::ai::AiSettings> for AiSettingsBody {
+    fn from(s: crate::ai::AiSettings) -> Self {
+        Self {
+            executive_enabled: s.executive_enabled,
+        }
+    }
+}
+
+/// `GET /settings/ai`.
+async fn get_ai_settings(State(state): State<Sin90State>) -> Response {
+    match state.store.get_ai_settings().await {
+        Ok(s) => Json(AiSettingsBody::from(s)).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AiSettingsPatch {
+    executive_enabled: bool,
+}
+
+/// `PUT /settings/ai {"executive_enabled": bool}` — human key only;
+/// mirrors `setting.changed` to `EventSink`, same one-event-per-real-write
+/// convention every other direct write here follows.
+async fn put_ai_settings(
+    State(state): State<Sin90State>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(r) = state.require_human(&headers) {
+        return r;
+    }
+    let patch: AiSettingsPatch = match parse(&body, "ai settings patch") {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    match state
+        .store
+        .put_ai_executive_enabled(patch.executive_enabled)
+        .await
+    {
+        Ok(s) => {
+            state.emit(
+                "setting.changed",
+                serde_json::json!({"key": "ai.executive_enabled", "value": s.executive_enabled}),
+            );
+            Json(AiSettingsBody::from(s)).into_response()
+        }
         Err(e) => map_err(e),
     }
 }
