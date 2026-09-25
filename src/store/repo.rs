@@ -6012,16 +6012,29 @@ mod review_routine_tests {
     /// `record_routine_fire` back to BEFORE `append_event(.., "fired", ..)`
     /// (or back to a separate pre-`tx` `self.pool()` checkout, the ORIGINAL
     /// bug) — this test goes red (`fired 0` stored vs. `fired 1` fresh).
+    ///
+    /// H1 (2026-09-26 review round 2): `scheduled_for` is `now_iso8601()`
+    /// (not a hand-picked `2026-09-21T18:00:00Z`) and the target week is
+    /// DERIVED from it (`iso_week_of`), not hardcoded `"2026-W39"` — a fixed
+    /// date/week pair goes stale (and this test would start asserting
+    /// against a week that no longer contains "now") the moment real
+    /// calendar time passes it, which for `2026-W39` was already true past
+    /// 2026-09-28. Nothing about what this test actually checks (the
+    /// auto-draft's stored body vs. a fresh `weekly_draft` render) depends
+    /// on which week it runs in.
     #[tokio::test]
     async fn review_routine_auto_draft_fired_count_matches_a_fresh_weekly_draft_call() {
         let store = new_store().await;
         let routine = create_review_routine(&store).await;
 
+        let now = crate::core::now_iso8601();
+        let week = crate::core::iso_week_of(&now)
+            .expect("now_iso8601() is always a fixed ISO-8601 timestamp");
         let outcome = store
             .record_routine_fire(
                 "fire-1",
                 &format!("routine.{}", routine.id),
-                "2026-09-21T18:00:00Z", // 2026-W39, Monday
+                &now,
                 FireTrigger::Tick,
             )
             .await
@@ -6034,7 +6047,7 @@ mod review_routine_tests {
         // A FRESH read, strictly AFTER `record_routine_fire` returned (and
         // therefore strictly after its `routine.fired` event committed) —
         // the target the stored auto-draft must already equal.
-        let fresh = store.weekly_draft("2026-W39").await.unwrap();
+        let fresh = store.weekly_draft(&week).await.unwrap();
         let fresh_md = crate::store::render_weekly_draft_markdown(&fresh);
         let expected_line = format!("{}: fired 1, completed 0", routine.id);
         assert!(

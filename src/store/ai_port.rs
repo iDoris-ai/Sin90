@@ -383,25 +383,35 @@ impl AiReadModel for AiReader {
         }
     }
 
-    /// T5.3.1 (§11.4.2's "数字来源", 2026-09-26 review C1/H1): the numbers
+    /// T5.3.1 (§11.4.2's "数字来源", 2026-09-26 review C1/H1/M2): the numbers
     /// come from `store::weekly_draft::weekly_draft_on` — the SAME function
-    /// `Sin90Store::weekly_draft` calls (one source of truth) — run on a
-    /// connection acquired from THIS reader's own `query_only` pool. Titles
-    /// and `auto_draft_md` (T4.3.2's own `render_weekly_draft_markdown`,
-    /// see [`SummarizeDraft::auto_draft_md`]'s doc) are then derived from
-    /// that SAME `WeeklyDraft` value, on the SAME connection — one read,
-    /// not "the numbers from one query and the labels from another that
-    /// might see a different snapshot".
+    /// `Sin90Store::weekly_draft` calls (one source of truth). Titles and
+    /// `auto_draft_md` (T4.3.2's own `render_weekly_draft_markdown`, see
+    /// [`SummarizeDraft::auto_draft_md`]'s doc) are then derived from that
+    /// SAME `WeeklyDraft` value. Every read here — `weekly_draft_on`'s own
+    /// queries AND every `resolve_label` lookup that follows — runs inside
+    /// ONE explicit transaction (`conn.begin()`), not just "the same
+    /// connection": a bare connection still starts a fresh implicit
+    /// read-transaction PER STATEMENT in SQLite, so a concurrent writer
+    /// could in principle rename a Direction between the numbers query and
+    /// that Direction's own label lookup a few statements later, handing
+    /// back a `SummarizeDraft` that never existed as a single consistent
+    /// snapshot. `BEGIN` (SQLite's default deferred mode) pins one snapshot
+    /// for the whole call; this reader's pool is `query_only` regardless
+    /// (§11.5 v2.1 M1), so there is nothing to commit — the transaction is
+    /// always rolled back at the end, same "this is a read" posture
+    /// `AiSink::precheck`'s own final `tx.rollback()` already has.
     async fn weekly_draft(&self, iso_week: &str) -> Result<SummarizeDraft, ReadError> {
         let mut conn = self.0.acquire().await.map_err(rerr)?;
-        let draft = crate::store::weekly_draft::weekly_draft_on(&mut conn, iso_week)
+        let mut tx = conn.begin().await.map_err(rerr)?;
+        let draft = crate::store::weekly_draft::weekly_draft_on(&mut tx, iso_week)
             .await
             .map_err(rerr)?;
         let auto_draft_md = crate::store::render_weekly_draft_markdown(&draft);
 
         let mut by_direction = Vec::with_capacity(draft.by_direction.len());
         for d in &draft.by_direction {
-            let label = resolve_label(&mut conn, "sin90_directions", &d.direction_id).await?;
+            let label = resolve_label(&mut tx, "sin90_directions", &d.direction_id).await?;
             by_direction.push(SummarizeBucket {
                 label,
                 minutes: d.minutes,
@@ -409,7 +419,7 @@ impl AiReadModel for AiReader {
         }
         let mut by_area = Vec::with_capacity(draft.by_area.len());
         for a in &draft.by_area {
-            let label = resolve_label(&mut conn, "sin90_areas", &a.area_id).await?;
+            let label = resolve_label(&mut tx, "sin90_areas", &a.area_id).await?;
             by_area.push(SummarizeBucket {
                 label,
                 minutes: a.minutes,
@@ -421,7 +431,7 @@ impl AiReadModel for AiReader {
             // "empty id -> None" branch never fires here — `unwrap_or_else`
             // only ever falls back to the id itself when the title lookup
             // comes back `None` (2026-09-26 review, Low).
-            let label = resolve_label(&mut conn, "sin90_routines", &r.routine_id)
+            let label = resolve_label(&mut tx, "sin90_routines", &r.routine_id)
                 .await?
                 .unwrap_or_else(|| r.routine_id.clone());
             routines.push(SummarizeRoutineRow {
@@ -430,6 +440,11 @@ impl AiReadModel for AiReader {
                 completed: r.completed,
             });
         }
+
+        // Never commits: this is a read (same posture `AiSink::precheck`
+        // already has) — best-effort, a dropped `tx` rolls back on its own
+        // regardless.
+        let _ = tx.rollback().await;
 
         Ok(SummarizeDraft {
             week: draft.week,
