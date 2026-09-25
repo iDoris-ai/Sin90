@@ -48,6 +48,44 @@ pub struct ApplyOutcome {
     pub applied_now: bool,
 }
 
+/// Outcome of [`Sin90Store::reject_proposal`] (T5.7.1). `capability_source` is
+/// `"classify" | "summarize" | "propose" | "direct"` and `ops_summary` is the
+/// same `"op_kind xN"` text — both the exact values `sin90_proposal_rejections`
+/// was just given, handed back so `http::reject_proposal` can mirror them
+/// into the `proposal.rejected` `EventSink` payload (Opus review L1) without
+/// a second read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectOutcome {
+    pub capability_source: String,
+    pub ops_summary: String,
+}
+
+/// A compact, deterministic (alphabetically-sorted) "op_kind x count" summary
+/// of a proposal's ops batch, e.g. `"assign_task_direction x1"` or
+/// `"create_task x2,transition_task x1"` — the `ops_summary` column of
+/// `sin90_proposal_rejections` (design §2 #28: NOT the raw ops JSON, which
+/// is already queryable off `sin90_proposals.ops` for the same id). Reuses
+/// `Sin90Op`'s own serde tag (`#[serde(tag = "op", ...)]`) as the kind name
+/// rather than a hand-maintained match arm per variant, so a future op
+/// variant is summarized correctly with zero changes here.
+fn summarize_ops(ops: &[Sin90Op]) -> Result<String> {
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for op in ops {
+        let v = serde_json::to_value(op)?;
+        let kind = v
+            .get("op")
+            .and_then(|s| s.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        *counts.entry(kind).or_insert(0) += 1;
+    }
+    Ok(counts
+        .into_iter()
+        .map(|(k, n)| format!("{k} x{n}"))
+        .collect::<Vec<_>>()
+        .join(","))
+}
+
 /// Outcome of [`Sin90Store::update_routine`] (T3.1.2 review). `changed` names
 /// exactly the fields the patch actually moved (same list `update_routine`'s
 /// own `updated` event payload carries) — empty when the patch was a no-op
@@ -2508,6 +2546,126 @@ impl Sin90Store {
         Ok(ApplyOutcome {
             receipt,
             applied_now: true,
+        })
+    }
+
+    /// `POST /proposals/{id}/reject` (T5.7.1, design §2 #27/#28, Q6). CAS
+    /// `pending → rejected`, same idempotency-free-but-conflict-safe shape
+    /// `apply_proposal`'s claim step uses: a proposal not currently `pending`
+    /// (already `applying`/`applied`/`rejected`, or missing) never mutates
+    /// anything — the caller gets `NotFound`/`Conflict`, mapped to 404/409 by
+    /// `http::map_err`, same as `apply_proposal`'s own non-pending branch.
+    ///
+    /// Unlike accept, there is no "idempotent replay" branch: a rejection is
+    /// a single decision, not a retryable side effect with a receipt to
+    /// replay — retrying a reject on an already-`rejected` id is a caller
+    /// bug (or a genuine double-submit), and 409 is the right signal either
+    /// way (task's own acceptance: "已 rejected 的返回 409").
+    ///
+    /// Writes ONE append-only `sin90_proposal_rejections` row in the SAME
+    /// transaction as the CAS (design §2 #28) — `capability_source` is
+    /// resolved by joining `sin90_ai_calls` on `proposal_id` (same shape
+    /// `list_ai_produced_proposal_ids` already uses to answer "is this
+    /// proposal AI-produced, and by which capability"); no matching `ok = 1`
+    /// row means a human/automation client submitted it directly via `POST
+    /// /proposals` (`Sin90Op`'s ops are never gated to the AI path at the
+    /// type level), reported as `"direct"` (Opus review M1: was `"manual"`
+    /// — misleading, since the automation key can submit directly too, not
+    /// just a human). `proposal_source` is copied verbatim from the
+    /// proposal's own `Sin90Proposal.source` (`local_brain`/`executive`/
+    /// `rule`) — a second, independent axis from `capability_source`: the
+    /// former is "who/what authored this proposal" (self-reported at submit
+    /// time), the latter is "which `/ai/*` capability's run produced it, if
+    /// any" (derived from `sin90_ai_calls`, Opus review M1).
+    pub async fn reject_proposal(
+        &self,
+        proposal_id: &str,
+        reason: Option<&str>,
+    ) -> Result<RejectOutcome> {
+        let now = now_iso8601();
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+
+        let claimed = sqlx::query(
+            "UPDATE sin90_proposals SET status = 'rejected', decided_at = ?
+             WHERE id = ? AND status = 'pending'
+             RETURNING source, ops, rationale, created_at",
+        )
+        .bind(&now)
+        .bind(proposal_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(claimed) = claimed else {
+            let existing = sqlx::query("SELECT status FROM sin90_proposals WHERE id = ?")
+                .bind(proposal_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+            return match existing {
+                None => Err(StoreError::NotFound(format!("proposal {proposal_id}"))),
+                Some(r) => Err(StoreError::Conflict(format!(
+                    "proposal {proposal_id} is {}, not pending",
+                    r.get::<String, _>("status")
+                ))),
+            };
+        };
+
+        let proposal_source: String = claimed.get("source");
+        let ops: Vec<Sin90Op> = serde_json::from_str(&claimed.get::<String, _>("ops"))?;
+        let rationale: Option<String> = claimed.get("rationale");
+        let created_at: String = claimed.get("created_at");
+        let ops_summary = summarize_ops(&ops)?;
+
+        let capability_source: String = sqlx::query_scalar(
+            "SELECT task_kind FROM sin90_ai_calls WHERE proposal_id = ? AND ok = 1 LIMIT 1",
+        )
+        .bind(proposal_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .unwrap_or_else(|| "direct".to_string());
+
+        sqlx::query(
+            "INSERT INTO sin90_proposal_rejections
+                (id, proposal_id, capability_source, proposal_source, ops_summary, rationale,
+                 reason, proposed_at, rejected_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(ulid())
+        .bind(proposal_id)
+        .bind(&capability_source)
+        .bind(&proposal_source)
+        .bind(&ops_summary)
+        .bind(&rationale)
+        .bind(reason)
+        .bind(&created_at)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+
+        // L1 (Opus review): the internal audit row and the external mirror
+        // ([`crate::http::mod::reject_proposal`]'s own `state.emit`) use the
+        // SAME key for the proposal id — `proposal_id`, not `id` — so a
+        // consumer reading either payload does not need to remember which
+        // one calls it what.
+        append_event(
+            &mut tx,
+            "proposal",
+            proposal_id,
+            "rejected",
+            Some("pending"),
+            Some("rejected"),
+            &json!({
+                "proposal_id": proposal_id,
+                "capability_source": capability_source,
+                "reason": reason,
+            }),
+            &now,
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(RejectOutcome {
+            capability_source,
+            ops_summary,
         })
     }
 
@@ -6071,5 +6229,151 @@ mod review_routine_tests {
         let payload: serde_json::Value =
             serde_json::from_str(&row.get::<String, _>("payload")).unwrap();
         assert_eq!(payload["source"], "human");
+    }
+}
+
+// ============================================================================
+// T5.7.1: Sin90Store::reject_proposal, store-layer only (no HTTP/actor-key
+// gate — that lives in `http::reject_proposal`, a separate stacked branch).
+// Pins the core state machine directly: CAS pending -> rejected, the
+// append-only `sin90_proposal_rejections` log, and the internal
+// `sin90_events` mirror — same "call the store method directly, no axum"
+// convention `outbox_tests`/`fired_tests` above already use.
+// ============================================================================
+
+#[cfg(test)]
+mod proposal_reject_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::store::test_hooks;
+
+    async fn new_store() -> Sin90Store {
+        Sin90Store::open_memory().await.unwrap()
+    }
+
+    /// A structurally-valid, directly-authored (not AI-produced)
+    /// `create_area` proposal — reject doesn't care what the ops are, only
+    /// that the proposal exists and is `pending`.
+    fn plain_proposal(id: &str, rationale: Option<&str>) -> Sin90Proposal {
+        Sin90Proposal {
+            id: id.to_string(),
+            status: ProposalStatus::Pending,
+            source: ProposalSource::LocalBrain,
+            ops: vec![Sin90Op::CreateArea {
+                title: "x".to_string(),
+            }],
+            rationale: rationale.map(str::to_string),
+        }
+    }
+
+    /// The core judgement, exercised at the store layer with no HTTP/actor
+    /// gate involved: a pending proposal moves to `rejected`, drops out of
+    /// the pending list, writes exactly ONE `sin90_proposal_rejections` row
+    /// (with `capability_source` resolved to `"direct"` — no `sin90_ai_calls`
+    /// row references this id — and `proposal_source` copied verbatim from
+    /// the submitted proposal), and appends exactly ONE internal
+    /// `sin90_events` row (`entity = proposal`, `kind = rejected`).
+    #[tokio::test]
+    async fn reject_moves_pending_to_rejected_and_writes_exactly_one_log_row_and_one_event() {
+        let store = new_store().await;
+        let p = plain_proposal("p-store-reject-1", Some("because reasons"));
+        store.submit_proposal(&p).await.unwrap();
+
+        let outcome = store
+            .reject_proposal("p-store-reject-1", Some("duplicate"))
+            .await
+            .unwrap();
+        assert_eq!(outcome.capability_source, "direct");
+        assert_eq!(outcome.ops_summary, "create_area x1");
+
+        let status = test_hooks::proposal_status(&store, "p-store-reject-1")
+            .await
+            .unwrap();
+        assert_eq!(status.as_deref(), Some("rejected"));
+
+        let pending = store.list_pending_proposals().await.unwrap();
+        assert!(
+            pending.iter().all(|sp| sp.id != "p-store-reject-1"),
+            "{pending:?}"
+        );
+
+        // Exactly one rejection-log row.
+        let rows = test_hooks::proposal_rejection_rows(&store, "p-store-reject-1")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0];
+        assert_eq!(row.proposal_id, "p-store-reject-1");
+        assert_eq!(row.capability_source, "direct");
+        assert_eq!(row.proposal_source, "local_brain");
+        assert_eq!(row.ops_summary, "create_area x1");
+        assert_eq!(row.rationale.as_deref(), Some("because reasons"));
+        assert_eq!(row.reason.as_deref(), Some("duplicate"));
+
+        // Exactly one internal event.
+        let events = store
+            .list_events(Some("proposal"), Some("p-store-reject-1"), None, None)
+            .await
+            .unwrap();
+        let rejected: Vec<_> = events.iter().filter(|e| e.kind == "rejected").collect();
+        assert_eq!(rejected.len(), 1, "{events:?}");
+    }
+
+    /// Rejecting an id that was never submitted is `NotFound`, not
+    /// `Conflict` — the same distinction `apply_proposal` already makes.
+    #[tokio::test]
+    async fn reject_of_unknown_id_is_not_found() {
+        let store = new_store().await;
+        let err = store.reject_proposal("ghost", None).await.unwrap_err();
+        assert!(matches!(err, StoreError::NotFound(_)), "{err:?}");
+    }
+
+    /// An already-`applied` proposal cannot be rejected — `Conflict`, and no
+    /// log row is written for it.
+    #[tokio::test]
+    async fn reject_of_an_applied_proposal_is_conflict_and_writes_no_log_row() {
+        let store = new_store().await;
+        let p = plain_proposal("p-store-reject-applied", None);
+        store.submit_proposal(&p).await.unwrap();
+        store
+            .apply_proposal("p-store-reject-applied")
+            .await
+            .unwrap();
+
+        let err = store
+            .reject_proposal("p-store-reject-applied", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Conflict(_)), "{err:?}");
+
+        let rows = test_hooks::proposal_rejection_rows(&store, "p-store-reject-applied")
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    /// An already-`rejected` proposal cannot be rejected again — `Conflict`,
+    /// and the log keeps exactly the ONE row the first reject wrote, not two.
+    #[tokio::test]
+    async fn reject_of_an_already_rejected_proposal_is_conflict_and_log_stays_one_row() {
+        let store = new_store().await;
+        let p = plain_proposal("p-store-reject-twice", None);
+        store.submit_proposal(&p).await.unwrap();
+        store
+            .reject_proposal("p-store-reject-twice", None)
+            .await
+            .unwrap();
+
+        let err = store
+            .reject_proposal("p-store-reject-twice", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Conflict(_)), "{err:?}");
+
+        let rows = test_hooks::proposal_rejection_rows(&store, "p-store-reject-twice")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
     }
 }
