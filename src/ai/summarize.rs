@@ -1352,6 +1352,16 @@ mod tests {
             .unwrap();
         assert_eq!(source, "local_brain");
 
+        // L2 (2026-09-26 review round 2): confirm the model's OWN narrative
+        // actually landed in the proposed body — the `source`/`ok` checks
+        // above prove the ladder took the model branch, but not that the
+        // text it produced survived into what gets accepted.
+        let stored = store.get_proposal(&id).await.unwrap();
+        let [Sin90Op::DraftReviewBody { body, .. }] = stored.ops.as_slice() else {
+            panic!("expected exactly one DraftReviewBody op: {:?}", stored.ops);
+        };
+        assert!(body.contains("本周整体推进顺利"), "{body}");
+
         let (engine, ok): (String, bool) = sqlx::query_as(
             "SELECT engine, ok FROM sin90_ai_calls WHERE run_id = 'run-positive' AND ok = 1",
         )
@@ -1429,11 +1439,17 @@ mod tests {
     async fn summarize_auto_draft_from_routine_fire_can_be_rewritten() {
         let store = Sin90Store::open_memory().await.unwrap();
         let routine = create_review_routine(&store).await;
+        // 2026-09-26 review round 2 (H1): `scheduled_for` is real "now", not
+        // a hand-picked date — a hardcoded `2026-W39` goes stale (and this
+        // test would silently stop exercising a real fire) the moment
+        // calendar time passes it, which for `2026-W39` was already true
+        // past 2026-09-28.
+        let now = crate::core::now_iso8601();
         let outcome = store
             .record_routine_fire(
                 "fire-1",
                 &format!("routine.{}", routine.id),
-                "2026-09-21T18:00:00Z", // 2026-W39, Monday
+                &now,
                 FireTrigger::Tick,
             )
             .await
@@ -1469,11 +1485,13 @@ mod tests {
     async fn summarize_auto_draft_with_human_addition_is_skipped() {
         let store = Sin90Store::open_memory().await.unwrap();
         let routine = create_review_routine(&store).await;
+        // H1 (2026-09-26 review round 2): real "now", not a hardcoded date.
+        let now = crate::core::now_iso8601();
         let outcome = store
             .record_routine_fire(
                 "fire-1",
                 &format!("routine.{}", routine.id),
-                "2026-09-21T18:00:00Z",
+                &now,
                 FireTrigger::Tick,
             )
             .await
@@ -1513,11 +1531,16 @@ mod tests {
     async fn summarize_auto_draft_stale_after_new_completion_is_skipped() {
         let store = Sin90Store::open_memory().await.unwrap();
         let routine = create_review_routine(&store).await;
+        // H1 (2026-09-26 review round 2): real "now", not a hardcoded date —
+        // the follow-up completion below must land in the SAME week this
+        // resolves to, not a hardcoded date that happens to share a week
+        // with the old hardcoded `scheduled_for`.
+        let now = crate::core::now_iso8601();
         let outcome = store
             .record_routine_fire(
                 "fire-1",
                 &format!("routine.{}", routine.id),
-                "2026-09-21T18:00:00Z",
+                &now,
                 FireTrigger::Tick,
             )
             .await
@@ -1527,8 +1550,10 @@ mod tests {
         };
         let auto_review = auto_review.unwrap();
 
-        // A NEW completion, inside the same week, AFTER the draft above was
-        // already rendered and stored.
+        // A NEW completion, inside the SAME week as `now` above, AFTER the
+        // draft was already rendered and stored — reusing `now` itself
+        // (rather than a second hardcoded date) guarantees it lands in the
+        // same ISO week regardless of when this test actually runs.
         let task = store
             .create_task("late task", None, None, TaskKind::Other, Energy::Mid, None)
             .await
@@ -1540,14 +1565,9 @@ mod tests {
         ] {
             store.transition_task(&task.id, to).await.unwrap();
         }
-        crate::store::test_hooks::set_last_event_at(
-            &store,
-            "task",
-            &task.id,
-            "2026-09-22T09:00:00Z", // still 2026-W39
-        )
-        .await
-        .unwrap();
+        crate::store::test_hooks::set_last_event_at(&store, "task", &task.id, &now)
+            .await
+            .unwrap();
 
         let review = store.get_review(&auto_review.review_id).await.unwrap();
         let reader = store.ai_reader();

@@ -4673,6 +4673,13 @@ mod ai_classify {
         let items = items.as_array().unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["result"], "proposed");
+        // M1 (2026-09-26 review round 2): a non-skipped item carries no
+        // `reason` field at all (`AiRunItem::reason`'s `skip_serializing_if`).
+        assert!(
+            items[0].get("reason").is_none(),
+            "a non-skipped item must not have a reason field: {:?}",
+            items[0]
+        );
         // M5: `calls` is read from the durable `sin90_ai_calls` table.
         let calls = calls.as_array().unwrap();
         assert!(
@@ -5230,6 +5237,9 @@ mod ai_classify {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["target"], task.id);
         assert_eq!(items[0]["result"], "skipped");
+        // M2/M1 (2026-09-26 review round 2): dedup-skip carries `reason:
+        // "dedup"` — mirrors `ai_propose`'s own dedup-skip assertion.
+        assert_eq!(items[0]["reason"], "dedup");
     }
 
     // ---- run registry eviction must not drop a still-running entry -------
@@ -5395,6 +5405,17 @@ mod ai_propose {
             .unwrap_or_else(|| panic!("no item for target {target}: {items:?}"))["result"]
             .as_str()
             .unwrap()
+    }
+
+    /// M1 (2026-09-26 review round 2): like [`item_result`] but hands back
+    /// the WHOLE item (so a caller can also inspect `reason`).
+    fn item_by_target<'a>(items: &'a Value, target: &str) -> &'a Value {
+        items
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["target"] == target)
+            .unwrap_or_else(|| panic!("no item for target {target}: {items:?}"))
     }
 
     #[tokio::test]
@@ -5566,6 +5587,15 @@ mod ai_propose {
         assert_eq!(item_result(&items, "propose.carry"), "proposed");
         assert_eq!(item_result(&items, "propose.reorder"), "nothing");
         assert_eq!(item_result(&items, "propose.create"), "nothing");
+        // M1 (2026-09-26 review round 2): a non-skipped item carries no
+        // `reason` field at all.
+        assert!(
+            item_by_target(&items, "propose.carry")
+                .get("reason")
+                .is_none(),
+            "a non-skipped item must not have a reason field: {:?}",
+            item_by_target(&items, "propose.carry")
+        );
 
         let submitted: Vec<_> = sink
             .0
@@ -6013,6 +6043,9 @@ mod ai_propose {
         let (state, items) = poll_run_to_done(&app, run["run_id"].as_str().unwrap()).await;
         assert_eq!(state, "done");
         assert_eq!(item_result(&items, "propose.reorder"), "skipped");
+        // M1 (2026-09-26 review round 2): dedup-skip carries `reason:
+        // "dedup"` — mirrors `ai_classify`'s own dedup-skip assertion.
+        assert_eq!(item_by_target(&items, "propose.reorder")["reason"], "dedup");
         let proposals_after = store.list_pending_proposals().await.unwrap().len();
         assert_eq!(
             proposals_before, proposals_after,
