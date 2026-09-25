@@ -2349,3 +2349,657 @@ mod rhythm {
         );
     }
 }
+
+// ============================================================================
+// M3 — Routine routes (T3.1.2). `cargo test --lib http::tests::routine`.
+// ============================================================================
+
+mod routine {
+    use super::*;
+
+    /// A minimal, legal `POST /routines` body — `0 7 * * MON,WED,FRI` is the
+    /// spec.md example (weekday NAMES, comma list; digits are rejected —
+    /// `not_a_cron_positive_control` below is the positive control that this
+    /// value itself is accepted).
+    fn new_routine_body() -> Value {
+        json!({"title": "Morning run", "kind": "exercise", "cron": "0 7 * * MON,WED,FRI"})
+    }
+
+    // ---- actor-key gate: automation -> 403, human -> 2xx (positive control) --
+
+    #[tokio::test]
+    async fn create_routine_requires_human_key() {
+        let (app, _sink) = test_app().await;
+        let resp = app
+            .clone()
+            .oneshot(automation_req("POST", "/routines", new_routine_body()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Positive control: the human key succeeds with the same body.
+        let resp = app
+            .oneshot(human_req("POST", "/routines", new_routine_body()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn update_routine_requires_human_key() {
+        let (app, _sink) = test_app().await;
+        let created = body_json(
+            app.clone()
+                .oneshot(human_req("POST", "/routines", new_routine_body()))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let id = created["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .clone()
+            .oneshot(automation_req(
+                "PATCH",
+                &format!("/routines/{id}"),
+                json!({"title": "hacked"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Positive control: the human key succeeds with the same body.
+        let resp = app
+            .oneshot(human_req(
+                "PATCH",
+                &format!("/routines/{id}"),
+                json!({"title": "renamed"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn transition_routine_requires_human_key() {
+        let (app, _sink) = test_app().await;
+        let created = body_json(
+            app.clone()
+                .oneshot(human_req("POST", "/routines", new_routine_body()))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let id = created["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .clone()
+            .oneshot(automation_req(
+                "POST",
+                &format!("/routines/{id}/transition"),
+                json!({"to": "paused"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Positive control: the human key succeeds with the same body.
+        let resp = app
+            .oneshot(human_req(
+                "POST",
+                &format!("/routines/{id}/transition"),
+                json!({"to": "paused"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ---- 400: unknown field, illegal cron; positive control: legal cron ------
+
+    #[tokio::test]
+    async fn create_routine_rejects_unknown_field() {
+        let (app, _sink) = test_app().await;
+        let mut body = new_routine_body();
+        body["nope"] = json!(1);
+        let resp = app
+            .oneshot(human_req("POST", "/routines", body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn create_routine_rejects_posix_digit_weekday_and_day_and_weekday_both_restricted() {
+        let (app, _sink) = test_app().await;
+
+        // POSIX-style digit weekday: cron 0.15 uses 1=Sun, not POSIX's
+        // 0/7=Sun — a digit would silently mean the wrong day (design §M3 /
+        // spec.md's H1).
+        let mut digit_weekday = new_routine_body();
+        digit_weekday["cron"] = json!("0 7 * * 1-5");
+        let resp = app
+            .clone()
+            .oneshot(human_req("POST", "/routines", digit_weekday))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Day-of-month AND day-of-week both restricted: cron 0.15 ANDs them,
+        // POSIX ORs them — ambiguous across the two dialects, rejected.
+        let mut both_restricted = new_routine_body();
+        both_restricted["cron"] = json!("0 7 1 * MON");
+        let resp = app
+            .clone()
+            .oneshot(human_req("POST", "/routines", both_restricted))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Positive control: the spec.md example (weekday names, day-of-month
+        // left at `*`) is accepted.
+        let resp = app
+            .oneshot(human_req("POST", "/routines", new_routine_body()))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "a legal cron string must still be accepted"
+        );
+    }
+
+    // ---- PATCH: null clears target_count, absent leaves it unchanged ---------
+
+    #[tokio::test]
+    async fn patch_null_target_count_clears_it() {
+        let (app, _sink) = test_app().await;
+        let mut body = new_routine_body();
+        body["target_count"] = json!(3);
+        let created = body_json(
+            app.clone()
+                .oneshot(human_req("POST", "/routines", body))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let id = created["id"].as_str().unwrap().to_string();
+        assert_eq!(created["target_count"], json!(3));
+
+        let patched = body_json(
+            app.oneshot(human_req(
+                "PATCH",
+                &format!("/routines/{id}"),
+                json!({"target_count": null}),
+            ))
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert!(
+            patched["target_count"].is_null(),
+            "an explicit null must clear target_count: {patched:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_absent_target_count_leaves_it_unchanged() {
+        let (app, _sink) = test_app().await;
+        let mut body = new_routine_body();
+        body["target_count"] = json!(3);
+        let created = body_json(
+            app.clone()
+                .oneshot(human_req("POST", "/routines", body))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let id = created["id"].as_str().unwrap().to_string();
+
+        // No `target_count` key at all — must leave the existing value alone.
+        let patched = body_json(
+            app.oneshot(human_req(
+                "PATCH",
+                &format!("/routines/{id}"),
+                json!({"title": "renamed"}),
+            ))
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            patched["target_count"],
+            json!(3),
+            "an absent key must not touch target_count: {patched:?}"
+        );
+        assert_eq!(patched["title"], "renamed");
+    }
+
+    // ---- retired is a closed door: PATCH -> 409, transition retired->active -> 409 --
+
+    #[tokio::test]
+    async fn patch_on_retired_routine_is_409() {
+        let (app, _sink) = test_app().await;
+        let created = body_json(
+            app.clone()
+                .oneshot(human_req("POST", "/routines", new_routine_body()))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let id = created["id"].as_str().unwrap().to_string();
+        assert_eq!(
+            app.clone()
+                .oneshot(human_req(
+                    "POST",
+                    &format!("/routines/{id}/transition"),
+                    json!({"to": "retired"}),
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        let resp = app
+            .oneshot(human_req(
+                "PATCH",
+                &format!("/routines/{id}"),
+                json!({"title": "too late"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn transition_retired_to_active_is_409() {
+        let (app, _sink) = test_app().await;
+        let created = body_json(
+            app.clone()
+                .oneshot(human_req("POST", "/routines", new_routine_body()))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let id = created["id"].as_str().unwrap().to_string();
+        assert_eq!(
+            app.clone()
+                .oneshot(human_req(
+                    "POST",
+                    &format!("/routines/{id}/transition"),
+                    json!({"to": "retired"}),
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        let resp = app
+            .oneshot(human_req(
+                "POST",
+                &format!("/routines/{id}/transition"),
+                json!({"to": "active"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn transition_rejects_unknown_field() {
+        let (app, _sink) = test_app().await;
+        let created = body_json(
+            app.clone()
+                .oneshot(human_req("POST", "/routines", new_routine_body()))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let id = created["id"].as_str().unwrap().to_string();
+        let resp = app
+            .oneshot(human_req(
+                "POST",
+                &format!("/routines/{id}/transition"),
+                json!({"to": "paused", "extra": 1}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ---- GET list: status / area_id / direction_id filters, each with a
+    // positive control (a matching + a non-matching row) -----------------------
+
+    #[tokio::test]
+    async fn list_filters_by_status_area_and_direction_have_positive_controls() {
+        let (app, _sink) = test_app().await;
+        let area1 = body_json(
+            app.clone()
+                .oneshot(human_req("POST", "/areas", json!({"title": "Health"})))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let area2 = body_json(
+            app.clone()
+                .oneshot(human_req("POST", "/areas", json!({"title": "Work"})))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let direction1 = body_json(
+            app.clone()
+                .oneshot(human_req(
+                    "POST",
+                    "/directions",
+                    json!({"title": "d1", "target_window": "2026-Q4", "area_id": area1["id"]}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        let mut r1 = new_routine_body();
+        r1["area_id"] = area1["id"].clone();
+        r1["direction_id"] = direction1["id"].clone();
+        let r1 = body_json(
+            app.clone()
+                .oneshot(human_req("POST", "/routines", r1))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let r1_id = r1["id"].as_str().unwrap().to_string();
+
+        let mut r2 = new_routine_body();
+        r2["title"] = json!("Deep work block");
+        r2["kind"] = json!("deep_work");
+        r2["area_id"] = area2["id"].clone();
+        let r2 = body_json(
+            app.clone()
+                .oneshot(human_req("POST", "/routines", r2))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let r2_id = r2["id"].as_str().unwrap().to_string();
+
+        // area_id filter: matches only r1 (positive control: r2 exists in a
+        // different area and must not show up).
+        let by_area = body_json(
+            app.clone()
+                .oneshot(get_req(&format!(
+                    "/routines?area_id={}",
+                    area1["id"].as_str().unwrap()
+                )))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let ids: Vec<&str> = by_area["routines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec![r1_id.as_str()]);
+
+        // direction_id filter: matches only r1.
+        let by_direction = body_json(
+            app.clone()
+                .oneshot(get_req(&format!(
+                    "/routines?direction_id={}",
+                    direction1["id"].as_str().unwrap()
+                )))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let ids: Vec<&str> = by_direction["routines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec![r1_id.as_str()]);
+
+        // status filter: pause r2, then filter by each status — each finds
+        // exactly the matching routine (positive control both ways).
+        assert_eq!(
+            app.clone()
+                .oneshot(human_req(
+                    "POST",
+                    &format!("/routines/{r2_id}/transition"),
+                    json!({"to": "paused"}),
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let active = body_json(
+            app.clone()
+                .oneshot(get_req("/routines?status=active"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let ids: Vec<&str> = active["routines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec![r1_id.as_str()]);
+
+        let paused = body_json(
+            app.oneshot(get_req("/routines?status=paused"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let ids: Vec<&str> = paused["routines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec![r2_id.as_str()]);
+    }
+
+    // ---- GET /routines/{id}: unknown id -> 404 --------------------------------
+
+    #[tokio::test]
+    async fn get_unknown_routine_is_404() {
+        let (app, _sink) = test_app().await;
+        let resp = app
+            .oneshot(get_req("/routines/does-not-exist"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ---- events mirrored to the kernel sink -----------------------------------
+    //
+    // T3.1.2 review: the mirror must be one-for-one with the store's OWN
+    // `sin90_events` writes — same event count, same kind names, same
+    // payload shape (`store::repo::update_routine`'s `RoutineUpdate::changed`
+    // is exactly what gates this; `transition_routine`'s destination-specific
+    // kind is what names it).
+
+    #[tokio::test]
+    async fn create_emits_a_mirrored_routine_created_event() {
+        let (app, sink) = test_app().await;
+        app.oneshot(human_req("POST", "/routines", new_routine_body()))
+            .await
+            .unwrap();
+        assert!(sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(kind, _)| kind == "routine.created"));
+    }
+
+    /// A no-op PATCH (absent fields, or fields re-stating the current
+    /// values) must emit ZERO mirrored events — the store itself wrote no
+    /// `sin90_events` row for it either (`update_routine`'s L1), so a mirror
+    /// firing anyway would be a lie about what happened. Positive control:
+    /// an actual field change still emits exactly one `routine.updated`,
+    /// whose payload is the full post-update snapshot plus a `changed` array
+    /// naming exactly the field that moved — not an ad hoc field list.
+    #[tokio::test]
+    async fn noop_patch_emits_no_event_real_change_emits_exactly_one_with_changed() {
+        let (app, sink) = test_app().await;
+        let created = body_json(
+            app.clone()
+                .oneshot(human_req("POST", "/routines", new_routine_body()))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let id = created["id"].as_str().unwrap().to_string();
+        let events_before = sink.0.lock().unwrap().len();
+
+        // Absent fields.
+        assert_eq!(
+            app.clone()
+                .oneshot(human_req("PATCH", &format!("/routines/{id}"), json!({})))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            sink.0.lock().unwrap().len(),
+            events_before,
+            "an absent-fields (no-op) patch must not emit a mirrored event"
+        );
+
+        // Present but re-stating the current value.
+        assert_eq!(
+            app.clone()
+                .oneshot(human_req(
+                    "PATCH",
+                    &format!("/routines/{id}"),
+                    json!({"title": "Morning run"}),
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            sink.0.lock().unwrap().len(),
+            events_before,
+            "a same-values (no-op) patch must not emit a mirrored event"
+        );
+
+        // Positive control: an actual change.
+        assert_eq!(
+            app.oneshot(human_req(
+                "PATCH",
+                &format!("/routines/{id}"),
+                json!({"title": "Evening run"}),
+            ))
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::OK
+        );
+        let events = sink.0.lock().unwrap();
+        let new_events = &events[events_before..];
+        assert_eq!(
+            new_events.len(),
+            1,
+            "a real change must emit exactly one mirrored event: {new_events:?}"
+        );
+        assert_eq!(new_events[0].0, "routine.updated");
+        assert_eq!(new_events[0].1["id"], json!(id));
+        assert_eq!(new_events[0].1["title"], json!("Evening run"));
+        assert_eq!(new_events[0].1["changed"], json!(["title"]));
+    }
+
+    /// The mirrored transition event's kind is the SAME destination-specific
+    /// name `store::repo::transition_routine` uses internally — `paused` /
+    /// `resumed` / `retired` — not a generic `routine.transitioned`. Each
+    /// edge is asserted individually (exact new-event count of 1, exact
+    /// kind), not just "some routine.* event fired somewhere".
+    #[tokio::test]
+    async fn transition_mirrored_event_kind_matches_the_destination_status() {
+        let (app, sink) = test_app().await;
+        let created = body_json(
+            app.clone()
+                .oneshot(human_req("POST", "/routines", new_routine_body()))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let id = created["id"].as_str().unwrap().to_string();
+
+        // active -> paused: `routine.paused`.
+        let events_before = sink.0.lock().unwrap().len();
+        assert_eq!(
+            app.clone()
+                .oneshot(human_req(
+                    "POST",
+                    &format!("/routines/{id}/transition"),
+                    json!({"to": "paused"}),
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        {
+            let events = sink.0.lock().unwrap();
+            let new_events = &events[events_before..];
+            assert_eq!(new_events.len(), 1, "{new_events:?}");
+            assert_eq!(new_events[0].0, "routine.paused");
+            assert_eq!(new_events[0].1["routine_id"], json!(id));
+        }
+
+        // paused -> active: `routine.resumed`.
+        let events_before = sink.0.lock().unwrap().len();
+        assert_eq!(
+            app.clone()
+                .oneshot(human_req(
+                    "POST",
+                    &format!("/routines/{id}/transition"),
+                    json!({"to": "active"}),
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        {
+            let events = sink.0.lock().unwrap();
+            let new_events = &events[events_before..];
+            assert_eq!(new_events.len(), 1, "{new_events:?}");
+            assert_eq!(new_events[0].0, "routine.resumed");
+            assert_eq!(new_events[0].1["routine_id"], json!(id));
+        }
+
+        // active -> retired: `routine.retired`.
+        let events_before = sink.0.lock().unwrap().len();
+        assert_eq!(
+            app.oneshot(human_req(
+                "POST",
+                &format!("/routines/{id}/transition"),
+                json!({"to": "retired"}),
+            ))
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::OK
+        );
+        let events = sink.0.lock().unwrap();
+        let new_events = &events[events_before..];
+        assert_eq!(new_events.len(), 1, "{new_events:?}");
+        assert_eq!(new_events[0].0, "routine.retired");
+        assert_eq!(new_events[0].1["routine_id"], json!(id));
+    }
+}

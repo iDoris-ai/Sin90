@@ -33,7 +33,8 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::core::{
-    Alloc, AreaStatus, Energy, ScheduleBlockStatus, Sin90Proposal, TaskKind, TaskStatus, WeekStatus,
+    Alloc, AreaStatus, Energy, NewRoutine, RoutinePatch, RoutineStatus, ScheduleBlockStatus,
+    Sin90Proposal, TaskKind, TaskStatus, WeekStatus,
 };
 use crate::store::StoreError;
 
@@ -144,6 +145,9 @@ pub fn router(state: Sin90State) -> axum::Router {
         .route("/packs/install", post(install_pack))
         .route("/capture", post(capture))
         .route("/today", get(today))
+        .route("/routines", post(create_routine).get(list_routines))
+        .route("/routines/{id}", get(get_routine).patch(update_routine))
+        .route("/routines/{id}/transition", post(transition_routine))
         .with_state(state)
 }
 
@@ -251,6 +255,19 @@ struct EventsQuery {
     entity_id: Option<String>,
     since_seq: Option<i64>,
     limit: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct RoutineListQuery {
+    status: Option<RoutineStatus>,
+    area_id: Option<String>,
+    direction_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutineTransitionReq {
+    to: RoutineStatus,
 }
 
 // ---- Area handlers (new) ----------------------------------------------------
@@ -783,6 +800,155 @@ async fn capture(State(state): State<Sin90State>, headers: HeaderMap, body: Byte
 async fn today(State(state): State<Sin90State>) -> Response {
     match state.store.today_view().await {
         Ok(view) => Json(view).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
+// ---- Routine handlers (new, M3, design §2 #6, §3.2, T3.1.2) ----------------
+//
+// `create`/`update`/`transition` are direct writes, human-gated, same
+// convention as Area/Task/Week above (no `Sin90Op::CreateRoutine` proposal
+// variant exists — see `store::repo`'s module doc for why). `GET /routines`
+// and `GET /routines/{id}` are reads, no gate, same posture as `GET /tasks`.
+// Every successful write also emits via `EventSink` — the store already
+// appends its own `sin90_events` row inside the same transaction; this is a
+// SEPARATE mirror out to whoever is on the other end of `state.sink`
+// (Agent24's kernel, in the adapter form) — the same "two audiences, two
+// writes" split every other direct-write handler above already follows.
+
+/// `POST /routines` — body deserializes straight into [`NewRoutine`]
+/// (`deny_unknown_fields`, same convention as every other `New*Req`: a
+/// stray/mistyped key must fail loudly, not be silently dropped).
+async fn create_routine(
+    State(state): State<Sin90State>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(r) = state.require_human(&headers) {
+        return r;
+    }
+    let req: NewRoutine = match parse(&body, "routine") {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    match state.store.create_routine(&req).await {
+        Ok(routine) => {
+            state.emit(
+                "routine.created",
+                serde_json::json!({
+                    "id": routine.id, "area_id": routine.area_id,
+                    "direction_id": routine.direction_id, "status": routine.status,
+                }),
+            );
+            (StatusCode::CREATED, Json(routine)).into_response()
+        }
+        Err(e) => map_err(e),
+    }
+}
+
+/// `GET /routines?status=&area_id=&direction_id=` — a read, no gate, same
+/// posture as `GET /tasks`. Unrecognized query keys are silently ignored by
+/// axum's `Query` extractor, same as every other list route above.
+async fn list_routines(
+    State(state): State<Sin90State>,
+    Query(q): Query<RoutineListQuery>,
+) -> Response {
+    match state
+        .store
+        .list_routines(q.area_id.as_deref(), q.direction_id.as_deref(), q.status)
+        .await
+    {
+        Ok(v) => Json(serde_json::json!({ "routines": v })).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
+/// `GET /routines/{id}` — a read, no gate. Unknown id -> 404 via `map_err`.
+async fn get_routine(State(state): State<Sin90State>, AxPath(id): AxPath<String>) -> Response {
+    match state.store.get_routine(&id).await {
+        Ok(r) => Json(r).into_response(),
+        Err(e) => map_err(e),
+    }
+}
+
+/// `PATCH /routines/{id}` — body deserializes straight into [`RoutinePatch`]
+/// (double-`Option` fields: absent key = leave unchanged, `null` = clear,
+/// value = set — see `RoutinePatch`'s doc comment). A `retired` routine
+/// rejects any patch with `StoreError::Conflict` -> 409 (`store::repo`'s H2).
+///
+/// Mirrors `routine.updated` to `EventSink` — but ONLY when
+/// [`crate::store::RoutineUpdate::changed`] is non-empty (T3.1.2 review): a
+/// no-op patch (absent fields, or ones re-stating the current values) writes
+/// no internal `sin90_events` row either (`update_routine`'s L1), so the
+/// mirror must stay silent too, one-for-one with the store. The mirrored
+/// payload is the SAME shape the store's own `updated` event uses — the
+/// full post-update snapshot plus a `"changed"` array — not an ad hoc field
+/// list, so both audiences see the identical fact.
+async fn update_routine(
+    State(state): State<Sin90State>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    body: Bytes,
+) -> Response {
+    if let Err(r) = state.require_human(&headers) {
+        return r;
+    }
+    let patch: RoutinePatch = match parse(&body, "routine patch") {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    match state.store.update_routine(&id, &patch).await {
+        Ok(outcome) => {
+            if !outcome.changed.is_empty() {
+                let mut payload = match serde_json::to_value(&outcome.routine) {
+                    Ok(v) => v,
+                    Err(e) => return map_err(e.into()),
+                };
+                if let serde_json::Value::Object(map) = &mut payload {
+                    map.insert("changed".to_string(), serde_json::json!(outcome.changed));
+                }
+                state.emit("routine.updated", payload);
+            }
+            Json(outcome.routine).into_response()
+        }
+        Err(e) => map_err(e),
+    }
+}
+
+/// `POST /routines/{id}/transition` — `active <-> paused`,
+/// `{active,paused} -> retired` (design §3.2); an illegal edge (including any
+/// edge out of `retired`) comes back as `StoreError::Transition` -> 409, same
+/// convention as `PATCH /tasks/{id}`/`PATCH /weeks/{id}` above.
+///
+/// The mirrored event kind is the SAME destination-specific name
+/// `store::repo::transition_routine` uses internally (`routine.paused` /
+/// `routine.resumed` / `routine.retired`, T3.1.2 review) — not a generic
+/// `routine.transitioned` — and the payload matches the store's own ad hoc
+/// `{"routine_id": id}` shape, so both audiences agree on both the event
+/// name and its contents.
+async fn transition_routine(
+    State(state): State<Sin90State>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    body: Bytes,
+) -> Response {
+    if let Err(r) = state.require_human(&headers) {
+        return r;
+    }
+    let req: RoutineTransitionReq = match parse(&body, "routine transition") {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    match state.store.transition_routine(&id, req.to).await {
+        Ok(routine) => {
+            let kind = match routine.status {
+                RoutineStatus::Paused => "routine.paused",
+                RoutineStatus::Active => "routine.resumed",
+                RoutineStatus::Retired => "routine.retired",
+            };
+            state.emit(kind, serde_json::json!({ "routine_id": routine.id }));
+            Json(routine).into_response()
+        }
         Err(e) => map_err(e),
     }
 }

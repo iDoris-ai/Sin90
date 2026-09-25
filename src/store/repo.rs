@@ -45,6 +45,20 @@ pub struct ApplyOutcome {
     pub applied_now: bool,
 }
 
+/// Outcome of [`Sin90Store::update_routine`] (T3.1.2 review). `changed` names
+/// exactly the fields the patch actually moved (same list `update_routine`'s
+/// own `updated` event payload carries) — empty when the patch was a no-op
+/// (absent, or re-stating the current values), in which case no row was
+/// written and no internal `sin90_events` row was appended either. A caller
+/// mirroring this out to another audience (`http::update_routine` -> its
+/// `EventSink`, T3.1.2) MUST gate its own emit on `changed` being non-empty,
+/// so the mirror never emits more (or fewer) events than the store itself did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutineUpdate {
+    pub routine: Routine,
+    pub changed: Vec<&'static str>,
+}
+
 /// A persisted proposal as returned by the read endpoints — the stored row plus
 /// its apply receipt (present only once `applied`). `ops` is re-inflated to typed
 /// form so a reader reconciles exactly what was proposed, not opaque JSON text.
@@ -1306,7 +1320,13 @@ impl Sin90Store {
     ///   snapshot (`serde_json::to_value(&updated)`, not an ad hoc field
     ///   list) plus a `"changed"` array naming which fields actually moved —
     ///   so a reader never has to diff two snapshots to know what happened.
-    pub async fn update_routine(&self, id: &str, patch: &RoutinePatch) -> Result<Routine> {
+    ///
+    /// Returns [`RoutineUpdate`] (T3.1.2 review), not a bare `Routine`: a
+    /// caller mirroring this write out to a second audience (T3.1.2's HTTP
+    /// layer -> its `EventSink`) needs to know whether anything ACTUALLY
+    /// changed, not just "the call returned `Ok`" — a no-op patch returns
+    /// `Ok` too (see L1 above), but must not be mistaken for a real write.
+    pub async fn update_routine(&self, id: &str, patch: &RoutinePatch) -> Result<RoutineUpdate> {
         let title = match &patch.title {
             Some(t) => {
                 let trimmed = t.trim();
@@ -1384,7 +1404,10 @@ impl Sin90Store {
         if changed.is_empty() {
             // Dropping `tx` here rolls back the `BEGIN IMMEDIATE` we opened
             // to read `current` — no row, no event, `updated_at` untouched.
-            return Ok(current);
+            return Ok(RoutineUpdate {
+                routine: current,
+                changed,
+            });
         }
 
         let now = now_iso8601();
@@ -1424,7 +1447,10 @@ impl Sin90Store {
         )
         .await?;
         tx.commit().await?;
-        Ok(updated)
+        Ok(RoutineUpdate {
+            routine: updated,
+            changed,
+        })
     }
 
     /// Transition a Routine's status (`active <-> paused`, `{active,paused} ->
@@ -2747,8 +2773,11 @@ mod routine_tests {
         assert_eq!(updated_payload["id"], json!(routine.id));
         assert_eq!(updated_payload["title"], json!("Evening run"));
         assert_eq!(updated_payload["cron"], json!("0 19 * * MON,WED,FRI"));
-        assert_eq!(updated_payload["tz"], json!(updated.tz));
-        assert_eq!(updated_payload["target_count"], json!(updated.target_count));
+        assert_eq!(updated_payload["tz"], json!(updated.routine.tz));
+        assert_eq!(
+            updated_payload["target_count"],
+            json!(updated.routine.target_count)
+        );
         let changed: Vec<String> =
             serde_json::from_value(updated_payload["changed"].clone()).unwrap();
         assert_eq!(changed, vec!["title".to_string(), "cron".to_string()]);
@@ -2773,12 +2802,18 @@ mod routine_tests {
             .await
             .unwrap();
 
-        assert_eq!(updated.title, "Evening run");
-        assert_eq!(updated.cron, "0 19 * * MON,WED,FRI");
-        assert_eq!(updated.tz, "America/New_York");
-        assert_eq!(updated.target_count, Some(4));
-        assert_eq!(updated.target_minutes, None);
-        assert_eq!(updated.status, RoutineStatus::Active); // update never touches status
+        assert_eq!(updated.routine.title, "Evening run");
+        assert_eq!(updated.routine.cron, "0 19 * * MON,WED,FRI");
+        assert_eq!(updated.routine.tz, "America/New_York");
+        assert_eq!(updated.routine.target_count, Some(4));
+        assert_eq!(updated.routine.target_minutes, None);
+        assert_eq!(updated.routine.status, RoutineStatus::Active); // update never touches status
+        let mut changed = updated.changed.clone();
+        changed.sort_unstable();
+        assert_eq!(
+            changed,
+            vec!["cron", "target_count", "target_minutes", "title", "tz"]
+        );
 
         let n = test_hooks::event_count(&store, "routine", &routine.id)
             .await
@@ -2800,7 +2835,8 @@ mod routine_tests {
             .update_routine(&routine.id, &RoutinePatch::default())
             .await
             .unwrap();
-        assert_eq!(empty_patch, routine);
+        assert_eq!(empty_patch.routine, routine);
+        assert!(empty_patch.changed.is_empty());
 
         let same_values_patch = store
             .update_routine(
@@ -2815,8 +2851,9 @@ mod routine_tests {
             )
             .await
             .unwrap();
-        assert_eq!(same_values_patch, routine);
-        assert_eq!(same_values_patch.updated_at, routine.updated_at);
+        assert_eq!(same_values_patch.routine, routine);
+        assert_eq!(same_values_patch.routine.updated_at, routine.updated_at);
+        assert!(same_values_patch.changed.is_empty());
 
         let n = test_hooks::event_count(&store, "routine", &routine.id)
             .await
@@ -2935,7 +2972,8 @@ mod routine_tests {
             .update_routine(&paused_routine.id, &patch)
             .await
             .unwrap();
-        assert_eq!(updated.title, "Renamed");
+        assert_eq!(updated.routine.title, "Renamed");
+        assert_eq!(updated.changed, vec!["title"]);
 
         // Now the actual assertion: retired rejects the exact same patch.
         let retired_routine = create_ok(&store).await;
