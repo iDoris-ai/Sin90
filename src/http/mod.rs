@@ -23,6 +23,7 @@
 
 pub mod actor;
 mod ai_classify;
+mod ai_propose;
 pub mod ai_runs;
 pub mod state;
 
@@ -172,6 +173,10 @@ pub fn router(state: Sin90State, mounted: bool) -> axum::Router {
         // both standalone and mounted mode ("standalone 模式同样注册（port
         // 为 `None`，只有 reflex）").
         .route("/ai/classify", post(ai_classify::trigger_classify))
+        // New (T5.4.1, design §11.4.3): same posture as `/ai/classify` above
+        // — not under `/_a24/*`, registered in both standalone and mounted
+        // mode.
+        .route("/ai/propose", post(ai_propose::trigger_propose))
         .route("/ai/runs/{run_id}", get(ai_runs::get_ai_run));
     if mounted {
         r = r.route("/_a24/scheduler/fired", post(scheduler_fired));

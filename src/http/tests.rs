@@ -4843,3 +4843,868 @@ mod ai_classify {
         assert!(inbox_ids.contains(&task.id.as_str()));
     }
 }
+
+// ---- POST /ai/propose (T5.4.1, design §11.4 公共 + §11.4.3) ----------------
+
+mod ai_propose {
+    use super::*;
+    use crate::ai::Capability;
+    use crate::core::{NewTask, Sin90Op, WeekStatus};
+
+    /// Polls `GET /ai/runs/{run_id}` until `state != "running"` (5s wall-clock
+    /// ceiling, same posture `ai_classify`'s own L6 fix uses) and returns the
+    /// final `(state, items)`.
+    async fn poll_run_to_done(app: &axum::Router, run_id: &str) -> (String, Value) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut state_str = "running".to_string();
+        let mut items = Value::Null;
+        while tokio::time::Instant::now() < deadline {
+            let r = body_json(
+                app.clone()
+                    .oneshot(get_req(&format!("/ai/runs/{run_id}")))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            state_str = r["state"].as_str().unwrap().to_string();
+            items = r["items"].clone();
+            if state_str != "running" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        (state_str, items)
+    }
+
+    fn item_result<'a>(items: &'a Value, target: &str) -> &'a str {
+        items
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["target"] == target)
+            .unwrap_or_else(|| panic!("no item for target {target}: {items:?}"))["result"]
+            .as_str()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn trigger_propose_requires_an_actor_key() {
+        let (app, _sink) = test_app().await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/ai/propose")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({"week_id": "w1"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn trigger_propose_unknown_field_is_400() {
+        let (app, _sink) = test_app().await;
+        let resp = app
+            .oneshot(automation_req("POST", "/ai/propose", json!({"oops": true})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn trigger_propose_unknown_week_is_404() {
+        let (app, _sink) = test_app().await;
+        let resp = app
+            .oneshot(automation_req(
+                "POST",
+                "/ai/propose",
+                json!({"week_id": "does-not-exist"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// L4 (2026-09-24 review): the same v1 error envelope every other route
+    /// uses (`{"error": {"code", "message"}}`), not a hand-rolled shape.
+    #[tokio::test]
+    async fn trigger_propose_week_not_open_is_409() {
+        let (app, _sink, store) = test_app_with_store().await;
+        let week = store.create_week("2026-W30").await.unwrap();
+        store
+            .transition_week(&week.id, WeekStatus::Active)
+            .await
+            .unwrap();
+        store
+            .transition_week(&week.id, WeekStatus::Reviewing)
+            .await
+            .unwrap();
+
+        let resp = app
+            .oneshot(automation_req(
+                "POST",
+                "/ai/propose",
+                json!({"week_id": week.id}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], "week_not_open");
+
+        // Positive control: `planning` is open — same request succeeds.
+        let (app2, _sink2, store2) = test_app_with_store().await;
+        let week2 = store2.create_week("2026-W31").await.unwrap();
+        let resp2 = app2
+            .oneshot(automation_req(
+                "POST",
+                "/ai/propose",
+                json!({"week_id": week2.id}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::ACCEPTED);
+    }
+
+    /// Pre-seeds the registry directly (rather than racing two real requests,
+    /// which would be flaky against a background `tokio::spawn`) to pin the
+    /// single-flight 409 shape — same technique `ai_classify`'s own test uses.
+    #[tokio::test]
+    async fn trigger_propose_busy_returns_409_with_existing_run_id() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let week = store.create_week("2026-W32").await.unwrap();
+        let state = Sin90State::new(
+            store,
+            Arc::new(RecordingSink::default()),
+            ActorKeys {
+                human: HUMAN.into(),
+                automation: AUTOMATION.into(),
+            },
+        );
+        state
+            .ai_runs
+            .lock()
+            .unwrap()
+            .start(Capability::Propose, "run-already-going");
+        let app = router(state, false);
+        let resp = app
+            .oneshot(automation_req(
+                "POST",
+                "/ai/propose",
+                json!({"week_id": week.id}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "ai_busy");
+        assert_eq!(body["run_id"], "run-already-going");
+    }
+
+    /// End-to-end through the real router: `202` → background run → polled
+    /// to completion via `GET /ai/runs/{id}`. Production has no real
+    /// `ModelPort` wired yet (T5.1.2), so this only exercises reflex — a
+    /// previous OPEN week with a `planned` task makes the carry reflex
+    /// deterministically produce a proposal, and the run mirrors
+    /// `proposal.submitted` through the SAME `EventSink` (M2: `EmittingSink`,
+    /// reused from `ai_classify`, not a second implementation) `POST
+    /// /proposals` uses.
+    #[tokio::test]
+    async fn trigger_propose_runs_in_background_and_is_pollable_to_done() {
+        let (app, sink, store) = test_app_with_store().await;
+        let prev = store.create_week("2026-W40").await.unwrap();
+        store
+            .transition_week(&prev.id, WeekStatus::Active)
+            .await
+            .unwrap();
+        let carry_proposal = crate::core::Sin90Proposal {
+            id: "seed-prev-task".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![Sin90Op::CreateTasks {
+                week_id: prev.id.clone(),
+                tasks: vec![NewTask {
+                    title: "carry me".into(),
+                    direction_id: None,
+                }],
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&carry_proposal).await.unwrap();
+        store.apply_proposal(&carry_proposal.id).await.unwrap();
+        let target = store.create_week("2026-W41").await.unwrap();
+
+        let resp = app
+            .clone()
+            .oneshot(automation_req(
+                "POST",
+                "/ai/propose",
+                json!({"week_id": target.id}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body = body_json(resp).await;
+        assert_eq!(body["capability"], "propose");
+        let run_id = body["run_id"].as_str().unwrap().to_string();
+
+        let (state_str, items) = poll_run_to_done(&app, &run_id).await;
+        assert_eq!(state_str, "done", "run never finished: items={items:?}");
+        assert_eq!(item_result(&items, "propose.carry"), "proposed");
+        assert_eq!(item_result(&items, "propose.reorder"), "nothing");
+        assert_eq!(item_result(&items, "propose.create"), "nothing");
+
+        let submitted: Vec<_> = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(kind, _)| kind == "proposal.submitted")
+            .cloned()
+            .collect();
+        assert_eq!(
+            submitted.len(),
+            1,
+            "one mirror per produced proposal: {submitted:?}"
+        );
+    }
+
+    /// H3 (2026-09-24 review, design §11.4 公共's "去重"): triggering propose
+    /// TWICE for the same week without accepting anything in between must
+    /// produce only ONE pending carry proposal, not two — the second run's
+    /// candidate is excluded because a still-valid pending carry proposal
+    /// already covers it. Accepting that proposal (closing the source task)
+    /// and adding a SECOND, distinct carryable task then lets a THIRD run
+    /// produce a fresh proposal — dedup does not block permanently once the
+    /// thing it was guarding against is no longer pending.
+    #[tokio::test]
+    async fn trigger_propose_dedup_skips_repeat_run_then_reproduces_after_accept() {
+        let (app, _sink, store) = test_app_with_store().await;
+        let prev = store.create_week("2026-W50").await.unwrap();
+        store
+            .transition_week(&prev.id, WeekStatus::Active)
+            .await
+            .unwrap();
+        let seed_first = crate::core::Sin90Proposal {
+            id: "seed-first-prev-task".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![Sin90Op::CreateTasks {
+                week_id: prev.id.clone(),
+                tasks: vec![NewTask {
+                    title: "first carryable".into(),
+                    direction_id: None,
+                }],
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&seed_first).await.unwrap();
+        store.apply_proposal(&seed_first.id).await.unwrap();
+        let target = store.create_week("2026-W51").await.unwrap();
+
+        // Round 1: produces a carry proposal.
+        let run1 = body_json(
+            app.clone()
+                .oneshot(automation_req(
+                    "POST",
+                    "/ai/propose",
+                    json!({"week_id": target.id}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let (state1, items1) = poll_run_to_done(&app, run1["run_id"].as_str().unwrap()).await;
+        assert_eq!(state1, "done");
+        assert_eq!(item_result(&items1, "propose.carry"), "proposed");
+        let pending_after_round1 = store.list_pending_proposals().await.unwrap();
+        assert_eq!(pending_after_round1.len(), 1, "{pending_after_round1:?}");
+
+        // Round 2 (nothing accepted yet): the SAME candidate is already
+        // covered by a still-valid pending carry proposal — excluded from
+        // `p_candidates`, so this run's carry decision is empty.
+        let run2 = body_json(
+            app.clone()
+                .oneshot(automation_req(
+                    "POST",
+                    "/ai/propose",
+                    json!({"week_id": target.id}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let (state2, items2) = poll_run_to_done(&app, run2["run_id"].as_str().unwrap()).await;
+        assert_eq!(state2, "done");
+        assert_eq!(
+            item_result(&items2, "propose.carry"),
+            "nothing",
+            "the only candidate is already covered by a still-pending proposal"
+        );
+        let pending_after_round2 = store.list_pending_proposals().await.unwrap();
+        assert_eq!(
+            pending_after_round2.len(),
+            1,
+            "round 2 must not have added a second carry proposal: {pending_after_round2:?}"
+        );
+
+        // Accept round 1's proposal, then add a SECOND, distinct carryable
+        // task to P.
+        let accept_resp = app
+            .clone()
+            .oneshot(accept_req(&pending_after_round1[0].id))
+            .await
+            .unwrap();
+        assert_eq!(accept_resp.status(), StatusCode::OK);
+        let seed_second = crate::core::Sin90Proposal {
+            id: "seed-second-prev-task".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![Sin90Op::CreateTasks {
+                week_id: prev.id.clone(),
+                tasks: vec![NewTask {
+                    title: "second carryable".into(),
+                    direction_id: None,
+                }],
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&seed_second).await.unwrap();
+        store.apply_proposal(&seed_second.id).await.unwrap();
+
+        // Round 3: a fresh candidate exists — dedup does not block it.
+        let run3 = body_json(
+            app.clone()
+                .oneshot(automation_req(
+                    "POST",
+                    "/ai/propose",
+                    json!({"week_id": target.id}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let (state3, items3) = poll_run_to_done(&app, run3["run_id"].as_str().unwrap()).await;
+        assert_eq!(state3, "done");
+        assert_eq!(item_result(&items3, "propose.carry"), "proposed");
+    }
+
+    /// H3's coordinator-clarified nuance (`docs/DESIGN-LIFEOS.md` §11.4.3,
+    /// "T5.4.1 实现时补"): a PENDING `ReorderTasks` proposal that only covers
+    /// PART of W's current non-terminal tasks must NOT be treated as "still
+    /// valid" for dedup purposes, even though `AiSink::precheck`'s dry run
+    /// alone would happily pass it (a partial reorder is a perfectly legal
+    /// `Sin90Op` on its own — nothing in `validate`/`apply_op` requires full
+    /// coverage). Submits such a partial reorder directly (bypassing
+    /// `ai::propose` entirely, simulating a stale leftover from before a
+    /// task was added/removed), then triggers propose and confirms it is NOT
+    /// skipped — a full reorder is still attempted.
+    #[tokio::test]
+    async fn trigger_propose_dedup_requires_exact_reorder_coverage() {
+        let (app, _sink, store) = test_app_with_store().await;
+        let target = store.create_week("2026-W22").await.unwrap();
+        let seed = crate::core::Sin90Proposal {
+            id: "seed-w-tasks".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![Sin90Op::CreateTasks {
+                week_id: target.id.clone(),
+                tasks: vec![
+                    NewTask {
+                        title: "task a".into(),
+                        direction_id: None,
+                    },
+                    NewTask {
+                        title: "task b".into(),
+                        direction_id: None,
+                    },
+                ],
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&seed).await.unwrap();
+        store.apply_proposal(&seed.id).await.unwrap();
+        let task_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM sin90_tasks WHERE week_id = ? ORDER BY sort_key ASC",
+        )
+        .bind(&target.id)
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(task_ids.len(), 2);
+        let task_a = &task_ids[0];
+        let task_b = &task_ids[1];
+        // Bump task B to `in_progress` so the reflex WANTS a different order
+        // ([b, a], tier 0 before tier 1) than the current sort_key order
+        // ([a, b]) — otherwise there would be nothing to reorder regardless
+        // of dedup.
+        let bump = crate::core::Sin90Proposal {
+            id: "bump-task-b".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![Sin90Op::TransitionTask {
+                task_id: task_b.clone(),
+                to: crate::core::TaskStatus::InProgress,
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&bump).await.unwrap();
+        store.apply_proposal(&bump.id).await.unwrap();
+
+        // A PARTIAL pending reorder — covers only task A, not task B —
+        // submitted directly, simulating a stale leftover proposal.
+        let partial = crate::ai::ProposalDraft {
+            id: "partial-reorder".into(),
+            ops: vec![Sin90Op::ReorderTasks {
+                week_id: target.id.clone(),
+                order: vec![task_a.clone()],
+            }],
+            rationale: None,
+        };
+        let rec = crate::ai::AiCallRecord {
+            id: "call-partial".into(),
+            run_id: "run-seed".into(),
+            task_kind: Capability::Propose,
+            engine: crate::ai::Engine::Reflex,
+            fallback_from: None,
+            served_tier: None,
+            model_id: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            latency_ms: 0,
+            ok: true,
+            error_kind: None,
+            proposal_id: None,
+            at: "2026-09-24T00:00:00Z".into(),
+        };
+        crate::ai::AiSink::submit(&store, Capability::Propose, partial, rec)
+            .await
+            .unwrap();
+
+        let run = body_json(
+            app.clone()
+                .oneshot(automation_req(
+                    "POST",
+                    "/ai/propose",
+                    json!({"week_id": target.id}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let (state, items) = poll_run_to_done(&app, run["run_id"].as_str().unwrap()).await;
+        assert_eq!(state, "done");
+        assert_eq!(
+            item_result(&items, "propose.reorder"),
+            "proposed",
+            "a PARTIAL pending reorder must not count as still-valid coverage"
+        );
+    }
+
+    /// M-1(a) (2026-09-24 review round 3): a FULL-coverage pending reorder
+    /// (AI-produced, via `AiSink::submit` directly) makes propose's blanket
+    /// skip fire — `propose.reorder == "skipped"`, proposal count unchanged.
+    /// This is the positive control `trigger_propose_dedup_requires_exact_
+    /// reorder_coverage` above never exercised (that test only proves a
+    /// PARTIAL pending reorder does NOT block); without a test asserting the
+    /// literal `"skipped"` string, `skip_reorder`/`skip_create` could be
+    /// hard-coded to `false` (turning `Skipped` into `Nothing` everywhere)
+    /// and all 321 pre-existing tests would stay green. Mutation target:
+    /// `dedup_propose`'s reorder loop body changed to a no-op (`skip_reorder`
+    /// stays `false`) — this test alone must go red.
+    #[tokio::test]
+    async fn trigger_propose_dedup_full_coverage_reorder_is_skipped() {
+        let (app, _sink, store) = test_app_with_store().await;
+        let target = store.create_week("2026-W41").await.unwrap();
+        let seed = crate::core::Sin90Proposal {
+            id: "seed-w-tasks-61".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![Sin90Op::CreateTasks {
+                week_id: target.id.clone(),
+                tasks: vec![
+                    NewTask {
+                        title: "task a".into(),
+                        direction_id: None,
+                    },
+                    NewTask {
+                        title: "task b".into(),
+                        direction_id: None,
+                    },
+                ],
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&seed).await.unwrap();
+        store.apply_proposal(&seed.id).await.unwrap();
+        let task_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM sin90_tasks WHERE week_id = ? ORDER BY sort_key ASC",
+        )
+        .bind(&target.id)
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+
+        // A FULL-coverage reorder (both of W's tasks, just swapped) —
+        // AI-produced via `AiSink::submit` directly, simulating a prior
+        // run's output without needing a real model.
+        let full_reorder = crate::ai::ProposalDraft {
+            id: "full-reorder-61".into(),
+            ops: vec![Sin90Op::ReorderTasks {
+                week_id: target.id.clone(),
+                order: vec![task_ids[1].clone(), task_ids[0].clone()],
+            }],
+            rationale: None,
+        };
+        let rec = crate::ai::AiCallRecord {
+            id: "call-full-reorder-61".into(),
+            run_id: "run-seed-61".into(),
+            task_kind: Capability::Propose,
+            engine: crate::ai::Engine::Reflex,
+            fallback_from: None,
+            served_tier: None,
+            model_id: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            latency_ms: 0,
+            ok: true,
+            error_kind: None,
+            proposal_id: None,
+            at: "2026-09-24T00:00:00Z".into(),
+        };
+        crate::ai::AiSink::submit(&store, Capability::Propose, full_reorder, rec)
+            .await
+            .unwrap();
+        let proposals_before = store.list_pending_proposals().await.unwrap().len();
+
+        let run = body_json(
+            app.clone()
+                .oneshot(automation_req(
+                    "POST",
+                    "/ai/propose",
+                    json!({"week_id": target.id}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let (state, items) = poll_run_to_done(&app, run["run_id"].as_str().unwrap()).await;
+        assert_eq!(state, "done");
+        assert_eq!(item_result(&items, "propose.reorder"), "skipped");
+        let proposals_after = store.list_pending_proposals().await.unwrap().len();
+        assert_eq!(
+            proposals_before, proposals_after,
+            "a blanket-skipped reorder must not have submitted anything new"
+        );
+    }
+
+    /// M-2 (2026-09-24 review round 3, design §11.4.3): dedup only ever
+    /// considers AI-PRODUCED proposals — a same-shape reorder a HUMAN
+    /// submitted directly through `POST /proposals` (never touching
+    /// `sin90_ai_calls`) must NOT block a fresh AI decision, even though its
+    /// shape and coverage are identical to the AI-produced case above.
+    #[tokio::test]
+    async fn trigger_propose_dedup_ignores_human_submitted_same_shape_reorder() {
+        let (app, _sink, store) = test_app_with_store().await;
+        let target = store.create_week("2026-W42").await.unwrap();
+        let seed = crate::core::Sin90Proposal {
+            id: "seed-w-tasks-62".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![Sin90Op::CreateTasks {
+                week_id: target.id.clone(),
+                tasks: vec![
+                    NewTask {
+                        title: "task a".into(),
+                        direction_id: None,
+                    },
+                    NewTask {
+                        title: "task b".into(),
+                        direction_id: None,
+                    },
+                ],
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&seed).await.unwrap();
+        store.apply_proposal(&seed.id).await.unwrap();
+        let task_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM sin90_tasks WHERE week_id = ? ORDER BY sort_key ASC",
+        )
+        .bind(&target.id)
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+
+        // A FULL-coverage reorder submitted the HUMAN way — `store.
+        // submit_proposal` directly, exactly what `POST /proposals` itself
+        // calls — never touches `sin90_ai_calls` at all.
+        let human_reorder = crate::core::Sin90Proposal {
+            id: "human-reorder-62".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![Sin90Op::ReorderTasks {
+                week_id: target.id.clone(),
+                order: vec![task_ids[1].clone(), task_ids[0].clone()],
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&human_reorder).await.unwrap();
+
+        let run = body_json(
+            app.clone()
+                .oneshot(automation_req(
+                    "POST",
+                    "/ai/propose",
+                    json!({"week_id": target.id}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let (state, items) = poll_run_to_done(&app, run["run_id"].as_str().unwrap()).await;
+        assert_eq!(state, "done");
+        assert_ne!(
+            item_result(&items, "propose.reorder"),
+            "skipped",
+            "a human-submitted same-shape proposal must never block the AI's own dedup"
+        );
+    }
+
+    /// M-2's second clause (2026-09-24 review round 3, §11.4.3): a pending
+    /// AI-produced CREATE proposal is "still valid" only while its target
+    /// Direction remains a current gap — once that Direction is abandoned,
+    /// the pending create is no longer treated as covering anything (skip_
+    /// create flips back to `false`). Verified via the OBSERVABLE
+    /// difference: round 1 (D still a gap) → `"skipped"`; round 2 (D
+    /// abandoned) → NOT skipped (`"nothing"`, since T5.1.2's only production
+    /// path, `model = None`, never actually produces a NEW create either way
+    /// — reflex has no create step — but the skip itself must lift).
+    #[tokio::test]
+    async fn trigger_propose_dedup_create_no_longer_skipped_after_direction_abandoned() {
+        let (app, _sink, store) = test_app_with_store().await;
+        let direction = store
+            .create_direction("Health", "2026-Q4", None)
+            .await
+            .unwrap();
+        crate::store::test_hooks::insert_rhythm(&store, "rhythm-62")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE sin90_rhythms SET allocations = ? WHERE id = ?")
+            .bind(
+                serde_json::to_string(&vec![crate::core::Alloc {
+                    direction_id: direction.id.clone(),
+                    pct: 100,
+                }])
+                .unwrap(),
+            )
+            .bind("rhythm-62")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let target = store.create_week("2026-W43").await.unwrap();
+
+        let pending_create = crate::ai::ProposalDraft {
+            id: "pending-create-63".into(),
+            ops: vec![Sin90Op::CreateTasks {
+                week_id: target.id.clone(),
+                tasks: vec![NewTask {
+                    title: "new task under Health".into(),
+                    direction_id: Some(direction.id.clone()),
+                }],
+            }],
+            rationale: None,
+        };
+        let rec = crate::ai::AiCallRecord {
+            id: "call-pending-create-63".into(),
+            run_id: "run-seed-63".into(),
+            task_kind: Capability::Propose,
+            engine: crate::ai::Engine::Reflex,
+            fallback_from: None,
+            served_tier: None,
+            model_id: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            latency_ms: 0,
+            ok: true,
+            error_kind: None,
+            proposal_id: None,
+            at: "2026-09-24T00:00:00Z".into(),
+        };
+        crate::ai::AiSink::submit(&store, Capability::Propose, pending_create, rec)
+            .await
+            .unwrap();
+
+        // Round 1: D is still a gap — the pending create is skipped.
+        let run1 = body_json(
+            app.clone()
+                .oneshot(automation_req(
+                    "POST",
+                    "/ai/propose",
+                    json!({"week_id": target.id}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let (state1, items1) = poll_run_to_done(&app, run1["run_id"].as_str().unwrap()).await;
+        assert_eq!(state1, "done");
+        assert_eq!(item_result(&items1, "propose.create"), "skipped");
+
+        // D is abandoned — no longer a gap Direction at all.
+        sqlx::query("UPDATE sin90_directions SET status = 'abandoned' WHERE id = ?")
+            .bind(&direction.id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let run2 = body_json(
+            app.clone()
+                .oneshot(automation_req(
+                    "POST",
+                    "/ai/propose",
+                    json!({"week_id": target.id}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let (state2, items2) = poll_run_to_done(&app, run2["run_id"].as_str().unwrap()).await;
+        assert_eq!(state2, "done");
+        assert_ne!(
+            item_result(&items2, "propose.create"),
+            "skipped",
+            "an abandoned Direction's pending create must no longer count as still-valid coverage"
+        );
+    }
+
+    /// M-b (2026-09-24 review round 4, design §11.4.3): create's dedup is
+    /// PER-DIRECTION — a pending create naming TWO directions {A, B} only
+    /// excludes the ones STILL a gap, not all-or-nothing for the whole
+    /// draft. B stops being a gap (a task lands in W under it, outside
+    /// propose entirely); A remains genuinely covered. A fresh gap C (never
+    /// mentioned by anything pending) must still be offered — dedup must
+    /// NOT blanket-skip create just because SOME of its directions are
+    /// stale. Calls `dedup_propose` DIRECTLY (not through a full trigger):
+    /// `model = None`'s production path can never observe the difference
+    /// between "blanket skipped" and "A excluded, C still offered" (reflex
+    /// never creates either way).
+    ///
+    /// Mutation target: `dedup_propose`'s `skip_create = ... .all(|g| ...)`
+    /// changed to `.any(...)` — `excluded_create_direction_ids` contains
+    /// `A`, and `.any()` over `{A, C}` finds that ONE match and wrongly
+    /// flips `skip_create` to `true` even though `C` is still wide open;
+    /// this test's `assert!(!dedup.skip_create, ...)` goes red.
+    #[tokio::test]
+    async fn dedup_propose_excludes_create_directions_per_item_not_all_or_nothing() {
+        let (_app, _sink, store) = test_app_with_store().await;
+        let direction_a = store.create_direction("A", "2026-Q4", None).await.unwrap();
+        let direction_b = store.create_direction("B", "2026-Q4", None).await.unwrap();
+        let direction_c = store.create_direction("C", "2026-Q4", None).await.unwrap();
+        crate::store::test_hooks::insert_rhythm(&store, "rhythm-abc")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE sin90_rhythms SET allocations = ? WHERE id = ?")
+            .bind(
+                serde_json::to_string(&vec![
+                    crate::core::Alloc {
+                        direction_id: direction_a.id.clone(),
+                        pct: 100,
+                    },
+                    crate::core::Alloc {
+                        direction_id: direction_b.id.clone(),
+                        pct: 100,
+                    },
+                    crate::core::Alloc {
+                        direction_id: direction_c.id.clone(),
+                        pct: 100,
+                    },
+                ])
+                .unwrap(),
+            )
+            .bind("rhythm-abc")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let target = store.create_week("2026-W45").await.unwrap();
+
+        // B stops being a gap: a task lands in W under it (a normal
+        // `CreateTasks`, nothing to do with propose's own dedup).
+        let seed_b = crate::core::Sin90Proposal {
+            id: "seed-under-b".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![Sin90Op::CreateTasks {
+                week_id: target.id.clone(),
+                tasks: vec![NewTask {
+                    title: "already under B".into(),
+                    direction_id: Some(direction_b.id.clone()),
+                }],
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&seed_b).await.unwrap();
+        store.apply_proposal(&seed_b.id).await.unwrap();
+
+        // A pending AI-produced create naming BOTH A and B.
+        let pending = crate::ai::ProposalDraft {
+            id: "pending-create-ab".into(),
+            ops: vec![Sin90Op::CreateTasks {
+                week_id: target.id.clone(),
+                tasks: vec![
+                    NewTask {
+                        title: "new under A".into(),
+                        direction_id: Some(direction_a.id.clone()),
+                    },
+                    NewTask {
+                        title: "new under B".into(),
+                        direction_id: Some(direction_b.id.clone()),
+                    },
+                ],
+            }],
+            rationale: None,
+        };
+        let rec = crate::ai::AiCallRecord {
+            id: "call-pending-create-ab".into(),
+            run_id: "run-seed-ab".into(),
+            task_kind: Capability::Propose,
+            engine: crate::ai::Engine::Reflex,
+            fallback_from: None,
+            served_tier: None,
+            model_id: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            latency_ms: 0,
+            ok: true,
+            error_kind: None,
+            proposal_id: None,
+            at: "2026-09-24T00:00:00Z".into(),
+        };
+        crate::ai::AiSink::submit(&store, Capability::Propose, pending, rec)
+            .await
+            .unwrap();
+
+        let dedup = crate::http::ai_propose::dedup_propose(&store, &target)
+            .await
+            .unwrap();
+        assert!(
+            dedup
+                .excluded_create_direction_ids
+                .contains(&direction_a.id),
+            "{dedup:?}"
+        );
+        assert!(
+            !dedup
+                .excluded_create_direction_ids
+                .contains(&direction_b.id),
+            "B was never a gap to begin with — nothing to exclude: {dedup:?}"
+        );
+        assert!(
+            !dedup.skip_create,
+            "C is still a genuinely uncovered gap — must NOT blanket-skip create: {dedup:?}"
+        );
+    }
+}
