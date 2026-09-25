@@ -18,7 +18,10 @@ pub mod repo;
 
 pub use attention::{AttentionRow, WeekAttention};
 pub use packs::{five_life_systems, SeedArea};
-pub use repo::{AppliedProposal, ApplyOutcome, EventRow, RoutineUpdate, StoredProposal, TodayView};
+pub use repo::{
+    AppliedProposal, ApplyOutcome, EventRow, RoutineFireOutcome, RoutineUpdate, StoredProposal,
+    TodayView,
+};
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
@@ -290,6 +293,38 @@ pub mod test_hooks {
         .bind(id)
         .execute(store.pool())
         .await?;
+        Ok(())
+    }
+
+    // ----- T3.2.2 routine_fires peeks -------------------------------------
+
+    /// Total `sin90_routine_fires` rows for one `routine_id` — used by the
+    /// "same fire_id recorded twice collapses to one row" test and its
+    /// positive control ("two distinct fire_ids leave two rows").
+    pub async fn routine_fire_count(store: &Sin90Store, routine_id: &str) -> Result<i64> {
+        Ok(
+            sqlx::query("SELECT COUNT(*) AS n FROM sin90_routine_fires WHERE routine_id = ?")
+                .bind(routine_id)
+                .fetch_one(store.pool())
+                .await?
+                .get::<i64, _>("n"),
+        )
+    }
+
+    /// Backdate one `sin90_routine_fires` row's `received_at` via raw SQL —
+    /// the only way a test can put a fire receipt "yesterday" for
+    /// `today_view`'s fired-routines section without sleeping past a UTC day
+    /// boundary (mirrors `set_task_created_at` above).
+    pub async fn set_routine_fire_received_at(
+        store: &Sin90Store,
+        fire_id: &str,
+        received_at: &str,
+    ) -> Result<()> {
+        sqlx::query("UPDATE sin90_routine_fires SET received_at = ? WHERE fire_id = ?")
+            .bind(received_at)
+            .bind(fire_id)
+            .execute(store.pool())
+            .await?;
         Ok(())
     }
 }

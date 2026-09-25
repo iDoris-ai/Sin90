@@ -138,6 +138,7 @@ manifest 的 `impl_kind: out_of_process_provider` 必须**同时**带 `spawn: {c
 | 13 | Domain Logic 不 import Agent24，只有 adapter 知道 | **采纳原则，改造形态** | 见 §4——物理分模块采纳；"standalone 与 Agent24 双轨部署"**拒绝**，它与 T11 验收标准打架。 |
 | 14 | M0-M11 里程碑表 | **改造** | GPT 的 M0（"数据模型+SQLite+Event"）内核早就有了，照它排会先把已有能力退化再补回来。重排见 §5。 |
 | 15 | outbox 状态扩为 `pending\|done\|failed`（T3.3.1） | **采纳** | `sin90_outbox` 原状态只有 `pending\|done`，表达不了"这条对账意图已经永久失败，不该再重试"。加 `failed` + `failure_kind`/`last_error`/`attempts`/`next_attempt_at` 四列（迁移 `0005_outbox_failed.sql`，纯加列，`status` 本来就没有 CHECK，见 §1.2；编号占 `0005` 而非 spec.md 原分配的 `0006`——T3.2.2 尚未开工，`0005_routine_fires.sql` 还不存在，留空洞会让 T3.2.2 之后落地一个编号更小却更晚出现的迁移，见迁移文件自身注释与 `outbox_migrations_are_contiguous_no_gaps` 测试）。错误分类（spec.md "错误处理"）：**永久**（`forbidden`/`quota_exceeded`/`invalid_params`）→ `failed`，在 `/today` 暴露，Routine 下次变更时重置为 `pending`；**可重试**（`rate_limited`/`busy`/`timeout`/断连/`not_ready`/`draining`）→ 退避后重试，`next_attempt_at` 记录何时可再试。对账落地（T3.3.2）不在本条范围。 |
+| 16 | fired 投递去重表 `sin90_routine_fires`（T3.2.2） | **采纳** | 内核调度是**至少一次**投递、同一次到点的重试共用 `fire_id`（Agent24 `docs/design/ME4-S1-scheduler-callback.md` §4.1/§4.2）——Sin90 侧必须按 `fire_id` 幂等去重，否则一次到点的重试会被记成多次 `routine.fired`。表只做去重记录，不做内核那边已有的状态机/重试/退避（那些留在内核的 `schedule_deliveries`，spec.md M3 "fired"）：`fire_id TEXT PRIMARY KEY, routine_id TEXT NOT NULL REFERENCES sin90_routines(id), scheduled_for TEXT NOT NULL, trigger TEXT NOT NULL CHECK(trigger IN ('tick','run_now')), received_at TEXT NOT NULL`（迁移 `0006_routine_fires.sql`，`spec.md` 原文的列集是 `fire_id, routine_id, scheduled_for, received_at`；`trigger` 是本条新加的——投递 body 里本来就带 `trigger`（内核设计文档 §5.3 `FiredBody`），`(routine_id, 来源)` 各自独立去重/审计时用得上，不加就要在 `payload` JSON 里翻找）。`POST /_a24/scheduler/fired` 只在**挂载模式**注册（architecture.md #4：这条路径的可信性来自内核代理剥掉客户端伪造的 `X-A24-*` 头，standalone 模式没有代理这层）；未知 `key`/已 `retired` 的 routine 一律 200 且不写行不发事件，留给对账器（T3.3.2，未做）处理孤儿——这里不反向调内核。 |
 
 ### 2.1 一处名不副实，值得单独记一笔
 
@@ -213,6 +214,7 @@ CreateTask   { title, direction_id?, parent_task_id?, kind?, energy?, est_minute
 | `sin90_tasks` | + `parent_task_id TEXT REFERENCES sin90_tasks(id)`，+ `idx_sin90_task_parent` | 加列 |
 | `sin90_events` | `entity` 值域扩 `area` / `routine`；schema 不变 | 值域扩展 |
 | `sin90_outbox`（T3.3.1） | `status` 值域扩 `pending\|done\|failed`（无 CHECK，代码约束）；+ `failure_kind TEXT NULL`、`last_error TEXT NULL`、`attempts INTEGER NOT NULL DEFAULT 0`、`next_attempt_at TEXT NULL` | 加列 |
+| `sin90_routine_fires`（T3.2.2） | `fire_id PK, routine_id FK, scheduled_for, trigger CHECK(tick\|run_now), received_at` —— 按 `fire_id` 去重内核的至少一次 fired 投递 | **新** |
 | 其余 8 张 | 不变 | 旧 |
 
 **不做的事**：不重建表、不改现有列类型、不动 `sin90_attention_*` 的水位语义。用户的 `sin90.db` 靠迁移升级，不靠重建（Agent24 §4.3 既有硬约束）。
