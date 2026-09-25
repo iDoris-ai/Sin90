@@ -22,6 +22,7 @@ use tokio::sync::Mutex;
 use crate::http::EventSink;
 
 mod frame;
+mod transport;
 
 /// Upper bound on one callback round trip (reconnect, or write + read the
 /// reply). A kernel that accepts but never answers must not wedge the event
