@@ -787,6 +787,7 @@ T5.1.1 对 `ClientError` 的配套改动（在 adapter 里）：加 `Unavailable
 - **去重（L3）**：触发时跳过已有**仍然有效**挂起提议的目标。「仍然有效」= 现在对那条挂起提议重跑提交前校验的第 1–3 步能通过。由 `AiSink::precheck(cap, &[ProposalDraft]) -> Vec<bool>` **批量**完成：每个 run 开头调用一次，一个 `BEGIN IMMEDIATE`、每条草稿一个 SAVEPOINT（试跑后 ROLLBACK TO），最后 ROLLBACK 整个事务——一次 run 只争一次写锁，不改变任何行。于是：任务已被归类、正文已被人改、目标 Direction 已 abandoned 的挂起提议都不再挡新 run——否则没有拒绝路由（Q6）时，一条过期提议会永久挡住它的目标。**各能力可以在本节「仍然有效」的基础上收紧，见各自小节**（T5.4.1 实现时补，2026-09-24 review L-c）：
   - **classify**：去重不区分挂起提议的来源——人类直接提交的一条同目标 `AssignTaskDirection` 提议，只要仍然有效，**照样挡住** AI 的再分类。这是**有意的**：人对同一个任务已经有一条挂起的分类判断时，不该让 AI 再提一条可能冲突的（两条都指向同一个 inbox 任务，接受一条就会让另一条在 accept 时因为 `NotInInbox` 而失败——避免这个竞争，比"只挡 AI 自己产出的"更保守也更安全，且分类这个能力的挂起提议本来就该只有一条）。
   - **propose**：T5.4.1 走的是相反的口径——去重**只认 AI 自己产出的提议**（§11.4.3 自己的小节详述），人类/automation 直接提交的同形状提议不挡 AI。两个能力选了不同的口径，都是有意的：分类的挂起提议本来就该唯一，人类提交的一条已经"占住"了这个任务，AI 没有必要（也不应该）再抢着提一条冲突的；而 propose 一次周期里人和 AI 都可能各自调整 carry/reorder/create，人类的手工调整不该被当成"AI 已经处理过"从而拦住 AI 继续给建议。
+  - **summarize**（T5.3.1 实现时补，2026-09-26 review M4）：与 classify 相同的口径——去重不区分来源，任何仍然有效的挂起 `DraftReviewBody` 提议都挡住新的一次触发。理由与 classify 不同但结论一致：`DraftReviewBody` 是整篇正文的 CAS 整体替换（§11.2.2），同一个 `base_body_sha256` 上若同时存在两条挂起提议，先被 accept 的那条会把正文摘要往前推进一格，另一条在自己被 accept 时必然因为 `StaleBase` 而失败——两条提议本就不可能同时生效，允许它们并存只是制造必然浪费的挂起行，不是给用户多一个选择。
 
 #### 11.4.1 classify（T5.2.1）
 
@@ -804,7 +805,7 @@ T5.1.1 对 `ClientError` 的配套改动（在 adapter 里）：加 `Unavailable
 #### 11.4.2 summarize（T5.3.1）
 
 - **输入**：`review_id`，必须 `kind = weekly` 且 `status = draft`（否则 409；daily/rhythm 400 `unsupported_kind`）；周 = `period`。
-- **可改写条件（M6/v2.1 M2，🟡 Q7 拍板前占位）**：当前正文为空，**或**与 `render_facts(当前草稿)` **逐字相等**（去尾部空白后比较，scratch `is_program_only(body, current_facts_md)`）。否则不产提议，run 结果记 `skipped: human_text`——`DraftReviewBody` 是整体替换，人写过的字不应出现在「整体改写」提议里。保守的代价：数字块下多出人手写的一行、或旧周数字块（数字已变）都会被当成人写，AI 不再覆盖它。
+- **可改写条件（v2.2，2026-09-26 review C1 定案，取代 v2.1 的 Q7 占位）**：当前正文去尾部空白后为空，或逐字等于下列程序渲染之一（去尾部空白后比较）：① `render_facts(当前草稿)`；② `render_weekly_draft_markdown(当前草稿)`（T4.3.2 自动建的周草稿正文，由 `AiReadModel::weekly_draft` 在同一次读取中一并返回，`ai/` 不自行渲染，见 `ports::SummarizeDraft::auto_draft_md`）。不做模糊匹配：在任一程序渲染上多、少或改一个字符即算人写，run 结果记 `skipped: human_text`——`DraftReviewBody` 是整体替换，人写过的字不应出现在「整体改写」提议里。**T4.3.2 必须在同一事务内、写入自身 `routine.fired` 事件之后渲染草稿**（`store::weekly_draft::weekly_draft_on`/`record_routine_fire` 的实现约束），否则它自己的触发计数会让 ② 永远不与之后任何一次重新读取相等——这正是 C1（critical）发现的 bug：v2.1 只认①、且 T4.3.2 的草稿正文一直是②，两者从未相等过，summarize 因此永远无法接手一份自动创建的草稿。保守的代价（仍然接受）：数字块下多出人手写的一行、或旧周数字块（数字已变，即①②都对不上）都会被当成人写，AI 不再覆盖它。
 - **数字来源**：`AiReadModel` 调 T4.3.1 的周草稿函数得到 `WeeklyDraft`（形状见 §11.1 第 13 条）；另取该周完成任务的标题（至多 50 条 ⚖️），只作为可引用的素材。
 - **「数字只来自草稿」的机制**（scratch `summarize.rs` 已 check + test）：
   1. `facts(draft, title_of)` 把草稿每个数值变成 `Fact{key: "fN", label, value}`，标签里的领域/方向/节律名先过 `sanitize_inline`；`render_facts` 渲染「本周数字」块——**完全由程序生成**。
@@ -968,7 +969,7 @@ CREATE TABLE sin90_settings (
 |---|---|---|---|
 | J17 | `summarize_numbers_come_from_draft` | 固定事件夹具 → 周草稿；桩叙述用 `{{fN}}`/`{{tN}}` → 提议正文包含 `render_facts(草稿)` 原文；正文的**每个数字串都出现在 `render_facts` 输出或代入的任务标题里**（L2） | 负对照（每条都让模型步 `bad_output`、提议来自 reflex（`source = rule`），除非注明）：① `编码 99 小时`、全角 `９９`、`Ⅻ小时`、`&frac12;`；② **标签错位**「编码投入达到{{f2}}」→ 不拒（R1），断言 f2 的数值只出现在 `〔f2 的标签：值〕` 单元内；③ **仿造数字块**「## 本周数字（修正）…」、`本​周数字`（零宽）、`本　周数字`（全角空格）；④ **手写单元**「〔领域「Coding」投入：十八 小时〕」「〔…：翻倍〕，〔完成任务数：全部〕」「「Coding」很忙」；⑤ **量词绕过**「十八 小时」「十八​小时」「十八　小时」「拾捌小时」「{{f3}}小时」「{{f3}} 小时」「{{f3}}​小时」；⑥ **切行绕过**单独 `\r`、U+2028、U+2029；⑦ **占位键**`{{t+1}}`、`{{t01}}`、`{{ f1 }}`、`{{f99}}`；⑧ **标题注入**：标题含 `\r## 伪造标题`、`**加粗** [链接](…) <b>` 与 `〔假：十八小时〕` → 不拒，断言渲染结果单行、`#`/`*` 被转义、`<` 成全角、不含 `〔假`；⑨ 行首 `##`/`-`/`>`/`|`/`<h>` 的叙述 → 不拒，渲染后没有任何行以块语法或 `<` 开头。scratch `round2_bypasses_are_rejected`（25 条）+ `titles_are_sanitized_when_substituted` + `markdown_and_html_flattened`。变异：删掉 `RESERVED` 检查 / `normalize` / 控制字符检查 / `sanitize_inline` → 各自对应断言变红 |
 | J18 | `draft_review_body_validate_` / `_cas_` | D1–D7 各一正一反；挂起期间人类 `PATCH` 正文 → accept 422 `StaleBase`、正文仍是人写的 | 无人改 → accept 200、正文 == 提议正文、`review.updated` 恰好 1 条、payload 形状与人类路径相同 |
-| J19 | `summarize_preconditions` | finalized → 409；daily → 400；正文含人写文字（含「数字块下多一行」、旧周数字块）→ 不产提议、run 结果 `skipped: human_text`；定稿后再 accept 旧提议 → 422 `ReviewNotDraft` | 正文为空、或与 `render_facts(当前草稿)` 逐字相等 → 产出提议 |
+| J19 | `summarize_preconditions` | finalized → 409；daily → 400；正文含人写文字（含「数字块下多一行」、旧周数字块，即①②都对不上）→ 不产提议、run 结果 `skipped: human_text`；定稿后再 accept 旧提议 → 422 `ReviewNotDraft` | 正文为空、或逐字等于 ①`render_facts(当前草稿)` 或 ②`render_weekly_draft_markdown(当前草稿)`（T4.3.2 自动草稿）之一 → 产出提议；C1 端到端正对照：review 节律到点自动建草稿（正文=②）→ 触发 summarize → 直接产出提议，不被误判为人写 |
 
 **T5.4.1 propose**
 
@@ -1042,9 +1043,13 @@ CREATE TABLE sin90_settings (
 - `POST /ai/classify`（`task_ids` > 20 → 400）。测试 J11–J16。
 - tasks.md T5.2.1 的「`source = local_brain`」文字应同步为「`source` 由产出引擎决定（`local_brain`/`executive`/`rule`）」——在规划分支，由统筹改。
 
-**T5.3.1 summarize**（依赖 T4.3.1 的周草稿函数）
-- `Sin90Op::DraftReviewBody`、`MAX_REVIEW_BODY_BYTES`、`body_sha256`；`apply_op` 分支（`review.updated`，payload 同人类路径）。
-- `src/ai/summarize.rs`：`Fact`、`facts`、`render_unit`、`render_facts`、`is_forbidden_control`、`is_format_char`（Cf 码位表）、`normalize`、`sanitize_inline`、`fill_narrative(narr, facts, titles)`、`compose_body`、`is_program_only(body, current_facts_md)`、`digit_runs`、`MEASURE`；`AiReadModel::{review, weekly_draft, done_titles}`。
+**T5.3.1 summarize**（依赖 T4.3.1 的周草稿函数；2026-09-26 review 后按层拆成三个 stacked 分支：`-store` → `-core` → 顶层）
+- `Sin90Op::DraftReviewBody`、`MAX_REVIEW_BODY_BYTES`、`body_sha256`；`apply_op` 分支（`review.updated`，payload 同人类路径）——T5.2.1 已随 `AssignTaskDirection` 一并落地。
+- `store/weekly_draft.rs`：`weekly_draft_on(conn, week)`/`direction_area_snapshot_on(conn)`（C1 修复：接受任意连接，`Sin90Store::weekly_draft` 与 `record_routine_fire` 共用同一份查询）；`store/attention.rs`：`attention_on(conn, start, end)` 同理抽出。`record_routine_fire` 改为先 `append_event("routine","fired")` 再在同一个 `&mut tx` 上渲染草稿。
+- `src/ai/ports.rs`：`SummarizeDraft{week, by_area, by_direction, tasks_done, routines, auto_draft_md}`、`SummarizeBucket{label: Option<String>, minutes}`、`SummarizeRoutineRow{label, fired, completed}`（ai 自己的周草稿词汇，标题已解析，不是 `store::weekly_draft::WeeklyDraft` 本身）；`AiReadModel::{review, weekly_draft, done_titles}`。
+- `src/ai/summarize.rs`：`Fact`、`facts`、`render_unit`、`render_facts`、`is_forbidden_control`、`is_format_char`（Cf 码位表）、`normalize`、`sanitize_inline`、`fill_narrative(narr, facts, titles)`、`compose_body`、`is_program_only(body, candidates: &[&str])`（v2.2：多候选，见 §11.4.2 的「可改写条件」）、`digit_runs`、`MEASURE`（`CJK_NUMERALS` 含繁体 兩/貳/參/陸/億 与俗写 廿/卅/卌）；`build_summarize_request`/`summarize_schema`/`parse_summarize_reply`/`select_review`/`run_summarize`。
+- `store/ai_port.rs`：`AiReader::weekly_draft`（调 `weekly_draft_on` 取数字 + `resolve_label` 解析标题回退 id + `render_weekly_draft_markdown` 填 `auto_draft_md`）、`AiReader::done_titles`；`allowed_ops(Summarize) = {DraftReviewBody}`。
+- `http/ai_runs.rs`：`AiRunItem` 加 `reason: Option<&'static str>`（`"human_text"`/`"dedup"`，2026-09-26 review M2）。
 - `POST /ai/summarize`。测试 J17–J19。
 - 给 T4.3.1：按 Direction/Area 统计完成任务时按 §11.2.1 的三步规则取归属。
 

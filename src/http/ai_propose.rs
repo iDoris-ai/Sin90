@@ -131,6 +131,10 @@ pub async fn trigger_propose(
             .map(|o| AiRunItem {
                 target: o.kind.as_str().to_string(),
                 result: item_result_str(&o.result).to_string(),
+                // M2 (2026-09-26 review): propose's own `Skipped` IS
+                // dedup — the only way this capability's item-level result
+                // can be "skipped" (§11.4 公共's "去重").
+                reason: matches!(o.result, ProposeItemResult::Skipped).then_some("dedup"),
             })
             .collect();
 

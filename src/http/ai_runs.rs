@@ -28,6 +28,16 @@ const MAX_TRACKED_RUNS: usize = 64;
 pub struct AiRunItem {
     pub target: String,
     pub result: String,
+    /// 2026-09-26 review (M2): WHY `result == "skipped"` — `"human_text"`
+    /// (design §11.4.2's Q7 gate: the body has human-written content) or
+    /// `"dedup"` (design §11.4 公共's "去重": a still-valid pending proposal
+    /// of this shape already covers the target). `None` for every other
+    /// result (including a non-skip outcome, and for capabilities that
+    /// compute their own dedup-skip without going through this field yet).
+    /// Serialized only when present — `GET /ai/runs/{id}`'s existing
+    /// consumers see no new field on an item this doesn't apply to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]

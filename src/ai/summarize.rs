@@ -4,26 +4,38 @@
 //! reference those numbers ONLY through `{{fN}}`/`{{tN}}` placeholders the
 //! program itself renders, never a digit the model typed.
 //!
-//! **Layer B of 3** (2026-09-26 review, stacked as `feat/t5.3.1a-summarize-
-//! store` → `feat/t5.3.1b-summarize-core` → `feat/t5.3.1-summarize`): this
-//! file currently holds only the CORE pure functions — the "数字只来自草稿"
-//! mechanism itself ([`facts`] through [`digit_runs`]) — ported from the
-//! frozen design's scratch crate `t501-check/src/summarize.rs` (§11.12, "已
-//! check + test") and adapted to this crate's real [`SummarizeDraft`] shape
-//! (`ai::ports`, resolved titles + `auto_draft_md`, not the scratch's
-//! placeholder tuples). The request/parse/rationale/run-driver half (Layer
-//! C) is added on top by a later commit on `feat/t5.3.1-summarize`.
+//! Stacked across three branches (2026-09-26 review): `feat/t5.3.1a-
+//! summarize-store` (the store-side plumbing — `weekly_draft_on`,
+//! `SummarizeDraft`/`auto_draft_md`, `AiReadModel::{weekly_draft,
+//! done_titles}`) → `feat/t5.3.1b-summarize-core` (this file's CORE pure
+//! functions, [`facts`] through [`digit_runs`] — the "数字只来自草稿"
+//! mechanism itself, ported from the frozen design's scratch crate
+//! `t501-check/src/summarize.rs`, §11.12) → `feat/t5.3.1-summarize` (this
+//! commit: the request/parse/rationale pieces and the [`run_summarize`]
+//! driver that ties the ladder, `AiReadModel`, and `AiSink` together — same
+//! shape `ai::classify`/`ai::propose` already established for their own
+//! capabilities).
 //!
-//! `facts()` is the one function whose SHAPE had to change from the scratch
-//! signature: this crate's real weekly draft carries raw ids, not resolved
-//! titles, and `ai/` cannot look one up itself (§11.5: it may not name
-//! `crate::store`). [`ports::AiReadModel::weekly_draft`]'s store-side
-//! implementation does that id→title join and hands back [`ports::
+//! `facts()` is the one CORE function whose SHAPE had to change from the
+//! scratch signature: this crate's real weekly draft carries raw ids, not
+//! resolved titles, and `ai/` cannot look one up itself (§11.5: it may not
+//! name `crate::store`). [`ports::AiReadModel::weekly_draft`]'s store-side
+//! implementation does that id→title join (and fills in `auto_draft_md`,
+//! T4.3.2's own rendering of the SAME draft) and hands back [`ports::
 //! SummarizeDraft`] instead — `facts()` here takes that directly, with no
 //! `title_of` closure (the scratch signature `facts(draft, title_of)` is not
 //! reachable from this module at all).
 
-use super::ports::SummarizeDraft;
+use serde::Deserialize;
+use serde_json::{json, Map, Value};
+
+use crate::core::{body_sha256, Review, ReviewKind, ReviewStatus, Sin90Op};
+
+use super::ladder::{plan, run_item, Outcome, RunState};
+use super::ports::{
+    AiReadModel, AiSink, Capability, Complexity, Engine, ModelAccess, ModelMessage, ModelPort,
+    ModelReply, ModelRequest, ProposalDraft, Role, SinkError, SummarizeDraft,
+};
 
 // ==================================================================== facts
 
@@ -396,6 +408,332 @@ pub fn digit_runs(s: &str) -> Vec<String> {
     v
 }
 
+// ---------------------------------------------------------------- model step
+
+const SUMMARIZE_SYSTEM_PROMPT: &str = "You are writing the narrative paragraph(s) of a weekly \
+review. Never type a digit yourself, including Chinese numerals — to reference a number, use the \
+placeholder {{fN}} exactly as given; to reference a completed task, use {{tN}}. Never type the \
+brackets 〔〕「」 yourself, only the program may render them. Do not use headings, lists, tables, \
+quotes, or HTML — plain paragraphs only. Avoid \"Chinese-numeral + measure-word\" phrasing like \
+\"这一周\"/\"一个\"/\"一次\" even for everyday counts that are not from the facts — prefer \"本周\"/\
+\"某个\"/\"再次\" instead. Respond with JSON only, matching the given schema.";
+
+/// `response_format`'s JSON schema (§11.4.2): `{narrative: string ≤ 2000}`,
+/// `additionalProperties: false`. The `maxLength` here is a hint a local
+/// model may not honor — [`fill_narrative`] re-checks [`MAX_NARRATIVE_CHARS`]
+/// itself regardless (same posture `ai::propose`'s own H2/L2 note gives its
+/// new-task title length check).
+#[must_use]
+pub fn summarize_schema() -> Map<String, Value> {
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "narrative": {"type": "string", "maxLength": MAX_NARRATIVE_CHARS}
+        },
+        "required": ["narrative"]
+    });
+    match schema {
+        Value::Object(m) => m,
+        _ => unreachable!("json!({{...}}) always builds a Value::Object"),
+    }
+}
+
+#[must_use]
+pub fn build_summarize_request(fs: &[Fact], titles: &[String], engine: Engine) -> ModelRequest {
+    let schema = summarize_schema();
+    let facts_json: Vec<Value> = fs
+        .iter()
+        .map(|f| json!({"key": f.key, "label": f.label, "value": f.value}))
+        .collect();
+    let titles_json: Vec<Value> = titles
+        .iter()
+        .enumerate()
+        .map(|(i, t)| json!({"key": format!("t{}", i + 1), "title": t}))
+        .collect();
+    let user = json!({"facts": facts_json, "tasks": titles_json}).to_string();
+    ModelRequest {
+        messages: vec![
+            ModelMessage {
+                role: Role::System,
+                content: SUMMARIZE_SYSTEM_PROMPT.to_string(),
+            },
+            ModelMessage {
+                role: Role::User,
+                content: user,
+            },
+        ],
+        schema_name: "sin90_summarize",
+        schema,
+        max_tokens: 1024,
+        complexity: if engine == Engine::Executive {
+            Complexity::Complex
+        } else {
+            Complexity::Simple
+        },
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelNarrative {
+    narrative: String,
+}
+
+/// Tolerates ONE layer of a ```` ```json ```` (or bare ```` ``` ````) fence —
+/// same convention `ai::classify::strip_json_fence` uses, kept as its own
+/// tiny copy (design §11.4.2's own precedent for `ai::propose::clean_ai_text`
+/// vs. `is_cf_format_char`: a three-line fence-stripper is not worth sharing
+/// across files, unlike a Unicode table).
+fn strip_json_fence(s: &str) -> &str {
+    let t = s.trim();
+    for prefix in ["```json", "```"] {
+        if let Some(rest) = t.strip_prefix(prefix) {
+            return rest.strip_suffix("```").unwrap_or(rest).trim();
+        }
+    }
+    t
+}
+
+/// The program's recheck of the model's reply (§11.4.2): malformed JSON, an
+/// unknown field, or a narrative [`fill_narrative`] rejects all map to the
+/// SAME `Err("bad_output")` — `run_item` records that as a degrade, not a
+/// crash (mirrors `ai::classify::parse_classify_reply`'s own posture).
+pub fn parse_summarize_reply(
+    text: &str,
+    fs: &[Fact],
+    titles: &[String],
+) -> Result<Option<String>, &'static str> {
+    let parsed: ModelNarrative =
+        serde_json::from_str(strip_json_fence(text)).map_err(|_| "bad_output")?;
+    fill_narrative(&parsed.narrative, fs, titles)
+        .map(Some)
+        .map_err(|_e| "bad_output")
+}
+
+// ---------------------------------------------------------------- rationale
+
+fn build_rationale(engine: Engine, produced_narrative: bool) -> String {
+    let reason = if produced_narrative {
+        "drafted this week's review body (facts block + narrative) from the current weekly draft"
+    } else {
+        "drafted this week's review body (facts block only) from the current weekly draft"
+    };
+    format!("{}: {}", engine.as_str(), reason)
+}
+
+// ---------------------------------------------------------------- input
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SummarizeInputError {
+    UnknownReview(String),
+    /// §11.4.2's "输入": only `kind = weekly` is supported — `daily`/`rhythm`
+    /// is a client mistake, not "nothing to summarize this week".
+    UnsupportedKind(ReviewKind),
+    NotDraft(String, ReviewStatus),
+    ReadFailed(String),
+}
+
+/// Resolves and validates the target Review (§11.4.2's "输入") — lives here,
+/// not the HTTP layer, same rationale `classify::select_targets`/
+/// `propose::select_week` give: unit-testable against a fake `AiReadModel`
+/// without a server, and so `POST /ai/summarize`'s handler stays a thin
+/// wrapper.
+pub async fn select_review<R: AiReadModel>(
+    read: &R,
+    review_id: &str,
+) -> Result<Review, SummarizeInputError> {
+    let review = read
+        .review(review_id)
+        .await
+        .map_err(|e| SummarizeInputError::ReadFailed(e.to_string()))?
+        .ok_or_else(|| SummarizeInputError::UnknownReview(review_id.to_string()))?;
+    if review.kind != ReviewKind::Weekly {
+        return Err(SummarizeInputError::UnsupportedKind(review.kind));
+    }
+    if review.status != ReviewStatus::Draft {
+        return Err(SummarizeInputError::NotDraft(
+            review.id.clone(),
+            review.status,
+        ));
+    }
+    Ok(review)
+}
+
+// ---------------------------------------------------------------- run driver
+
+/// §11.4 公共's `items: [{target, result}]` shape for summarize — the HTTP
+/// layer maps this to that wire vocabulary (mirrors `classify::ItemResult`/
+/// `propose::ProposeItemResult`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SummarizeItemResult {
+    /// A proposal was submitted; the id is `sin90_proposals.id`.
+    Proposed(String),
+    /// A decision was reached but the composed body is byte-identical to the
+    /// current one (§11.4.2's "比较并交换") — nothing to propose.
+    Nothing,
+    /// Capacity/budget/deadline hit — left for a later run.
+    Deferred,
+    /// A produced decision failed `AiSink::submit`'s dry run (state moved —
+    /// e.g. the review was finalized in the same run's window).
+    Rejected,
+    /// The run aborted (§11.3.4) before or during this item.
+    Aborted,
+    /// Q7/J19 (§11.4.2's "可改写条件"): the current body is not empty and
+    /// does not exactly match ANY of the program's own renderings (①
+    /// `render_facts`, ② `SummarizeDraft::auto_draft_md`) — this run never
+    /// even called the ladder, let alone the model.
+    Skipped,
+    /// 2026-09-26 review (Low): `AiReadModel::weekly_draft` itself failed —
+    /// distinguishable from [`Self::Nothing`] (a real decision that had
+    /// nothing to add) and [`Self::Skipped`] (Q7's human-text gate): this
+    /// run never even got the numbers to decide anything. Carries the
+    /// read model's own error message for logging/diagnosis. Maps to the
+    /// wire's `"aborted"` (the closed `proposed|nothing|deferred|rejected|
+    /// skipped|aborted` vocabulary has no room for a new word; "this run
+    /// produced nothing because something stopped it" is `aborted`'s own
+    /// meaning) — HTTP layer, `item_result_str`.
+    ReadFailed(String),
+}
+
+/// Runs the whole summarize capability for `review` (§11.4.2). `review` is
+/// assumed already validated `kind = weekly, status = draft` by
+/// [`select_review`] — this function does not re-check either.
+pub async fn run_summarize<M, S, R>(
+    run_id: &str,
+    review: &Review,
+    access: ModelAccess,
+    model: Option<&M>,
+    sink: &S,
+    read: &R,
+) -> SummarizeItemResult
+where
+    M: ModelPort,
+    S: AiSink,
+    R: AiReadModel,
+{
+    let draft = match read.weekly_draft(&review.period).await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(error = %e, review_id = %review.id, "summarize: weekly_draft read failed");
+            return SummarizeItemResult::ReadFailed(e.to_string());
+        }
+    };
+    let fs = facts(&draft);
+    let facts_md = render_facts(&draft.week, &fs);
+
+    // Q7/§11.4.2's "可改写条件" (J19, REVISED 2026-09-26 review C1): checked
+    // BEFORE the ladder ever runs — human text under (or instead of) EITHER
+    // program rendering means this run attempts nothing at all, not even a
+    // reflex-only rewrite. `candidates` is BOTH program renderings of this
+    // SAME draft: `ai::summarize`'s own facts block, and T4.3.2's
+    // `render_weekly_draft_markdown` output (`auto_draft_md`) — a review
+    // auto-created by a Routine firing starts out equal to the SECOND one,
+    // never the first, so checking only `facts_md` (the pre-review shape)
+    // meant summarize could never touch an auto-created draft at all.
+    if !is_program_only(&review.body, &[&facts_md, &draft.auto_draft_md]) {
+        return SummarizeItemResult::Skipped;
+    }
+
+    let titles = read.done_titles(&review.period).await.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, review_id = %review.id, "summarize: done_titles read failed, treating as empty");
+        Vec::new()
+    });
+    let base_body_sha256 = body_sha256(&review.body);
+
+    let settings = read.settings().await.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "summarize: settings read failed, defaulting to executive disabled");
+        Default::default()
+    });
+    let steps = plan(Capability::Summarize, access, settings, model.is_some());
+    let mut st = RunState::new(std::time::Instant::now());
+
+    let fs_for_build = fs.clone();
+    let titles_for_build = titles.clone();
+    let fs_for_parse = fs.clone();
+    let titles_for_parse = titles.clone();
+    let outcome: Outcome<Option<String>> = run_item(
+        run_id,
+        Capability::Summarize,
+        &steps,
+        &mut st,
+        model,
+        sink,
+        read,
+        move |engine| build_summarize_request(&fs_for_build, &titles_for_build, engine),
+        move |reply: &ModelReply| {
+            parse_summarize_reply(&reply.text, &fs_for_parse, &titles_for_parse)
+        },
+        || None, // summarize has no ReflexDecisive step (§11.3.3)
+        // L3-equivalent (design §11.4.2/§11.3.3): reflex ALWAYS has an
+        // answer for summarize — a facts-only body (no narrative) is a
+        // real, completed decision, not "couldn't decide". `Some(None)`:
+        // the OUTER `Some` means "decisive", the inner `None` means "no
+        // narrative" (mirrors `ai::propose`'s own `Some(ProposeDecision {
+        // .. })` always-decisive reflex fallback).
+        || Some(None::<String>),
+        crate::core::now_iso8601,
+        crate::core::ulid,
+    )
+    .await;
+
+    match outcome {
+        Outcome::Produced { value, engine, rec } => {
+            let produced_narrative = value.is_some();
+            let body = compose_body(&facts_md, value.as_deref());
+            let new_hash = body_sha256(&body);
+            if new_hash == base_body_sha256 {
+                // §11.4.2's "比较并交换": identical body -> no proposal, but
+                // the decision itself was real (`ok = 1`, R6's own posture —
+                // `run_item` never writes a `Produced` row itself, §11.3.5's
+                // atomicity, so this IS the one place it gets recorded).
+                if let Err(e) = sink.record_call(rec).await {
+                    tracing::warn!(error = %e, run_id = %run_id, "summarize: failed to record a no-op decision (R6, not fatal)");
+                }
+                return SummarizeItemResult::Nothing;
+            }
+            let draft_op = ProposalDraft {
+                id: format!("ai-summarize-{}", crate::core::ulid()),
+                ops: vec![Sin90Op::DraftReviewBody {
+                    review_id: review.id.clone(),
+                    base_body_sha256: base_body_sha256.clone(),
+                    body,
+                }],
+                rationale: Some(build_rationale(engine, produced_narrative)),
+            };
+            let draft_id = draft_op.id.clone();
+            // M1-style (mirrors classify/propose's own posture): `rec` is
+            // cloned BEFORE `submit` consumes it so there is something left
+            // to record on the error path.
+            let rec_on_failure = rec.clone();
+            match sink.submit(Capability::Summarize, draft_op, rec).await {
+                Ok(()) => SummarizeItemResult::Proposed(draft_id),
+                Err(e) => {
+                    tracing::warn!(error = %e, review_id = %review.id, "summarize: a decision failed submit's dry run (state moved)");
+                    let mut failed = rec_on_failure;
+                    failed.ok = false;
+                    failed.proposal_id = None;
+                    failed.error_kind = Some(match &e {
+                        SinkError::Invalid(_) => "rejected_by_precheck",
+                        SinkError::Store(_) => "submit_store_error",
+                    });
+                    if let Err(record_err) = sink.record_call(failed).await {
+                        tracing::warn!(error = %record_err, review_id = %review.id, "summarize: failed to record a rejected-at-submit call (R6, not fatal)");
+                    }
+                    SummarizeItemResult::Rejected
+                }
+            }
+        }
+        // Unreachable in practice (the reflex fallback above is always
+        // `Some`, so `run_item` never falls through to here) — kept so this
+        // `match` stays exhaustive against `Outcome<T>`'s real shape rather
+        // than assuming the always-decisive property holds forever.
+        Outcome::Nothing => SummarizeItemResult::Nothing,
+        Outcome::Deferred => SummarizeItemResult::Deferred,
+        Outcome::Aborted => SummarizeItemResult::Aborted,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -683,5 +1021,652 @@ mod tests {
         assert_eq!(digit_runs("a12b345c"), vec!["12", "345"]);
         assert_eq!(digit_runs("no digits here"), Vec::<String>::new());
         assert_eq!(digit_runs("7"), vec!["7"]);
+    }
+
+    // ---- parse_summarize_reply: code fence + strict schema -----------------
+
+    #[test]
+    fn summarize_parse_reply_tolerates_one_json_fence() {
+        let wrapped = "```json\n{\"narrative\": \"重点是{{t1}}。\"}\n```";
+        let out = parse_summarize_reply(wrapped, &fs(), &titles()).unwrap();
+        assert_eq!(out.as_deref(), Some("重点是「发布 v0.5」。"));
+    }
+
+    #[test]
+    fn summarize_parse_reply_rejects_unknown_field() {
+        let bad = r#"{"narrative": "ok", "extra": 1}"#;
+        assert_eq!(
+            parse_summarize_reply(bad, &fs(), &titles()),
+            Err("bad_output")
+        );
+    }
+
+    #[test]
+    fn summarize_parse_reply_rejects_malformed_json() {
+        assert_eq!(
+            parse_summarize_reply("not json at all", &fs(), &titles()),
+            Err("bad_output")
+        );
+    }
+
+    // ---- select_review: §11.4.2's "输入" ------------------------------------
+
+    use crate::ai::ports::{AiSettings, ReadError, SettingsRead};
+    use crate::core::{Alloc, DirectionId, Task, Week, WeekId};
+
+    #[derive(Default)]
+    struct FakeRead {
+        review: Option<Review>,
+    }
+    impl SettingsRead for FakeRead {
+        async fn settings(&self) -> Result<AiSettings, ReadError> {
+            Ok(AiSettings::default())
+        }
+    }
+    impl AiReadModel for FakeRead {
+        async fn inbox(&self, _limit: u32) -> Result<Vec<Task>, ReadError> {
+            Ok(Vec::new())
+        }
+        async fn inbox_task(&self, _id: &str) -> Result<Option<Task>, ReadError> {
+            Ok(None)
+        }
+        async fn direction_candidates(
+            &self,
+            _limit: u32,
+        ) -> Result<Vec<super::super::ports::DirectionCandidate>, ReadError> {
+            Ok(Vec::new())
+        }
+        async fn direction(
+            &self,
+            _id: &DirectionId,
+        ) -> Result<Option<super::super::ports::DirectionCandidate>, ReadError> {
+            Ok(None)
+        }
+        async fn title_history(&self, _normalized: &str) -> Result<Vec<DirectionId>, ReadError> {
+            Ok(Vec::new())
+        }
+        async fn review(&self, _id: &str) -> Result<Option<Review>, ReadError> {
+            Ok(self.review.clone())
+        }
+        async fn week_tasks(&self, _week_id: &WeekId) -> Result<Vec<Task>, ReadError> {
+            Ok(Vec::new())
+        }
+        async fn week(&self, _id: &WeekId) -> Result<Option<Week>, ReadError> {
+            Ok(None)
+        }
+        async fn previous_open_week(&self, _iso_week: &str) -> Result<Option<Week>, ReadError> {
+            Ok(None)
+        }
+        async fn rhythm_alloc(&self) -> Result<Vec<Alloc>, ReadError> {
+            Ok(Vec::new())
+        }
+        async fn weekly_draft(&self, _iso_week: &str) -> Result<SummarizeDraft, ReadError> {
+            Ok(SummarizeDraft {
+                week: "2026-W39".into(),
+                by_area: Vec::new(),
+                by_direction: Vec::new(),
+                tasks_done: 0,
+                routines: Vec::new(),
+                auto_draft_md: String::new(),
+            })
+        }
+        async fn done_titles(&self, _iso_week: &str) -> Result<Vec<String>, ReadError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn weekly_review(status: ReviewStatus, kind: ReviewKind) -> Review {
+        Review {
+            id: "r1".into(),
+            kind,
+            status,
+            week_id: None,
+            period: "2026-W39".into(),
+            body: String::new(),
+            body_ref: None,
+            created_at: "2026-09-24T00:00:00Z".into(),
+            updated_at: "2026-09-24T00:00:00Z".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn summarize_preconditions_select_review_accepts_weekly_draft() {
+        let read = FakeRead {
+            review: Some(weekly_review(ReviewStatus::Draft, ReviewKind::Weekly)),
+        };
+        let r = select_review(&read, "r1").await.unwrap();
+        assert_eq!(r.id, "r1");
+    }
+
+    #[tokio::test]
+    async fn summarize_preconditions_select_review_rejects_unknown_daily_and_finalized() {
+        let unknown = FakeRead { review: None };
+        assert_eq!(
+            select_review(&unknown, "nope").await,
+            Err(SummarizeInputError::UnknownReview("nope".into()))
+        );
+
+        let daily = FakeRead {
+            review: Some(weekly_review(ReviewStatus::Draft, ReviewKind::Daily)),
+        };
+        assert_eq!(
+            select_review(&daily, "r1").await,
+            Err(SummarizeInputError::UnsupportedKind(ReviewKind::Daily))
+        );
+
+        let finalized = FakeRead {
+            review: Some(weekly_review(ReviewStatus::Finalized, ReviewKind::Weekly)),
+        };
+        assert_eq!(
+            select_review(&finalized, "r1").await,
+            Err(SummarizeInputError::NotDraft(
+                "r1".into(),
+                ReviewStatus::Finalized
+            ))
+        );
+    }
+
+    // ==================================================================
+    // run_summarize against a REAL Sin90Store/AiReader (same boundary
+    // carve-out `ai::classify`/`ai::propose`'s own `#[cfg(test)] mod tests`
+    // already use, §11.5's checker doc — "单元测试可以用真实 store 建夹具").
+    // ==================================================================
+
+    use crate::ai::{ModelFailure, NoModelPort};
+    use crate::core::{Energy, FireTrigger, NewReview, RoutineKind, ScheduleBlockStatus, TaskKind};
+    use crate::store::Sin90Store;
+    use std::future::Future;
+
+    /// A `ModelPort` that always returns the SAME canned reply/failure —
+    /// same shape `ai::classify`'s own `StubModel` uses.
+    struct StubModel(Result<ModelReply, ModelFailure>);
+    impl ModelPort for StubModel {
+        fn complete(
+            &self,
+            _req: ModelRequest,
+        ) -> impl Future<Output = Result<ModelReply, ModelFailure>> + Send {
+            let r = self.0.clone();
+            async move { r }
+        }
+    }
+
+    fn ok_reply(text: &str) -> ModelReply {
+        ModelReply {
+            text: text.to_string(),
+            model_id: Some("m".into()),
+            tier: crate::ai::ServedTier::Local,
+            prompt_tokens: Some(10),
+            completion_tokens: Some(5),
+        }
+    }
+
+    async fn create_review_routine(store: &Sin90Store) -> crate::core::Routine {
+        store
+            .create_routine(&crate::core::NewRoutine {
+                title: "Weekly review".into(),
+                area_id: None,
+                direction_id: None,
+                kind: RoutineKind::Review,
+                cron: "0 18 * * SUN".into(),
+                tz: None,
+                target_count: None,
+                target_minutes: None,
+            })
+            .await
+            .unwrap()
+    }
+
+    /// J17's own end-to-end claim, against a REAL fixture (2026-09-26 review
+    /// H2: "不再手工构造 SummarizeDraft") — one completed block, one done
+    /// task, driven through the real `AiReader`, then through the FULL
+    /// `run_summarize` with a model producing a narrative that cites both a
+    /// fact and a task title. Every digit in the resulting body must trace
+    /// back to `render_facts`'s own output or a cited task title.
+    #[tokio::test]
+    async fn summarize_numbers_come_from_draft() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let area = store.create_area("Coding").await.unwrap();
+        let direction = store
+            .create_direction("Ship it", "2026-Q4", Some(&area.id))
+            .await
+            .unwrap();
+        let in_week = "2026-09-24T10:00:00Z"; // 2026-W39
+        let block = store
+            .create_block(Some(&direction.id), None, 90)
+            .await
+            .unwrap();
+        store
+            .transition_block(&block.id, ScheduleBlockStatus::Started)
+            .await
+            .unwrap();
+        store
+            .transition_block(&block.id, ScheduleBlockStatus::Completed)
+            .await
+            .unwrap();
+        crate::store::test_hooks::set_last_event_at(&store, "block", &block.id, in_week)
+            .await
+            .unwrap();
+        let task = store
+            .create_task("Ship it v1", None, None, TaskKind::Other, Energy::Mid, None)
+            .await
+            .unwrap();
+        for to in [
+            crate::core::TaskStatus::Planned,
+            crate::core::TaskStatus::InProgress,
+            crate::core::TaskStatus::Done,
+        ] {
+            store.transition_task(&task.id, to).await.unwrap();
+        }
+        crate::store::test_hooks::set_last_event_at(&store, "task", &task.id, in_week)
+            .await
+            .unwrap();
+
+        let review = store
+            .create_review(&NewReview {
+                kind: ReviewKind::Weekly,
+                period: "2026-W39".into(),
+            })
+            .await
+            .unwrap();
+        let reader = store.ai_reader();
+
+        let draft = AiReadModel::weekly_draft(&reader, "2026-W39")
+            .await
+            .unwrap();
+        let f = facts(&draft);
+        let facts_md = render_facts(&draft.week, &f);
+        let model = StubModel(Ok(ok_reply(
+            &json!({"narrative": "编码方向投入{{f1}}，重点推进了{{t1}}。"}).to_string(),
+        )));
+
+        let result = run_summarize(
+            "run-j17",
+            &review,
+            ModelAccess::LocalOnly,
+            Some(&model),
+            &store,
+            &reader,
+        )
+        .await;
+        let SummarizeItemResult::Proposed(id) = result else {
+            panic!("expected Proposed, got {result:?}");
+        };
+        let stored = store.get_proposal(&id).await.unwrap();
+        let [Sin90Op::DraftReviewBody { body, .. }] = stored.ops.as_slice() else {
+            panic!("expected exactly one DraftReviewBody op: {:?}", stored.ops);
+        };
+        assert!(body.contains(&facts_md), "{body}");
+
+        let allowed: Vec<String> = digit_runs(&facts_md)
+            .into_iter()
+            .chain(digit_runs("Ship it v1"))
+            .collect();
+        assert!(
+            digit_runs(body).iter().all(|d| allowed.contains(d)),
+            "every digit in the body must trace back to render_facts or a cited task title: \
+             body={body:?} allowed={allowed:?}"
+        );
+        // Positive control: this isn't vacuous — tampering the body invents
+        // a digit `allowed` does not contain.
+        let tampered = body.replace("1 小时 30 分钟", "9 小时 30 分钟");
+        assert!(!digit_runs(&tampered).iter().all(|d| allowed.contains(d)));
+    }
+
+    /// H2 (2026-09-26 review): the FULL positive path, end to end — a
+    /// model-produced narrative survives `fill_narrative`, gets composed
+    /// with the facts block, and lands in a submitted proposal whose
+    /// `source` is `local_brain` (served locally, no privacy switch
+    /// involved).
+    #[tokio::test]
+    async fn summarize_model_narrative_end_to_end_positive_path() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let review = store
+            .create_review(&NewReview {
+                kind: ReviewKind::Weekly,
+                period: "2026-W39".into(),
+            })
+            .await
+            .unwrap();
+        let reader = store.ai_reader();
+        let model = StubModel(Ok(ok_reply(
+            &json!({"narrative": "本周整体推进顺利，团队保持了良好的节奏。"}).to_string(),
+        )));
+
+        let result = run_summarize(
+            "run-positive",
+            &review,
+            ModelAccess::LocalOnly,
+            Some(&model),
+            &store,
+            &reader,
+        )
+        .await;
+        let SummarizeItemResult::Proposed(id) = result else {
+            panic!("expected Proposed, got {result:?}");
+        };
+
+        let source: String = sqlx::query_scalar("SELECT source FROM sin90_proposals WHERE id = ?")
+            .bind(&id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(source, "local_brain");
+
+        let (engine, ok): (String, bool) = sqlx::query_as(
+            "SELECT engine, ok FROM sin90_ai_calls WHERE run_id = 'run-positive' AND ok = 1",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(engine, "local");
+        assert!(ok);
+    }
+
+    /// H2 (2026-09-26 review): negative controls through the FULL ladder —
+    /// a model reply `fill_narrative` rejects degrades to reflex, and the
+    /// model step's OWN `sin90_ai_calls` row records `bad_output` while the
+    /// final produced proposal's `source` is `rule` (reflex).
+    #[tokio::test]
+    async fn summarize_model_bad_output_degrades_to_reflex_end_to_end() {
+        for bad_narrative in [
+            "编码 99 小时都在写代码。", // literal digit
+            "完成了七个任务。",         // CJK numeral + measure word
+            "〔伪造：十八小时〕",       // hand-written unit
+        ] {
+            let store = Sin90Store::open_memory().await.unwrap();
+            let review = store
+                .create_review(&NewReview {
+                    kind: ReviewKind::Weekly,
+                    period: "2026-W39".into(),
+                })
+                .await
+                .unwrap();
+            let reader = store.ai_reader();
+            let model = StubModel(Ok(ok_reply(
+                &json!({"narrative": bad_narrative}).to_string(),
+            )));
+
+            let result = run_summarize(
+                "run-negative",
+                &review,
+                ModelAccess::LocalOnly,
+                Some(&model),
+                &store,
+                &reader,
+            )
+            .await;
+            let SummarizeItemResult::Proposed(id) = result else {
+                panic!("{bad_narrative:?}: expected Proposed (via reflex), got {result:?}");
+            };
+
+            let source: String =
+                sqlx::query_scalar("SELECT source FROM sin90_proposals WHERE id = ?")
+                    .bind(&id)
+                    .fetch_one(store.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(source, "rule", "{bad_narrative:?}");
+
+            let bad_output_rows: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sin90_ai_calls
+                 WHERE run_id = 'run-negative' AND engine = 'local'
+                   AND ok = 0 AND error_kind = 'bad_output'",
+            )
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+            assert_eq!(bad_output_rows, 1, "{bad_narrative:?}");
+        }
+    }
+
+    // ---- C1 (2026-09-26 review): the auto-draft gate, end to end -----------
+
+    /// The full C1 flow: a review-kind Routine fires, auto-creating a weekly
+    /// draft whose body is T4.3.2's `auto_draft_md` — summarize must be able
+    /// to take that draft over and produce a proposal (candidate ②'s whole
+    /// point).
+    #[tokio::test]
+    async fn summarize_auto_draft_from_routine_fire_can_be_rewritten() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let routine = create_review_routine(&store).await;
+        let outcome = store
+            .record_routine_fire(
+                "fire-1",
+                &format!("routine.{}", routine.id),
+                "2026-09-21T18:00:00Z", // 2026-W39, Monday
+                FireTrigger::Tick,
+            )
+            .await
+            .unwrap();
+        let crate::store::RoutineFireOutcome::Recorded { auto_review, .. } = outcome else {
+            panic!("expected Recorded, got {outcome:?}");
+        };
+        let auto_review = auto_review.expect("must auto-create a draft");
+
+        let reader = store.ai_reader();
+        let review = store.get_review(&auto_review.review_id).await.unwrap();
+        assert!(!review.body.is_empty(), "sanity: the auto-draft has a body");
+
+        let model: Option<&NoModelPort> = None; // reflex-only, same as production today
+        let result = run_summarize(
+            "run-auto-draft",
+            &review,
+            ModelAccess::LocalOnly,
+            model,
+            &store,
+            &reader,
+        )
+        .await;
+        assert!(
+            matches!(result, SummarizeItemResult::Proposed(_)),
+            "the auto-created draft (candidate ②) must be recognized as program-only: {result:?}"
+        );
+    }
+
+    /// A human adding even ONE character under the auto-draft makes it
+    /// human text — no fuzzy matching (§11.4.2's revised "可改写条件").
+    #[tokio::test]
+    async fn summarize_auto_draft_with_human_addition_is_skipped() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let routine = create_review_routine(&store).await;
+        let outcome = store
+            .record_routine_fire(
+                "fire-1",
+                &format!("routine.{}", routine.id),
+                "2026-09-21T18:00:00Z",
+                FireTrigger::Tick,
+            )
+            .await
+            .unwrap();
+        let crate::store::RoutineFireOutcome::Recorded { auto_review, .. } = outcome else {
+            panic!("expected Recorded, got {outcome:?}");
+        };
+        let auto_review = auto_review.unwrap();
+        let original = store.get_review(&auto_review.review_id).await.unwrap();
+        store
+            .update_review_body(&auto_review.review_id, &format!("{}x", original.body))
+            .await
+            .unwrap();
+        let touched = store.get_review(&auto_review.review_id).await.unwrap();
+
+        let reader = store.ai_reader();
+        let model: Option<&NoModelPort> = None;
+        let result = run_summarize(
+            "run-auto-draft-touched",
+            &touched,
+            ModelAccess::LocalOnly,
+            model,
+            &store,
+            &reader,
+        )
+        .await;
+        assert_eq!(result, SummarizeItemResult::Skipped);
+    }
+
+    /// A completed task AFTER the auto-draft was rendered changes the
+    /// numbers `weekly_draft` would now compute — a fresh `auto_draft_md`
+    /// no longer matches the STORED one, so the stored draft is (correctly,
+    /// conservatively) treated as stale human-equivalent text, not silently
+    /// overwritten with numbers the stored draft never claimed (§11.4.2's
+    /// own documented trade-off: "旧数字块（数字已变）也会被当成人写").
+    #[tokio::test]
+    async fn summarize_auto_draft_stale_after_new_completion_is_skipped() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let routine = create_review_routine(&store).await;
+        let outcome = store
+            .record_routine_fire(
+                "fire-1",
+                &format!("routine.{}", routine.id),
+                "2026-09-21T18:00:00Z",
+                FireTrigger::Tick,
+            )
+            .await
+            .unwrap();
+        let crate::store::RoutineFireOutcome::Recorded { auto_review, .. } = outcome else {
+            panic!("expected Recorded, got {outcome:?}");
+        };
+        let auto_review = auto_review.unwrap();
+
+        // A NEW completion, inside the same week, AFTER the draft above was
+        // already rendered and stored.
+        let task = store
+            .create_task("late task", None, None, TaskKind::Other, Energy::Mid, None)
+            .await
+            .unwrap();
+        for to in [
+            crate::core::TaskStatus::Planned,
+            crate::core::TaskStatus::InProgress,
+            crate::core::TaskStatus::Done,
+        ] {
+            store.transition_task(&task.id, to).await.unwrap();
+        }
+        crate::store::test_hooks::set_last_event_at(
+            &store,
+            "task",
+            &task.id,
+            "2026-09-22T09:00:00Z", // still 2026-W39
+        )
+        .await
+        .unwrap();
+
+        let review = store.get_review(&auto_review.review_id).await.unwrap();
+        let reader = store.ai_reader();
+        let model: Option<&NoModelPort> = None;
+        let result = run_summarize(
+            "run-auto-draft-stale",
+            &review,
+            ModelAccess::LocalOnly,
+            model,
+            &store,
+            &reader,
+        )
+        .await;
+        assert_eq!(result, SummarizeItemResult::Skipped);
+    }
+
+    // ---- §11.4.2's "比较并交换" ------------------------------------------
+
+    /// §11.4.2's "比较并交换": re-running against a review whose body is
+    /// ALREADY exactly the reflex fallback's own output (nothing changed
+    /// since) must produce `Nothing`, not a redundant second proposal.
+    #[tokio::test]
+    async fn summarize_no_op_when_body_already_matches_reflex_output() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let review = store
+            .create_review(&NewReview {
+                kind: ReviewKind::Weekly,
+                period: "2026-W39".into(),
+            })
+            .await
+            .unwrap();
+        let reader = store.ai_reader();
+        let model: Option<&NoModelPort> = None;
+
+        let first = run_summarize(
+            "run-1",
+            &review,
+            ModelAccess::LocalOnly,
+            model,
+            &store,
+            &reader,
+        )
+        .await;
+        let SummarizeItemResult::Proposed(proposal_id) = first else {
+            panic!("expected Proposed, got {first:?}");
+        };
+        store.apply_proposal(&proposal_id).await.unwrap();
+        let applied = store.get_review(&review.id).await.unwrap();
+        assert!(applied.body.contains(FACTS_HEADING_WORD));
+
+        let second = run_summarize(
+            "run-2",
+            &applied,
+            ModelAccess::LocalOnly,
+            model,
+            &store,
+            &reader,
+        )
+        .await;
+        assert_eq!(second, SummarizeItemResult::Nothing);
+
+        // Positive control (2026-09-26 review, Low: "改用同一份草稿" — NOT a
+        // different period/week): reset the SAME review's body back to
+        // empty via the ordinary human PATCH path, still `2026-W39`, still
+        // the identical draft numbers — proves `Nothing` above was a real
+        // comparison, not this review always coming back `Nothing`
+        // regardless of body.
+        store.update_review_body(&review.id, "").await.unwrap();
+        let reset = store.get_review(&review.id).await.unwrap();
+        let third = run_summarize(
+            "run-3",
+            &reset,
+            ModelAccess::LocalOnly,
+            model,
+            &store,
+            &reader,
+        )
+        .await;
+        assert!(matches!(third, SummarizeItemResult::Proposed(_)));
+    }
+
+    // ---- Low: weekly_draft read failure is distinguishable -----------------
+
+    /// 2026-09-26 review (Low): a malformed `period` (which `weekly_draft`
+    /// rejects, `store::weekly_draft_on`'s own `StoreError::Invalid`) must
+    /// come back as `ReadFailed`, not silently `Nothing` — the caller
+    /// (`http::ai_summarize`) can tell "nothing to do" apart from "the read
+    /// itself broke".
+    #[tokio::test]
+    async fn summarize_weekly_draft_read_failure_is_distinguishable_from_nothing() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let mut review = store
+            .create_review(&NewReview {
+                kind: ReviewKind::Weekly,
+                period: "2026-W39".into(),
+            })
+            .await
+            .unwrap();
+        // A malformed period `AiReadModel::weekly_draft` will reject —
+        // `select_review` never validates `period` itself (that's a store
+        // invariant from `create_review`), so this simulates a corrupted
+        // row without needing raw SQL.
+        review.period = "not-a-week".into();
+
+        let reader = store.ai_reader();
+        let model: Option<&NoModelPort> = None;
+        let result = run_summarize(
+            "run-read-fail",
+            &review,
+            ModelAccess::LocalOnly,
+            model,
+            &store,
+            &reader,
+        )
+        .await;
+        assert!(
+            matches!(result, SummarizeItemResult::ReadFailed(_)),
+            "{result:?}"
+        );
+        assert_ne!(result, SummarizeItemResult::Nothing);
     }
 }
