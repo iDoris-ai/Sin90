@@ -115,6 +115,53 @@ pub fn canonical_iso_week(s: &str) -> Option<String> {
     Some(format!("{year:04}-W{week:02}"))
 }
 
+/// Canonical `YYYY-MM-DD` calendar date — `Review.period` for `kind: daily`
+/// (design §3.2/§4.1's M4 patch) — or `None` if `s` isn't one. Unlike
+/// [`is_fixed_iso8601`] (a full `...Thh:mm:ssZ` timestamp), a period carries
+/// no time component. Rejects out-of-range months/days, including a Feb 29
+/// on a non-leap year, with the same rigor [`canonical_iso_week`] applies to
+/// week numbers — a loose `chrono::NaiveDate::from_ymd_opt` isn't available
+/// here (`chrono` is dev-only, see `Cargo.toml`'s M6 comment: `core` stays
+/// dependency-free at runtime), so this is a small hand-rolled calendar
+/// check instead.
+pub fn canonical_iso_date(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let digits = |r: std::ops::Range<usize>| -> Option<u32> {
+        let part = &s[r];
+        part.bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| part.parse().ok())
+            .flatten()
+    };
+    let year = digits(0..4)?;
+    let month = digits(5..7)?;
+    let day = digits(8..10)?;
+    if year < 1000 || month == 0 || month > 12 {
+        return None;
+    }
+    if day == 0 || day > days_in_month(year, month) {
+        return None;
+    }
+    Some(format!("{year:04}-{month:02}-{day:02}"))
+}
+
+fn is_leap_year(year: u32) -> bool {
+    year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
+}
+
+fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
 /// Validate a `Routine.cron` expression (design §3.2, M3) the same way
 /// Agent24's `agent24-scheduler` validates a `ScheduleSpec::Cron.expr`
 /// (`agent24-scheduler/src/next_fire.rs::normalize_cron`/`validate`): exactly
@@ -270,6 +317,34 @@ mod tests {
             "2026-09-22T00:00:00Z"
         );
         assert!(is_fixed_iso8601(&day_start_utc(now, &plus7)));
+    }
+
+    #[test]
+    fn iso_date_labels_are_validated() {
+        assert_eq!(
+            canonical_iso_date("2026-09-24").as_deref(),
+            Some("2026-09-24")
+        );
+        // Leap day: 2024 is a leap year, 2026 is not.
+        assert!(canonical_iso_date("2024-02-29").is_some());
+        assert!(canonical_iso_date("2026-02-29").is_none());
+        // Leap-year rule itself: divisible by 100 but not 400 is NOT leap.
+        assert!(canonical_iso_date("2000-02-29").is_some());
+        assert!(canonical_iso_date("1900-02-29").is_none());
+        for bad in [
+            "garbage",
+            "2026-13-01", // month 13
+            "2026-00-01", // month 0
+            "2026-04-31", // April has 30 days
+            "2026-01-32", // day 32
+            "2026-01-00", // day 0
+            "26-01-01",   // 2-digit year
+            "2026-1-01",  // month not zero-padded
+            "2026/01/01", // wrong separator
+            "2026-01-01T00:00:00Z",
+        ] {
+            assert!(canonical_iso_date(bad).is_none(), "{bad} must be rejected");
+        }
     }
 
     #[test]

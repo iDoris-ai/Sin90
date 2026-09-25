@@ -249,15 +249,55 @@ pub struct ScheduleBlock {
     pub updated_at: String,
 }
 
+/// New field (T4.1.1, design §2/§3.2/§4.1 M4 patch): `period` is a Review's
+/// actual identity alongside `kind` — `UNIQUE(kind, period)` (migration
+/// 0007) — replacing `week_id` as the thing that pins a Review to a moment,
+/// since `week_id` can only ever express "this week" and a `daily`/`rhythm`
+/// Review needs a calendar date / rhythm id instead. Shape depends on `kind`
+/// (`core::util::validate_cron`-style per-kind validation lives in
+/// `store::repo::validate_review_period`, since `rhythm`'s shape — "an
+/// existing `Rhythm.id`" — is a relational check, not a pure one):
+///   - `daily`  → `YYYY-MM-DD` ([`crate::core::canonical_iso_date`])
+///   - `weekly` → `YYYY-Www` ([`crate::core::canonical_iso_week`])
+///   - `rhythm` → the referenced [`RhythmId`]
+///
+/// `week_id` is kept (unchanged column, still nullable) for wire/schema
+/// back-compat, but new code never sets it — `period` is now the sole
+/// identity axis.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Review {
     pub id: ReviewId,
     pub kind: ReviewKind,
     pub status: ReviewStatus,
     pub week_id: Option<WeekId>,
+    pub period: String,
     pub body: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// The wire/store shape for creating a [`Review`] (T4.1.1, design §2/§3.2).
+/// `deny_unknown_fields`: client input, same convention as [`NewRoutine`].
+/// `body` is not accepted here — a fresh Review always starts as an empty
+/// draft; use `PATCH /reviews/{id}` ([`ReviewPatch`]) to write its body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewReview {
+    pub kind: ReviewKind,
+    pub period: String,
+}
+
+/// The wire/store shape for `PATCH /reviews/{id}` (T4.1.1): the ONLY thing a
+/// Review patch can change is its `body` — `status` moves only through
+/// `POST /reviews/{id}/finalize` (design's `draft → finalized`, a one-way
+/// door, not a field to overwrite), and `kind`/`period` are a Review's fixed
+/// identity, immutable after creation. Unlike [`RoutinePatch`], `body` is a
+/// single required field, not a double-`Option`: there is no "absent vs.
+/// null vs. set" distinction to make when there is only one field to patch.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewPatch {
+    pub body: String,
 }
 
 /// New (design §2 #6, §3.2, M3): a repeating execution template. `area_id`
@@ -456,5 +496,34 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn new_review_rejects_unknown_fields_and_omits_body() {
+        let err = serde_json::from_str::<NewReview>(
+            r#"{"kind":"daily","period":"2026-09-24","oops":true}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
+
+        // A fresh Review never accepts an initial body through this shape.
+        let err = serde_json::from_str::<NewReview>(
+            r#"{"kind":"daily","period":"2026-09-24","body":"x"}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn review_patch_rejects_unknown_fields_and_requires_body() {
+        let ok: ReviewPatch = serde_json::from_str(r#"{"body":"new text"}"#).unwrap();
+        assert_eq!(ok.body, "new text");
+
+        let err = serde_json::from_str::<ReviewPatch>(r#"{"body":"x","status":"finalized"}"#)
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
+
+        let err = serde_json::from_str::<ReviewPatch>(r#"{}"#).unwrap_err();
+        assert!(err.to_string().contains("missing field"), "{err}");
     }
 }
