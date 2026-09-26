@@ -421,6 +421,58 @@ fn kernel_schedules(d: &Daemon) -> serde_json::Value {
     serde_json::from_str(&body).unwrap()
 }
 
+/// Sin90's own `GET /today` through the real proxy — no gate, side-effect
+/// free (`sin90_mounts_under_a_real_agent24_daemon`'s own readiness probe).
+fn today(d: &Daemon) -> serde_json::Value {
+    let (status, body) = http_get(d.port, Some(&d.token), "/api/v1/sin90/today")
+        .unwrap_or_else(|| panic!("no response from GET /today"));
+    assert_eq!(status, 200, "{body}");
+    serde_json::from_str(&body).unwrap()
+}
+
+/// T3.5.1 review (H1): a restart's own reconcile pass, for a routine the
+/// human just suspended directly on the kernel, is only PROVEN to have run
+/// (and to have taken the `user_suspended` branch, and to have correctly
+/// mapped the kernel's lower-cased key back onto this routine's real,
+/// uppercase id) by an actual, ONLY-reconcile-produced side effect —
+/// `store::Sin90Store::sync_kernel_suspended_routines`, called exclusively
+/// from `adapter_agent24::reconciler::reconcile_full`'s `user_suspended`
+/// branch, is the ONE thing that ever populates `/today`'s
+/// `kernel_suspended_routines`. Polling the KERNEL schedule row's own
+/// `user_suspended` flag instead (as an earlier draft of this test did)
+/// would be nearly vacuous: the kernel's `upsert` never clears
+/// `user_suspended` in the first place (`agent24_protocol::types::Schedule`'s
+/// own doc — only `.../suspend`/`.../resume` do), so that flag would read
+/// `true` after a restart whether or not the reconciler ever ran, or even
+/// whether it ran CORRECTLY.
+fn wait_for_today_kernel_suspended(
+    d: &Daemon,
+    routine_id: &str,
+    timeout: Duration,
+) -> serde_json::Value {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let t = today(d);
+        if t["kernel_suspended_routines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["id"] == routine_id)
+        {
+            return t;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "sin90's own /today never listed {routine_id} under kernel_suspended_routines after \
+             a restart (i.e. the startup full reconcile never ran, never took the \
+             user_suspended branch, or never mapped the kernel's key back to this routine): \
+             {t}; daemon log:\n{}",
+            d.combined_log()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 /// Every row in a `GET /api/v1/schedules` response owned by Sin90 under the
 /// given kernel key (`agent24_protocol::types::ScheduleOwner`'s wire shape:
 /// `{"module": "sin90", "key": ...}`).
@@ -1093,7 +1145,18 @@ fn kernel_clients_roundtrip() {
 ///
 /// Covers, in order, EVERY numbered point tasks.md T3.5.1 lists:
 /// 1. create "每周 3 次运动" -> kernel `GET /api/v1/schedules` has 1 row for it.
-/// 2. restart the daemon -> still 1 row, not disabled.
+/// 2. inject REAL drift straight on the kernel side (`DELETE
+///    /api/v1/schedules/{id}` — no module-ownership restriction, unlike
+///    PATCH), THEN restart the daemon -> the row REAPPEARS, with a fresh
+///    kernel schedule id, `enabled: true`, `system_disabled_reason: null`
+///    (review round 2, M1: an assertion that the row is merely still
+///    `enabled: true` after a restart would be true whether or not the
+///    startup full reconcile ever ran at all — the kernel's own schedule
+///    state persists across an `agent24d` restart regardless; deleting it
+///    first makes the row's very reappearance an actual, reconcile-only
+///    observable effect. A PATCH-based drift injection was tried first and
+///    rejected: for a module row, the kernel's own `enabled`-only PATCH is
+///    secretly `suspend`/`resume` — see the test body's own comment).
 /// 3. positive control: `adapter_agent24::reconciler_debug`'s test hook sends
 ///    the kernel TWO real back-to-back upserts for the same Routine -> still
 ///    1 row (the kernel's own idempotency-by-key, not merely Sin90's outbox
@@ -1108,16 +1171,31 @@ fn kernel_clients_roundtrip() {
 ///    STANDALONE Sin90 (no Agent24 in front of it at all) gets 404 — proving
 ///    `crate::http::router`'s own documented guard: the route simply does not
 ///    exist outside mounted mode, so there is nothing a forged
-///    `X-A24-Fire-Id` could ever reach.
+///    `X-A24-Fire-Id` could ever reach. Positive control: the same standalone
+///    port answers an ordinary route (`GET /today`) with 200. Review round 2,
+///    H2 ALSO covers the mounted-mode half of this: the identical forgery,
+///    with a valid daemon token and routine_b's own REAL key, through the
+///    real daemon -> still 404 (the kernel's OWN reserved-path judgement,
+///    ME4-1.3.2 §7.1 — a different layer than Sin90's router, which in
+///    mounted mode DOES register this route but can never be reached through
+///    the public proxy) — and routine_b's `routine.fired` count is unchanged.
 /// 6. `POST .../transition {"to":"paused"}` -> the kernel row's `enabled`
 ///    flips to `false`.
 /// 7. resume it (back to `enabled: true`), then a HUMAN suspends the SAME
 ///    kernel row directly via the kernel's OWN `POST
 ///    /api/v1/schedules/{id}/suspend` (bypassing Sin90 entirely) -> restart
-///    the daemon -> the row is STILL suspended (`adapter_agent24::reconciler`'s
-///    own "user_suspended 的行不去碰" rule: the startup full-reconcile must
-///    not fight a human's kernel-side suspension just because Sin90 itself
-///    still considers the Routine `active`).
+///    the daemon -> wait for SIN90'S OWN `/today` to list this routine under
+///    `kernel_suspended_routines` (review round 2, H1: the kernel's
+///    `user_suspended` flag alone is nearly vacuous here — `upsert` never
+///    clears it, so it would read `true` whether or not the reconciler ran,
+///    or ran correctly; `/today`'s own list is populated ONLY by the startup
+///    full reconcile's `user_suspended` branch, which also proves the
+///    kernel's lower-cased key was correctly mapped back to this routine's
+///    real, uppercase id) -> THEN the kernel row is still suspended
+///    (`adapter_agent24::reconciler`'s own "user_suspended 的行不去碰" rule:
+///    the startup full-reconcile must not fight a human's kernel-side
+///    suspension just because Sin90 itself still considers the Routine
+///    `active`).
 /// 8. retire it -> the kernel row disappears entirely.
 #[test]
 #[ignore = "needs a sibling Agent24 checkout; run explicitly: cargo test --test agent24_mount_blackbox -- --ignored --test-threads=1"]
@@ -1176,6 +1254,17 @@ fn routine_m3_real_mount_acceptance() {
             "a forged fired POST at a STANDALONE sin90 must 404 (route not registered outside \
              mounted mode), got {status}: {body}"
         );
+        // H2 positive control: the 404 above is the ROUTE genuinely not
+        // existing, not this standalone process being broken/unreachable —
+        // the SAME port answers an ordinary, always-registered route fine.
+        // Standalone routes are un-nested (`main.rs`'s own doc), so bare
+        // `/today`, not `/api/v1/sin90/today`.
+        let (status, body) = http_call(port, "GET", "/today", None, None, None)
+            .unwrap_or_else(|| panic!("no response from standalone sin90 on port {port}"));
+        assert_eq!(
+            status, 200,
+            "positive control: GET /today on the SAME standalone port must succeed: {body}"
+        );
     }
 
     let home = tmp_home("routine-m3");
@@ -1215,7 +1304,7 @@ fn routine_m3_real_mount_acceptance() {
     // kernel's schedule key charset is `[a-z0-9._-]`, byte-exact, while
     // `routine_a_id` is an uppercase `ulid()` — the ACTUAL key the kernel
     // stores this Routine under is the lower-cased form.
-    let key_a = format!("routine.{}", routine_a_id.to_lowercase());
+    let key_a = format!("routine.{}", routine_a_id.to_ascii_lowercase());
 
     let schedule_a = wait_for_one_schedule_row(&d2, &key_a, sync_timeout);
     assert_eq!(schedule_a["enabled"], true, "{schedule_a}");
@@ -1224,19 +1313,52 @@ fn routine_m3_real_mount_acceptance() {
         schedule_a["spec"]["expr"], "0 7 * * MON,WED,FRI",
         "{schedule_a}"
     );
+    let schedule_a_kernel_id = schedule_a["id"].as_str().unwrap().to_owned();
+
+    // T3.5.1 review (M1): before restarting, inject REAL drift straight on
+    // the kernel side — DELETE the row entirely (`DELETE /api/v1/schedules/
+    // {id}` has no module-ownership restriction, unlike PATCH: `Scheduler::
+    // delete`'s own doc). A PATCH of `{"enabled": false}` was tried first and
+    // rejected in review: for a MODULE row, `agent24-scheduler`'s own
+    // `module_row_patch` routes ANY enabled-only PATCH straight to
+    // `suspend`/`resume` — it never touches the raw `enabled` column at all,
+    // so it would have silently turned this into a `user_suspended` case
+    // (H1's territory) while leaving `enabled` itself completely untouched.
+    // Deleting the row outright is unambiguous: nothing but a REAL, running
+    // full reconcile can make it reappear.
+    let (status, body) = http_call(
+        d2.port,
+        "DELETE",
+        &format!("/api/v1/schedules/{schedule_a_kernel_id}"),
+        Some(&d2.token),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(status, 204, "DELETE schedule (inject drift): {body}");
     drop(d2);
 
-    // ── generation 3: §2 restart -> still 1 row, not disabled ──────────────
+    // ── generation 3: §2 restart -> the deleted row reappears ──────────────
     let d3 = start_daemon(&home, &agent24d_bin, FAST_TICK);
     wait_for_sin90_ready(&d3, mount_ready);
     let human_key = d3.read_actor_key(&home, "human", Duration::from_secs(10));
 
+    // M1: the startup full reconcile must notice the row is genuinely GONE
+    // (`local` has an active Routine, `kernel.get(key)` is `None` —
+    // `reconcile_full`'s own "本地有、内核缺 → 补上" branch) and re-create it —
+    // an observable effect (a NEW kernel schedule id) that proves reconcile
+    // genuinely ran, not merely that nothing needed to change.
     let schedule_a =
         wait_for_one_schedule_row_where(&d3, &key_a, sync_timeout, |row| row["enabled"] == true);
+    assert_ne!(
+        schedule_a["id"], schedule_a_kernel_id,
+        "a re-created row must get a fresh kernel schedule id, proving it was genuinely \
+         recreated rather than the deleted one somehow surviving: {schedule_a}"
+    );
     assert_eq!(
         schedule_a["system_disabled_reason"],
         serde_json::Value::Null,
-        "a routine that never drifted must not come back disabled after a restart: {schedule_a}"
+        "a freshly re-created row must not come back disabled: {schedule_a}"
     );
     assert_eq!(schedule_a["user_suspended"], false, "{schedule_a}");
 
@@ -1286,7 +1408,7 @@ fn routine_m3_real_mount_acceptance() {
         &format!(r#"{{"title":"T3.5.1 tick probe","kind":"other","cron":"{cron_b}"}}"#),
     );
     let routine_b_id = routine_b["id"].as_str().unwrap().to_owned();
-    let key_b = format!("routine.{}", routine_b_id.to_lowercase());
+    let key_b = format!("routine.{}", routine_b_id.to_ascii_lowercase());
     let schedule_b = wait_for_one_schedule_row(&d3, &key_b, sync_timeout);
     assert_eq!(schedule_b["enabled"], true, "{schedule_b}");
 
@@ -1332,6 +1454,42 @@ fn routine_m3_real_mount_acceptance() {
     assert!(
         triggers.contains(&"tick") && triggers.contains(&"run_now"),
         "expected one \"tick\" and one \"run_now\" fire, got {triggers:?}"
+    );
+
+    // T3.5.1 review (H2): the SAME forgery as §5's standalone check, this
+    // time through the REAL mounted daemon — a client can never reach
+    // `POST /_a24/scheduler/fired` through the public proxy either, even
+    // with a valid daemon token and a REAL (routine_b's own) key. The 404
+    // comes from a DIFFERENT layer than §5's: the kernel's own
+    // reserved-path judgement (`agent24_os_proto::proxy::judge`/
+    // `PathVerdict::Reserved` — ME4-1.3.2, design §7.1: the first path
+    // segment under a module's namespace named `_a24` is refused BEFORE
+    // admission, module dispatch, or even the daemon-token check), not
+    // Sin90's own router (which, in mounted mode, DOES register this route
+    // — see `crate::http::router`'s own doc; a client simply can never get
+    // a request to it through the public proxy at all).
+    let (status, body) = http_call(
+        d3.port,
+        "POST",
+        "/api/v1/sin90/_a24/scheduler/fired",
+        Some(&d3.token),
+        None,
+        Some(&format!(
+            r#"{{"key":"{key_b}","trigger":"tick","scheduled_for":"2026-01-01T00:00:00Z","fired_at":"2026-01-01T00:00:00Z"}}"#
+        )),
+    )
+    .unwrap();
+    assert_eq!(
+        status, 404,
+        "a forged fired POST through the REAL mounted daemon must 404 (kernel reserved-path \
+         judgement, ME4-1.3.2): {body}"
+    );
+    let fired_after_forgery = routine_fired_events(&d3, &routine_b_id);
+    assert_eq!(
+        fired_after_forgery.len(),
+        2,
+        "a forged fired POST through the real daemon must not create a new routine.fired: \
+         {fired_after_forgery:?}"
     );
 
     // ── §6: pause Routine A -> kernel row's `enabled` flips to `false` ─────
@@ -1386,6 +1544,14 @@ fn routine_m3_real_mount_acceptance() {
     let d4 = start_daemon(&home, &agent24d_bin, FAST_TICK);
     wait_for_sin90_ready(&d4, mount_ready);
     let human_key = d4.read_actor_key(&home, "human", Duration::from_secs(10));
+    // T3.5.1 review (H1): the kernel's own `user_suspended` flag alone would
+    // read `true` here regardless of whether the reconciler ran, or ran
+    // correctly — `upsert` never clears it (`wait_for_today_kernel_suspended`'s
+    // own doc). Wait for SIN90'S OWN observable side effect first: this
+    // proves the startup full reconcile actually ran, took the
+    // `user_suspended` branch, and correctly mapped the kernel's
+    // lower-cased key back onto routine_a_id's real, uppercase form.
+    wait_for_today_kernel_suspended(&d4, &routine_a_id, sync_timeout);
     let schedule_a = wait_for_one_schedule_row_where(&d4, &key_a, sync_timeout, |row| {
         row["user_suspended"] == true
     });

@@ -21,13 +21,14 @@
 //! `test-hooks`-only, never built into a release binary
 //! (`lib.rs`'s `compile_error!`).
 //!
-//! The kernel key it upserts is derived the same way
-//! `adapter_agent24::reconciler::kernel_key` derives it (`routine.<id>`) —
-//! duplicated here rather than imported, since that helper is private to
-//! `reconciler` and re-deriving one `format!` is cheaper than widening that
-//! module's own surface for a test-only caller (same reasoning
-//! `kernel_roundtrip.rs`'s own doc gives for duplicating `http`'s error
-//! envelope rather than reaching into it).
+//! The kernel key it upserts is [`crate::store::repo::routine_kernel_key`]
+//! itself — the SAME `pub(crate)` function `adapter_agent24::reconciler::
+//! kernel_key` delegates to (that function's own doc, T3.5.1 review M2/L: a
+//! naive `format!("routine.{id}")` — what this route used before that
+//! review round — sends the kernel an invalid, uppercase-bearing key, since
+//! `routine.id` is an uppercase `ulid()` and the kernel's key charset is
+//! `[a-z0-9._-]`; this debug route would always fail with `invalid_params`
+//! and never actually exercise the idempotency it exists to prove).
 
 use std::sync::Arc;
 

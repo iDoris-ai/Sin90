@@ -669,7 +669,7 @@ fn routine_dedup_key(id: &str) -> String {
 /// lower-cased here — the ONE place this crate turns a Routine id into the
 /// string actually sent to the kernel.
 ///
-/// [`Sin90Store::record_routine_fire`]'s `.to_uppercase()` on the way back
+/// [`Sin90Store::record_routine_fire`]'s `.to_ascii_uppercase()` on the way back
 /// is this transform's lossless inverse (plain ASCII case folding —
 /// Crockford's own alphabet has no upper/lower ambiguity), recovering the
 /// EXACT id `sin90_routines.id` stores. `pub(crate)` (not private): the
@@ -681,7 +681,12 @@ fn routine_dedup_key(id: &str) -> String {
 /// first place (one call site lower-cased, the others didn't), so this
 /// fix makes it ONE function, not two identical ones.
 pub(crate) fn routine_kernel_key(id: &str) -> String {
-    format!("routine.{}", id.to_lowercase())
+    // `to_ascii_lowercase`, not `to_lowercase` (T3.5.1 review, L): `ulid()`'s
+    // whole alphabet is ASCII, so the two agree on every real input, but
+    // `to_ascii_lowercase` cannot ever change a string's length/byte count
+    // the way full Unicode case folding can for some scripts — the right
+    // default for a value whose charset is contractually ASCII-only.
+    format!("routine.{}", id.to_ascii_lowercase())
 }
 
 /// The `desired` payload for a `scheduler.upsert` outbox row mirroring a
@@ -2549,16 +2554,19 @@ impl Sin90Store {
         // is the receiving half of that same convention
         // (`store::repo::routine_outbox_upsert_desired`/
         // `routine_outbox_delete_desired` lower-case the id when building
-        // the key sent TO the kernel) — `.to_uppercase()` here is the
-        // lossless inverse of that `.to_lowercase()` (Crockford's alphabet
-        // is plain ASCII digits/letters, so the round trip never loses
-        // information), recovering the EXACT id `sin90_routines.id` stores.
-        // A no-op for the many existing tests in this file/`http::tests`
-        // that build this key directly from an already-uppercase id.
+        // the key sent TO the kernel) — `.to_ascii_uppercase()` here is the
+        // lossless inverse of that `.to_ascii_lowercase()` (Crockford's
+        // alphabet is plain ASCII digits/letters, so the round trip never
+        // loses information), recovering the EXACT id `sin90_routines.id`
+        // stores. `to_ascii_uppercase`, not `to_uppercase` (T3.5.1 review,
+        // L) — the id's charset is contractually ASCII-only, so full
+        // Unicode case folding buys nothing and can only surprise. A no-op
+        // for the many existing tests in this file/`http::tests` that build
+        // this key directly from an already-uppercase id.
         let Some(routine_id) = key
             .strip_prefix("routine.")
             .filter(|rest| !rest.is_empty())
-            .map(str::to_uppercase)
+            .map(str::to_ascii_uppercase)
         else {
             return Ok(RoutineFireOutcome::UnknownKey);
         };
@@ -6527,6 +6535,39 @@ mod fired_tests {
                 .unwrap(),
             2,
             "expected exactly `created` + one `fired` (not two `fired`s)"
+        );
+    }
+
+    /// T3.5.1 review (M3): `record_routine_fire` must recover the ORIGINAL,
+    /// uppercase `sin90_routines.id` from the kernel's own key — a REAL
+    /// mounted daemon always delivers `routine_kernel_key(id)`'s literal,
+    /// lower-cased wire form (that function's own doc: the kernel's key
+    /// charset is `[a-z0-9._-]`, `ulid()` is uppercase), never the raw
+    /// `format!("routine.{id}")` every OTHER test in this module builds by
+    /// hand. Those other tests already happen to pass with an
+    /// already-uppercase id (`.to_ascii_uppercase()` is a no-op on it) — this is
+    /// the one test that actually exercises the recovery transform itself.
+    #[tokio::test]
+    async fn fired_recovers_the_real_uppercase_routine_id_from_the_lower_cased_kernel_key() {
+        let store = new_store().await;
+        let routine = create_ok(&store).await;
+
+        let outcome = store
+            .record_routine_fire(
+                "fire-lowercase-key",
+                &routine_kernel_key(&routine.id),
+                "2026-09-24T07:00:00Z",
+                FireTrigger::Tick,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            RoutineFireOutcome::Recorded {
+                routine_id: routine.id.clone(),
+                auto_review: None,
+            },
+            "must recover the ORIGINAL uppercase id, not the lower-cased key fragment"
         );
     }
 
