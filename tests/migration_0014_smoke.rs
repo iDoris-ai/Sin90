@@ -62,13 +62,17 @@ async fn migration_0014_seeds_the_triage_direction() {
 #[tokio::test]
 async fn migration_0014_insert_is_idempotent_on_rerun() {
     let pool = migrated_pool().await;
-    let insert = "INSERT INTO sin90_directions \
-         (id, area_id, title, status, target_window, created_at, updated_at) \
-         VALUES ('sin90-triage', NULL, '待定', 'active', 'n/a', \
-         '2026-09-26T00:00:00Z', '2026-09-26T00:00:00Z') \
-         ON CONFLICT(id) DO NOTHING";
-    // Second INSERT of the identical row the migration already applied once.
-    sqlx::query(insert).execute(&pool).await.unwrap();
+    // Re-run the migration file's OWN contents (not a hand-copied string),
+    // so deleting its `ON CONFLICT(id) DO NOTHING` turns this test red —
+    // PR-Daemon review of #65: a hand-maintained copy passed even with the
+    // clause removed from the real file.
+    let migration_sql = include_str!("../src/store/migrations/0014_triage_direction.sql");
+    assert!(
+        migration_sql.contains("INSERT INTO sin90_directions"),
+        "include_str! must point at the real 0014 seed migration"
+    );
+    // Second run of the identical statement the migration already applied once.
+    sqlx::raw_sql(migration_sql).execute(&pool).await.unwrap();
 
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM sin90_directions WHERE id = ?")
         .bind(sin90::core::TRIAGE_DIRECTION_ID)
