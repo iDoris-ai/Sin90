@@ -299,6 +299,18 @@
 - **验收命令**：`cargo test proposal_reject_`：人类拒绝 → rejected、不在待处理列表、日志 1 行、事件 1 条；自动化 key 拒绝 → 403；已 accept 的提议不能拒绝 → 409；被拒提议不再挡 classify/propose 的去重。
 - **证据**：
 
+### T5.7.2 被拒建议条件压制 + 「待定」条目重新分类  `BACKLOG`
+- **优先级**：mid
+- **目标**：用户拍板 Q9 选 C。被拒过的同一建议（同一目标 + 同一 ops 指纹）默认不再提；**仅在情况变化时允许重提**：目标任务在拒绝之后被修改过，或者拒绝之后出现了新的非终态 Direction。同时让「待定」（`sin90-triage`）里的条目能被 classify 重新分类，条件也是出现了新 Direction。
+- **开发范围**：
+  - 先在 DESIGN §2 登记「建议指纹」的定义（能力 + 目标 + 规范化后的 ops）和「情况变化」的判定。
+  - classify / propose / summarize 的去重在读挂起提议之外，再读 `sin90_proposal_rejections`，按指纹做条件压制。
+  - 「待定」重新分类的最小方案（T5.2.2 评审给出，约 60–80 行）：inbox / A3 对 `sin90-triage` 放宽；已在待定里的条目，兜底结果为 nothing，不提「待定 → 待定」；只在 `task.updated_at < MAX(非终态非待定 Direction.created_at)` 时重试。
+  - run 结果里被压制的条目记 `skipped`，`reason = suppressed_rejected`。
+- **依赖**：T5.7.1、T5.2.2（其 H2：title_history 排除待定）
+- **验收命令**：`cargo test suppress_`：拒过的建议下一轮不再提出；正对照 ①：任务改名后重新提出；正对照 ②：新建 Direction 后重新提出；「待定」里的条目在新建合适 Direction 后被重新归类；没有新 Direction 时不重试。
+- **证据**：
+
 ## MS — 迁到 `agent24-os-sdk`
 
 ### TS.1.1 adapter 换成 SDK  `BACKLOG`
