@@ -1,0 +1,51 @@
+-- 0014 (T5.2.2, design DESIGN-LIFEOS.md §2 #30): seed the system-reserved
+-- "待定" (Triage) Direction — classify's fallback target for T5.2.2 (§11.2.1/
+-- §11.4.1): "没有合适的 Direction 时，把条目归到一个固定的『待定』分类，不
+-- 提议新建 Direction" (tasks.md T5.2.2, 用户拍板 Q4).
+--
+-- Seeded here (a migration), not lazily created on first use: it must exist
+-- in EVERY environment from the very first boot, so every read path
+-- (`classify::classify_one`'s fallback, `AssignTaskDirection`'s A4/A5
+-- existence/non-terminal checks) can assume the row is already there —
+-- no "first classify run in this db creates it" race, no idempotent-insert
+-- code path to get right at call time.
+--
+-- Fixed id `sin90-triage` — never a generated ULID (`core::util::ulid`
+-- only ever emits 26 uppercase Crockford-base32 characters, so this
+-- lowercase/hyphenated id can never collide with a real Direction's id).
+-- Protected by this exact id, not an `is_system` column (§2 #30's own
+-- comparison of the two options): no HTTP route today can rename or delete
+-- a Direction at all (`src/http/mod.rs` only has `POST /directions` +
+-- `GET /directions`), so the id itself is the whole protection surface
+-- until a rename/delete route exists — at which point THAT route is where
+-- the guard belongs, not a column nothing else reads yet.
+--
+-- `area_id = NULL`: 待定 is a system bucket, not scoped to any of the
+-- user's own life areas (§2 #30 — assigning it an Area would make it look
+-- like a real planning target, which is exactly what it must not be).
+-- `status = 'active'`: non-terminal (draft/active/paused all satisfy
+-- `AssignTaskDirection`'s A5), and there is no lifecycle event that should
+-- ever move it to `achieved`/`abandoned` — nothing in this codebase
+-- transitions a Direction's status except a human `PATCH`, which today only
+-- exists for tasks, not Directions themselves.
+-- `target_window = 'n/a'`: non-blank (matches the `non_blank` check
+-- `POST /directions` applies to human-created rows), but deliberately not a
+-- real period — 待定 has no target window, it is a holding bucket.
+--
+-- `direction_candidates` (`src/store/ai_port.rs`) and `gap_directions`
+-- (`src/ai/propose.rs`) both explicitly exclude this id in Rust — it must
+-- never be offered to R1/R2/the model as a real classification candidate,
+-- and it must never count toward a week's rhythm quota or "缺口 Direction"
+-- (tasks.md T5.2.2: "『待定』不参与配额计算，也不参与缺口计算").
+--
+-- `ON CONFLICT(id) DO NOTHING`: defensive only — `sqlx::migrate!` tracks
+-- applied migrations by checksum and never re-runs this file against an
+-- already-migrated db, but a hand-run copy of this statement (or a future
+-- edit that re-uses this file's contents) must not fail or duplicate the
+-- row.
+--
+-- Takes migration slot 0014, the next free one after 0013
+-- (`outbox_migrations_are_contiguous_no_gaps`, src/store/repo.rs).
+INSERT INTO sin90_directions (id, area_id, title, status, target_window, created_at, updated_at)
+VALUES ('sin90-triage', NULL, '待定', 'active', 'n/a', '2026-09-26T00:00:00Z', '2026-09-26T00:00:00Z')
+ON CONFLICT(id) DO NOTHING;

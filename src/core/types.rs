@@ -19,6 +19,19 @@ pub type ReviewId = String;
 pub type AreaId = String;
 pub type RoutineId = String;
 
+/// T5.2.2 (design §2 #30): the system-reserved "待定" (Triage) Direction —
+/// classify's fallback target when no candidate Direction is a good match
+/// (§11.2.1/§11.4.1). A fixed, well-known id, never a generated ULID
+/// (`util::ulid` only ever emits uppercase Crockford base32, so this
+/// lowercase/hyphenated id can never collide with a real Direction's id).
+/// Seeded by migration `0014_triage_direction.sql` so it exists in every
+/// environment from the first boot (not lazily created — no run-time race
+/// to get right, and every read path can assume it is already there).
+/// Protected by this exact id rather than an `is_system` flag: no route
+/// today can rename or delete a Direction at all (§2 #30's own comparison),
+/// so the id is the entire protection surface until one exists.
+pub const TRIAGE_DIRECTION_ID: &str = "sin90-triage";
+
 // ---------------------------------------------------------------------------
 // Status enums (each has a state machine in `transitions.rs`)
 // ---------------------------------------------------------------------------

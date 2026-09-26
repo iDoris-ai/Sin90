@@ -30,7 +30,7 @@ pub use types::{
     NewReview, NewRoutine, ProposalStatus, Review, ReviewId, ReviewKind, ReviewPatch, ReviewStatus,
     Rhythm, RhythmId, RhythmStatus, Routine, RoutineId, RoutineKind, RoutinePatch, RoutineStatus,
     ScheduleBlock, ScheduleBlockId, ScheduleBlockStatus, Task, TaskId, TaskKind, TaskStatus, Week,
-    WeekId, WeekStatus,
+    WeekId, WeekStatus, TRIAGE_DIRECTION_ID,
 };
 pub use util::{
     canonical_iso_date, canonical_iso_week, is_fixed_iso8601, iso8601_after_secs, iso_week_bounds,
