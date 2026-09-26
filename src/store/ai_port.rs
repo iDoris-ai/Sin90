@@ -168,6 +168,67 @@ impl SettingsRead for AiReader {
     }
 }
 
+/// T5.7.2 review round 2 (H2/M6), N-H1/Low follow-up: the 待定 retry gate's
+/// SQL, shared verbatim by [`AiReadModel::inbox`]/[`AiReadModel::inbox_task`]
+/// below — assumes the enclosing query aliases `sin90_tasks` as `t`.
+/// Replaces the ORIGINAL gate (`updated_at < newest eligible Direction's
+/// created_at`), which had two bugs the review round found:
+///
+/// - **H2 (no exit condition)**: `updated_at` never moves for a triage task
+///   classify re-examines and STILL cannot place (`none`/low-confidence/
+///   no-conclusion — none of those write anything back), so once some
+///   Direction is newer than this task's `updated_at`, the task re-qualifies
+///   as a target on EVERY run forever, for as long as that Direction stays
+///   the newest one — permanently occupying one of `MAX_CLASSIFY_TASK_IDS`
+///   slots. Fixed by comparing against `evaluated_at`/`entered_at` instead:
+///   `evaluated_at` (`sin90_classify_evals`, written by `AiSink::
+///   record_classify_eval` every time classify looks at a triage task and
+///   does not move it out) advances past a fruitless look, so the task
+///   drops out of contention again until a Direction newer STILL shows up;
+///   `entered_at` (`sin90_tasks.triage_entered_at`, N-H1) is the floor before
+///   any evaluation has ever been recorded.
+/// - **M6 (待定→真实 Direction only for classify's own placements)**: `t.
+///   triage_via = 'classify'` requires this task's 待定 parking to trace
+///   back to an ACCEPTED `capability_source = "classify"` proposal — the
+///   SAME check `core::proposal::validate`'s A3 carve-out now requires
+///   (`ValidationCtx::task_triage_via_classify`, `store/repo.rs`'s
+///   `load_task_triage_via_classify`). A task a human filed into 待定
+///   directly (`POST /proposals`, `capability_source = "direct"`) must
+///   never be offered to classify's retry inbox at all — both mechanisms
+///   share this one clause so they cannot drift apart.
+///
+/// N-H1 (T5.7.2 review round 2 follow-up): `triage_via`/`triage_entered_at`
+/// are plain `sin90_tasks` columns now (migration 0015), stamped by
+/// `AssignTaskDirection`'s apply and copied forward by `CarryOverTask`'s —
+/// this replaces both the `EXISTS (... sin90_ai_calls JOIN sin90_proposals
+/// JOIN json_each(p.ops) ...)` M6 used and the `sin90_events` lookup H2 used
+/// for "entered 待定 at", NEITHER of which survived a task's id changing
+/// under `CarryOverTask` (both were keyed on `t.id`/`entity_id = t.id`, the
+/// CURRENT id — a carried-over 待定 task has a brand-new one, so both
+/// derivations silently found nothing for it; this migration's own
+/// motivating bug). Also fixes the JOIN's own per-read cost (M-d).
+///
+/// Low (T5.7.2 review round 2 follow-up): the comparand is `MAX(evaluated_at,
+/// entered_at)`, not `COALESCE(evaluated_at, entered_at)` — SQLite's
+/// multi-argument `max()` NULL-poisons if either side is NULL, hence the
+/// `COALESCE(..., '')` around each leg first; both are still ISO-8601
+/// strings, so `''` sorts before any real timestamp exactly like the
+/// existing `COALESCE(..., '')` on the Direction side already relies on.
+fn triage_retry_gate_sql(d_placeholders: &str) -> String {
+    format!(
+        "t.direction_id = ?
+         AND t.triage_via = 'classify'
+         AND COALESCE(
+               (SELECT MAX(created_at) FROM sin90_directions
+                WHERE status NOT IN ({d_placeholders}) AND id != ?),
+               ''
+             ) > MAX(
+               COALESCE((SELECT evaluated_at FROM sin90_classify_evals WHERE task_id = t.id), ''),
+               COALESCE(t.triage_entered_at, '')
+             )"
+    )
+}
+
 impl AiReadModel for AiReader {
     /// 2026-09-24 review (H1, blocking): the exclusion list is DERIVED from
     /// [`task_is_terminal`] (via [`terminal_task_status_wires`]), not a
@@ -179,16 +240,46 @@ impl AiReadModel for AiReader {
     /// slot ahead of every real candidate once 20+ such rows accumulate,
     /// since nothing ever reclassifies a closed task. See
     /// `inbox_excludes_carried_over_tasks` for the regression.
+    ///
+    /// T5.7.2 (design §2 #31, T5.2.2 followup ②): ALSO includes a task
+    /// parked in the reserved 待定 Direction (`TRIAGE_DIRECTION_ID`), but
+    /// ONLY while it satisfies [`triage_retry_gate_sql`]'s retry gate (L4,
+    /// T5.7.2 review round 3: this doc used to describe that gate's
+    /// ORIGINAL, since-replaced shape — plain `updated_at` strictly before
+    /// the newest eligible Direction's `created_at` — which is stale now
+    /// that H2/M6/N-H1 rewrote it; see `triage_retry_gate_sql`'s own doc for
+    /// the CURRENT shape: `triage_via = 'classify'` (M6) plus `MAX(evaluated_
+    /// at, triage_entered_at)` (H2/N-H1) as the floor, not `updated_at`).
+    /// Written directly into this query's `WHERE` (a scalar subquery sharing
+    /// the SAME "non-terminal + exclude triage itself" set `direction_
+    /// candidates` below already filters on) rather than selecting every
+    /// triage task unconditionally and filtering in Rust afterward — the
+    /// gate IS the membership test, not a second pass over it.
     async fn inbox(&self, limit: u32) -> Result<Vec<Task>, ReadError> {
         let terminal = terminal_task_status_wires();
-        let placeholders = terminal.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let d_terminal = terminal_direction_status_wires();
+        let t_placeholders = terminal.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let d_placeholders = d_terminal
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let gate = triage_retry_gate_sql(&d_placeholders);
         let sql = format!(
-            "SELECT {TASK_COLUMNS} FROM sin90_tasks
-             WHERE direction_id IS NULL AND status NOT IN ({placeholders})
-             ORDER BY created_at ASC
+            "SELECT {TASK_COLUMNS} FROM sin90_tasks t
+             WHERE (
+                 t.direction_id IS NULL
+                 OR ({gate})
+             )
+             AND t.status NOT IN ({t_placeholders})
+             ORDER BY t.created_at ASC
              LIMIT ?"
         );
-        let mut q = sqlx::query(&sql);
+        let mut q = sqlx::query(&sql).bind(crate::core::TRIAGE_DIRECTION_ID); // gate: t.direction_id = ?
+        for t in &d_terminal {
+            q = q.bind(t);
+        }
+        q = q.bind(crate::core::TRIAGE_DIRECTION_ID); // gate: id != ? (exclude triage itself)
         for t in &terminal {
             q = q.bind(t);
         }
@@ -205,15 +296,35 @@ impl AiReadModel for AiReader {
     /// explicitly-given `task_ids` against, instead of paging through the
     /// entire inbox with an arbitrary large `limit` (T5.2.1's original
     /// `inbox(10_000)` placeholder). Shares the SAME terminal-status
-    /// exclusion [`inbox`] uses.
+    /// exclusion [`inbox`] uses — including [`inbox`]'s own T5.7.2 待定
+    /// retry gate (§2 #31), so an explicit `task_ids` request and the
+    /// auto-selected path agree on membership.
     async fn inbox_task(&self, id: &str) -> Result<Option<Task>, ReadError> {
         let terminal = terminal_task_status_wires();
-        let placeholders = terminal.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let d_terminal = terminal_direction_status_wires();
+        let t_placeholders = terminal.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let d_placeholders = d_terminal
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let gate = triage_retry_gate_sql(&d_placeholders);
         let sql = format!(
-            "SELECT {TASK_COLUMNS} FROM sin90_tasks
-             WHERE id = ? AND direction_id IS NULL AND status NOT IN ({placeholders})"
+            "SELECT {TASK_COLUMNS} FROM sin90_tasks t
+             WHERE t.id = ?
+             AND (
+                 t.direction_id IS NULL
+                 OR ({gate})
+             )
+             AND t.status NOT IN ({t_placeholders})"
         );
-        let mut q = sqlx::query(&sql).bind(id);
+        let mut q = sqlx::query(&sql)
+            .bind(id)
+            .bind(crate::core::TRIAGE_DIRECTION_ID); // gate: t.direction_id = ?
+        for t in &d_terminal {
+            q = q.bind(t);
+        }
+        q = q.bind(crate::core::TRIAGE_DIRECTION_ID); // gate: id != ? (exclude triage itself)
         for t in &terminal {
             q = q.bind(t);
         }
@@ -806,6 +917,20 @@ impl AiSink for Sin90Store {
         insert_call_row(&mut *conn, &rec)
             .await
             .map_err(|e| SinkError::Store(e.to_string()))
+    }
+
+    async fn record_classify_eval(&self, task_id: &str) -> Result<(), SinkError> {
+        let now = crate::core::now_iso8601();
+        sqlx::query(
+            "INSERT INTO sin90_classify_evals (task_id, evaluated_at) VALUES (?, ?)
+             ON CONFLICT(task_id) DO UPDATE SET evaluated_at = excluded.evaluated_at",
+        )
+        .bind(task_id)
+        .bind(&now)
+        .execute(self.pool())
+        .await
+        .map_err(|e| SinkError::Store(e.to_string()))?;
+        Ok(())
     }
 
     async fn precheck(&self, cap: Capability, drafts: &[ProposalDraft]) -> Vec<bool> {

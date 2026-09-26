@@ -400,6 +400,20 @@ pub trait AiSink: Send + Sync {
     ) -> impl Future<Output = Result<(), SinkError>> + Send;
     /// Failed / non-producing attempts only.
     fn record_call(&self, rec: AiCallRecord) -> impl Future<Output = Result<(), SinkError>> + Send;
+    /// T5.7.2 review round 2 (H2): records "classify just evaluated this
+    /// task" — an upsert into `sin90_classify_evals`, independent of
+    /// `record_call`/`submit` (those are about the MODEL call; this is about
+    /// the 待定 retry gate's own exit condition, `AiReadModel::inbox`/
+    /// `inbox_task`'s SQL). Called for a task CURRENTLY parked in 待定 whose
+    /// evaluation this run ended in `none`/low-confidence/no-conclusion —
+    /// i.e. did NOT move it to a real Direction — so the gate's comparand
+    /// (newest eligible Direction's `created_at`) advances past this
+    /// evaluation instead of re-qualifying the same task on every future
+    /// run until a genuinely NEW Direction appears.
+    fn record_classify_eval(
+        &self,
+        task_id: &str,
+    ) -> impl Future<Output = Result<(), SinkError>> + Send;
     /// Batch "is each pending proposal still valid?" (L3): ONE
     /// `BEGIN IMMEDIATE` per call; per draft a SAVEPOINT running steps 1–3 of
     /// `submit` then `ROLLBACK TO`; finally `ROLLBACK` the whole transaction.

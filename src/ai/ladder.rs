@@ -114,7 +114,24 @@ pub enum Outcome<T> {
         rec: AiCallRecord,
     },
     /// Every step ran, none produced (model said none, R2 no match…).
-    Nothing,
+    ///
+    /// `deterministic` (T5.7.2 review round 3, M2): true iff at least one
+    /// step along the way got a genuine model REPLY that was then rejected
+    /// as `bad_output` (`parse` returned `Err`) or blocked by the privacy
+    /// `tripwire` — the model (or the served tier itself) actually looked at
+    /// this item and produced something, it just wasn't usable. `false` when
+    /// every step that ran never got that far at all: `ReflexDecisive`
+    /// undecided, `ReflexFallback` no match, no model port configured, every
+    /// `Model` step degraded/deferred on the TRANSPORT (`Timeout`,
+    /// `Unavailable`, `Busy`, `RateLimited`, `NotReady`, circuit already
+    /// open, …) before a reply ever came back. Callers use this to decide
+    /// whether "the model looked at this and found nothing new" is true
+    /// enough to record (classify's H2 `sin90_classify_evals` write) — a
+    /// transport hiccup must not be laundered into "classify examined this
+    /// task", but a malformed/blocked reply is a real (if unusable) look.
+    Nothing {
+        deterministic: bool,
+    },
     /// Capacity/budget/deadline: item left for a later run; no R2.
     Deferred,
     Aborted,
@@ -149,6 +166,12 @@ where
         return Outcome::Aborted;
     }
     let mut failed_from: Option<Engine> = None;
+    // M2 (T5.7.2 review round 3): set true the moment ANY step gets a real
+    // model reply that is then rejected (`bad_output`) or blocked
+    // (`tripwire`) — see `Outcome::Nothing`'s own doc for why this, and only
+    // this, distinguishes "the model looked and answered badly" from "the
+    // model never answered at all".
+    let mut deterministic = false;
     for step in steps {
         let started = Instant::now();
         let mut rec = AiCallRecord {
@@ -226,6 +249,7 @@ where
                                 rec.error_kind = Some("privacy_tripwire");
                                 record_call_best_effort(sink, rec).await;
                                 failed_from = Some(*engine);
+                                deterministic = true;
                                 continue;
                             }
                         }
@@ -242,6 +266,7 @@ where
                                 rec.error_kind = Some(why);
                                 record_call_best_effort(sink, rec).await;
                                 failed_from = Some(*engine);
+                                deterministic = true;
                             }
                         }
                     }
@@ -275,7 +300,7 @@ where
             }
         }
     }
-    Outcome::Nothing
+    Outcome::Nothing { deterministic }
 }
 
 /// R6 (§11.3.5): a non-producing attempt's call record is best-effort — the
@@ -386,6 +411,9 @@ mod tests {
         ) -> impl Future<Output = Result<(), SinkError>> + Send {
             self.0.lock().unwrap().push(rec);
             async { Ok(()) }
+        }
+        async fn record_classify_eval(&self, _task_id: &str) -> Result<(), SinkError> {
+            Ok(())
         }
         fn precheck(
             &self,
@@ -1043,6 +1071,9 @@ mod tests {
             }
             async fn record_call(&self, _rec: AiCallRecord) -> Result<(), SinkError> {
                 Err(SinkError::Store("boom".into()))
+            }
+            async fn record_classify_eval(&self, _task_id: &str) -> Result<(), SinkError> {
+                Ok(())
             }
             async fn precheck(&self, _cap: Capability, drafts: &[ProposalDraft]) -> Vec<bool> {
                 vec![true; drafts.len()]
