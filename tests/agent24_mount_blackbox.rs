@@ -61,6 +61,46 @@ fn build_agent24d(checkout: &Path) -> PathBuf {
     bin
 }
 
+/// Build Sin90 itself with the `test-hooks` feature on, for
+/// `kernel_clients_roundtrip` — the ONLY test in this file that needs the
+/// `POST /debug/kernel-roundtrip` route (`src/http/kernel_roundtrip.rs`),
+/// which is compiled in exclusively under that feature (off by default,
+/// `Cargo.toml`) so a real ship build never carries it.
+///
+/// Deliberately built into its OWN `--target-dir`, not the default
+/// `target/debug` `CARGO_BIN_EXE_sin90` already points at — that path is
+/// shared with `sin90_mounts_under_a_real_agent24_daemon` (which uses the
+/// plain, `test-hooks`-off binary via `CARGO_BIN_EXE_sin90`), and rebuilding
+/// the SAME path with a different feature set would overwrite that other
+/// test's binary out from under it (Cargo does not give a bin target a
+/// feature-specific filename) — a real, if easy to miss, source of flaky
+/// cross-test interference within one `--test-threads=1` run.
+fn build_sin90_with_test_hooks() -> PathBuf {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let target_dir = manifest_dir.join("target/test-hooks-debug");
+    let status = Command::new("cargo")
+        .args([
+            "build",
+            "--bin",
+            "sin90",
+            "--features",
+            "test-hooks",
+            "--target-dir",
+        ])
+        .arg(&target_dir)
+        .current_dir(&manifest_dir)
+        .status()
+        .expect("could not run cargo build for sin90 (test-hooks)");
+    assert!(status.success(), "cargo build --features test-hooks failed");
+    let bin = target_dir.join("debug/sin90");
+    assert!(
+        bin.is_file(),
+        "expected {} to exist after build",
+        bin.display()
+    );
+    bin
+}
+
 /// `/tmp` directly, NOT `std::env::temp_dir()` — on macOS the latter resolves
 /// through `/var/folders/<hash>/<hash>/T`, and the daemon's out-of-process
 /// callback socket lives at `<home>/.agent24/run/<pid>/callback.sock`. `sockaddr_un`
@@ -588,4 +628,221 @@ fn sin90_mounts_under_a_real_agent24_daemon() {
         }
     };
     assert_eq!(event["payload"]["kind"], "task.created", "{event}");
+}
+
+/// **T3.2.3 — Offer acceptance under a real mount.** Proves the real
+/// `Offer` this real `agent24d` grants Sin90 actually lets its typed kernel
+/// clients (`adapter_agent24::clients::Clients`) round-trip for real, one
+/// capability at a time: memory (`_a24/memory/private/*`), approval
+/// (`_a24/approval/*`), and scheduler (`_a24/scheduler/*`).
+/// `sin90_mounts_under_a_real_agent24_daemon` above already proves the
+/// mount/proxy/event-forwarding mechanism itself; this test's only job is
+/// the three capabilities' actual wire round-trip, which needs its own
+/// specially-built `sin90` binary (`build_sin90_with_test_hooks`) because
+/// the production binary has no route an HTTP test client could use to
+/// drive those typed clients at all — see
+/// `src/adapter_agent24/kernel_roundtrip.rs`'s own module doc for why that
+/// route exists, why it lives in `adapter_agent24` and not `http`, and why
+/// it is `test-hooks`-only.
+///
+/// **No negative control in THIS test.** The obvious one — a Sin90 manifest
+/// that does not request `scheduler`, proving `Offer.provides` then omits
+/// `_a24/scheduler/` and a call comes back `forbidden` — would need a
+/// second `domain-os.yml` and a second full install/mount cycle standing up
+/// a whole second copy of this file's own harness, which was judged not
+/// worth the cost for this round (see the task report). That exact negative
+/// control already exists on the Agent24 side, at the capability-grant
+/// layer this test's positive path exercises: `agent24d`'s own
+/// `domain.rs::scheduler_callback_forbidden_without_grant_and_offered_and_working_with_it`
+/// (and its neighboring cases) prove an ungranted module's
+/// `gate`/`advise`/`status` all come back `forbidden` there.
+///
+/// Unlike the test above (which `eprintln!`s and returns when no checkout is
+/// configured — a legitimate "optional without a sibling repo" skip),
+/// a missing Agent24 checkout HERE is a hard FAILURE, per this task's own
+/// requirement: `#[ignore]` is already this whole file's mechanism for
+/// "never runs under a plain `cargo test`"; a test that ALSO quietly no-ops
+/// the moment someone explicitly asks for it with `--ignored` would never
+/// fail even when genuinely broken.
+#[test]
+#[ignore = "needs a sibling Agent24 checkout; run explicitly: cargo test --test agent24_mount_blackbox -- --ignored --test-threads=1"]
+fn kernel_clients_roundtrip() {
+    let checkout = agent24_checkout().unwrap_or_else(|| {
+        panic!(
+            "no Agent24 checkout found (set AGENT24_CHECKOUT or place it at ../Agent24) — this \
+             test must FAIL, not silently skip, when its prerequisite is missing"
+        )
+    });
+    let agent24d_bin = build_agent24d(&checkout);
+    let sin90_bin = build_sin90_with_test_hooks();
+
+    let home = tmp_home("kclients");
+
+    // Same "prove there is nothing already mounted" guard
+    // `sin90_mounts_under_a_real_agent24_daemon` uses, and for the same
+    // reason (see that test's own comment for the full T11 context).
+    let d1 = start_daemon(&home, &agent24d_bin);
+    let (status, body) = http_get(d1.port, Some(&d1.token), "/api/v1/os").unwrap();
+    assert_eq!(status, 200, "{body}");
+    let before: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        before["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["name"] != "sin90"),
+        "cannot run this test: agent24d still has an in-process \"sin90\" module compiled in \
+         (T11 not fully landed — see sin90_mounts_under_a_real_agent24_daemon's own doc): {body}"
+    );
+    drop(d1);
+
+    install_sin90(&home.join(".agent24/packages"), &sin90_bin);
+
+    // Second lifetime: real restart, same already-built binaries, no
+    // rebuild from here on.
+    let d2 = start_daemon(&home, &agent24d_bin);
+
+    // ── A1: wait for the mount (same list-vs-ready race
+    //    `sin90_mounts_under_a_real_agent24_daemon` retries around).
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if os_list_entry(&d2, "sin90")["state"] == "mounted" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "sin90 never reached state \"mounted\"; daemon log:\n{}",
+            d2.combined_log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let human_key = d2.read_actor_key(&home, "human", Duration::from_secs(10));
+
+    // The mount can report "mounted" slightly before the module is actually
+    // ready to serve a proxied request (`sin90_mounts_under_a_real_agent24_daemon`
+    // hits the identical race). Unlike that test's own `/today` probe, THIS
+    // readiness wait must poll a side-effect-free route, never the debug
+    // route itself: `/debug/kernel-roundtrip` is not idempotent (every
+    // successful call inserts a real, never-cleaned-up approval row and
+    // memory entry — that route's own module doc) — retrying it in a
+    // readiness loop would leave one leftover row per retry, and would
+    // change the very thing the assertions below check (e.g.
+    // `upsert_outcome == "Created"` would go `"Updated"` on a second real
+    // call to it within the same install). Poll `/today` (no side effects,
+    // same probe the other test already trusts) to completion FIRST, then
+    // call the debug route exactly once.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some((status, body)) = http_get(d2.port, Some(&d2.token), "/api/v1/sin90/today") {
+            if status == 200 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "sin90 never answered /today through the real proxy (last status {status}): \
+                 {body}; daemon log:\n{}",
+                d2.combined_log()
+            );
+        } else {
+            assert!(
+                Instant::now() < deadline,
+                "sin90 never answered /today through the real proxy; daemon log:\n{}",
+                d2.combined_log()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Exactly one call — this route has real, uncleaned-up side effects
+    // (module doc), so it must not be retried.
+    let (status, body) = http_call(
+        d2.port,
+        "POST",
+        "/api/v1/sin90/debug/kernel-roundtrip",
+        Some(&d2.token),
+        Some(&human_key),
+        Some("{}"),
+    )
+    .unwrap_or_else(|| {
+        panic!(
+            "no response at all from the real kernel-roundtrip debug route; daemon log:\n{}",
+            d2.combined_log()
+        )
+    });
+    assert_eq!(
+        status,
+        200,
+        "POST /debug/kernel-roundtrip through the real proxy: {body}; daemon log:\n{}",
+        d2.combined_log()
+    );
+    let result: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    // ── Offer.provides — the real handshake's own grant, read back out of
+    //    the response (`kernel_roundtrip`'s handler echoes
+    //    `KernelClients::offer()` verbatim) — must cover every prefix this
+    //    test is about to exercise. This is the assertion the task's own
+    //    "变异验证" flips (to a wrong prefix) to prove this test can go red.
+    let provides = result["offer"]
+        .as_array()
+        .unwrap_or_else(|| panic!("response has no \"offer\" array: {result}"))
+        .iter()
+        .map(|v| v.as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    // Exact membership (L1, review): the real kernel's own `Offer.provides`
+    // entries for these three capabilities are already the identical
+    // strings Sin90 declares in `SIN90_CAPABILITY_PREFIXES`
+    // (`adapter_agent24::clients::{memory,approval,scheduler}::PREFIX`), not
+    // some looser/shorter form — pinning the exact string here catches the
+    // kernel ever granting a differently-shaped prefix, which a
+    // starts_with-either-way check would silently paper over.
+    for want in ["_a24/scheduler/", "_a24/memory/private/", "_a24/approval/"] {
+        assert!(
+            provides.contains(&want.to_string()),
+            "Offer.provides {provides:?} does not cover {want}"
+        );
+    }
+
+    // ── memory: remember, then recall it back ------------------------------
+    assert_eq!(
+        result["memory"]["found_in_recall"], true,
+        "remember-then-recall round trip failed: {result}"
+    );
+    assert!(
+        result["memory"]["remembered_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("osmem:")),
+        "kernel-minted memory id has an unexpected shape: {result}"
+    );
+
+    // ── approval: gate the one closed-set action ---------------------------
+    assert_eq!(
+        result["approval"]["decision"], "Pending",
+        "gate round trip did not come back Pending: {result}"
+    );
+    assert!(
+        result["approval"]["approval_id"].as_str().is_some(),
+        "{result}"
+    );
+
+    // ── scheduler: upsert, list, delete --------------------------------------
+    assert_eq!(
+        result["scheduler"]["upsert_outcome"], "Created",
+        "a fresh install's first upsert of this key must be Created: {result}"
+    );
+    assert_eq!(
+        result["scheduler"]["found_in_list"], true,
+        "upserted key was not visible in list: {result}"
+    );
+    assert_eq!(
+        result["scheduler"]["delete_outcome"], "Deleted",
+        "delete of a key list just proved exists must be Deleted, not Absent: {result}"
+    );
+    // L3 (review): the delete must actually have taken — not just answered
+    // `Deleted` — proven by a THIRD list call (inside the same debug-route
+    // request) no longer finding the key.
+    assert_eq!(
+        result["scheduler"]["found_after_delete"], false,
+        "key was still visible in list after delete claimed \"Deleted\": {result}"
+    );
 }

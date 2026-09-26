@@ -43,6 +43,10 @@ use crate::http::{EventSink, NullEventSink};
 
 pub mod clients;
 mod frame;
+/// T3.2.3, `test-hooks` only — see that module's own doc for why it lives
+/// here rather than in `http`.
+#[cfg(feature = "test-hooks")]
+pub mod kernel_roundtrip;
 mod transport;
 
 // L-1: only `FatalHook` is re-exported — `main.rs` needs to name it to

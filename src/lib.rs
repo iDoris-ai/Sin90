@@ -20,6 +20,15 @@
 //!   `initialize` handshake, `A24_*` env vars, and the `EventSink` that
 //!   forwards to `_a24/events/emit`.
 
+// T3.2.3 review (M2): `test-hooks` gates real, security-relevant surface
+// (`adapter_agent24::kernel_roundtrip`'s debug HTTP route, `store::test_hooks`'s
+// raw DB backdoors) that must never ship. `debug_assertions` is off in a
+// `--release` build unless a `Cargo.toml` profile override lies about it —
+// cheap, load-bearing insurance against `--release --features test-hooks`
+// ever producing a binary anyone could mistake for a real install.
+#[cfg(all(feature = "test-hooks", not(debug_assertions)))]
+compile_error!("test-hooks must not be enabled in release builds");
+
 pub mod adapter_agent24;
 pub mod ai;
 pub mod core;

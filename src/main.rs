@@ -138,6 +138,12 @@ async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = listener_from_fd(env.listen_fd)?;
     tracing::info!("sin90: accepting on kernel-bound listener");
+    // T3.2.3, `test-hooks` only: grab the `Arc<ActorKeys>` `state` already
+    // holds BEFORE `router(state, ..)` below consumes `state` by value — the
+    // debug router (`adapter_agent24::kernel_roundtrip`) needs its own copy
+    // to run the same human-actor-key gate every other write route uses.
+    #[cfg(feature = "test-hooks")]
+    let debug_actor_keys = std::sync::Arc::clone(&state.actor_keys);
     // Agent24's proxy forwards the ORIGINAL request path, not a
     // namespace-stripped one (`agent24-os-proto::proxy::forward` builds the
     // upstream URI from `original.path_and_query()` verbatim) — so a request
@@ -152,7 +158,20 @@ async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
     // `mounted = true`: this IS behind Agent24's kernel proxy, which is what
     // makes `POST /_a24/scheduler/fired` (T3.2.2) trustworthy here — see
     // router()'s doc and architecture.md #4.
-    let mounted_router = axum::Router::new().nest("/api/v1/sin90", router(state, true));
+    let inner_router = router(state, true);
+    // T3.2.3, `test-hooks` only: merge the standalone debug router
+    // (`adapter_agent24::kernel_roundtrip`) onto the same
+    // `/api/v1/sin90` namespace — kept as its OWN router over its OWN tiny
+    // state (never `Sin90State`) so `http` itself never has to know Agent24
+    // exists; see that module's doc for the full reasoning. `_clients` is
+    // `Arc::clone`d, not moved — the callback connection this generation
+    // owns must still outlive this whole function regardless (N-H1, above).
+    #[cfg(feature = "test-hooks")]
+    let inner_router = inner_router.merge(sin90::adapter_agent24::kernel_roundtrip::router(
+        std::sync::Arc::clone(&_clients),
+        debug_actor_keys,
+    ));
+    let mounted_router = axum::Router::new().nest("/api/v1/sin90", inner_router);
     axum::serve(listener, mounted_router).await?;
     Ok(())
 }
