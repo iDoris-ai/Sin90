@@ -4673,6 +4673,13 @@ mod ai_classify {
         let items = items.as_array().unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["result"], "proposed");
+        // M1 (2026-09-26 review round 2): a non-skipped item carries no
+        // `reason` field at all (`AiRunItem::reason`'s `skip_serializing_if`).
+        assert!(
+            items[0].get("reason").is_none(),
+            "a non-skipped item must not have a reason field: {:?}",
+            items[0]
+        );
         // M5: `calls` is read from the durable `sin90_ai_calls` table.
         let calls = calls.as_array().unwrap();
         assert!(
@@ -5230,6 +5237,9 @@ mod ai_classify {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["target"], task.id);
         assert_eq!(items[0]["result"], "skipped");
+        // M2/M1 (2026-09-26 review round 2): dedup-skip carries `reason:
+        // "dedup"` — mirrors `ai_propose`'s own dedup-skip assertion.
+        assert_eq!(items[0]["reason"], "dedup");
     }
 
     // ---- run registry eviction must not drop a still-running entry -------
@@ -5395,6 +5405,17 @@ mod ai_propose {
             .unwrap_or_else(|| panic!("no item for target {target}: {items:?}"))["result"]
             .as_str()
             .unwrap()
+    }
+
+    /// M1 (2026-09-26 review round 2): like [`item_result`] but hands back
+    /// the WHOLE item (so a caller can also inspect `reason`).
+    fn item_by_target<'a>(items: &'a Value, target: &str) -> &'a Value {
+        items
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["target"] == target)
+            .unwrap_or_else(|| panic!("no item for target {target}: {items:?}"))
     }
 
     #[tokio::test]
@@ -5566,6 +5587,15 @@ mod ai_propose {
         assert_eq!(item_result(&items, "propose.carry"), "proposed");
         assert_eq!(item_result(&items, "propose.reorder"), "nothing");
         assert_eq!(item_result(&items, "propose.create"), "nothing");
+        // M1 (2026-09-26 review round 2): a non-skipped item carries no
+        // `reason` field at all.
+        assert!(
+            item_by_target(&items, "propose.carry")
+                .get("reason")
+                .is_none(),
+            "a non-skipped item must not have a reason field: {:?}",
+            item_by_target(&items, "propose.carry")
+        );
 
         let submitted: Vec<_> = sink
             .0
@@ -6013,6 +6043,9 @@ mod ai_propose {
         let (state, items) = poll_run_to_done(&app, run["run_id"].as_str().unwrap()).await;
         assert_eq!(state, "done");
         assert_eq!(item_result(&items, "propose.reorder"), "skipped");
+        // M1 (2026-09-26 review round 2): dedup-skip carries `reason:
+        // "dedup"` — mirrors `ai_classify`'s own dedup-skip assertion.
+        assert_eq!(item_by_target(&items, "propose.reorder")["reason"], "dedup");
         let proposals_after = store.list_pending_proposals().await.unwrap().len();
         assert_eq!(
             proposals_before, proposals_after,
@@ -6324,6 +6357,507 @@ mod ai_propose {
         assert!(
             !dedup.skip_create,
             "C is still a genuinely uncovered gap — must NOT blanket-skip create: {dedup:?}"
+        );
+    }
+}
+
+// ---- POST /ai/summarize (T5.3.1, design §11.4 公共 + §11.4.2) --------------
+
+mod ai_summarize {
+    use super::*;
+    use crate::ai::Capability;
+    use crate::core::NewReview;
+    use crate::core::ReviewKind;
+
+    /// Polls `GET /ai/runs/{run_id}` until `state != "running"` (5s
+    /// wall-clock ceiling, same posture `ai_classify`/`ai_propose`'s own
+    /// fix uses) and returns the final `(state, items)`.
+    async fn poll_run_to_done(app: &axum::Router, run_id: &str) -> (String, Value) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut state_str = "running".to_string();
+        let mut items = Value::Null;
+        while tokio::time::Instant::now() < deadline {
+            let r = body_json(
+                app.clone()
+                    .oneshot(get_req(&format!("/ai/runs/{run_id}")))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            state_str = r["state"].as_str().unwrap().to_string();
+            items = r["items"].clone();
+            if state_str != "running" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        (state_str, items)
+    }
+
+    #[tokio::test]
+    async fn trigger_summarize_requires_an_actor_key() {
+        let (app, _sink) = test_app().await;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/ai/summarize")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"review_id": "r1"}).to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn trigger_summarize_unknown_field_is_400() {
+        let (app, _sink) = test_app().await;
+        let resp = app
+            .oneshot(automation_req(
+                "POST",
+                "/ai/summarize",
+                json!({"review_id": "r1", "oops": true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn trigger_summarize_unknown_review_is_404() {
+        let (app, _sink) = test_app().await;
+        let resp = app
+            .oneshot(automation_req(
+                "POST",
+                "/ai/summarize",
+                json!({"review_id": "does-not-exist"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// §11.4.2's "输入": `daily`/`rhythm` is a client mistake, not "nothing
+    /// to summarize" — `400 unsupported_kind`, not `404`/`409`.
+    #[tokio::test]
+    async fn trigger_summarize_unsupported_kind_is_400() {
+        let (app, _sink, store) = test_app_with_store().await;
+        let review = store
+            .create_review(&NewReview {
+                kind: ReviewKind::Daily,
+                period: "2026-09-24".into(),
+            })
+            .await
+            .unwrap();
+        let resp = app
+            .oneshot(automation_req(
+                "POST",
+                "/ai/summarize",
+                json!({"review_id": review.id}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], "unsupported_kind");
+    }
+
+    /// A finalized weekly review is a closed door for summarize, same as
+    /// `PATCH /reviews/{id}` — `409`, same v1 error envelope every other
+    /// route uses.
+    #[tokio::test]
+    async fn trigger_summarize_not_draft_is_409() {
+        let (app, _sink, store) = test_app_with_store().await;
+        let review = store
+            .create_review(&NewReview {
+                kind: ReviewKind::Weekly,
+                period: "2026-W39".into(),
+            })
+            .await
+            .unwrap();
+        store.finalize_review(&review.id).await.unwrap();
+
+        let resp = app
+            .oneshot(automation_req(
+                "POST",
+                "/ai/summarize",
+                json!({"review_id": review.id}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], "conflict");
+    }
+
+    /// J19/M3 (2026-09-26 review): a proposal submitted while the review was
+    /// still `draft`, but ACCEPTED only after the review was finalized in
+    /// the meantime, must be rejected — `422 ReviewNotDraft`, and the
+    /// review's body (finalized) is unchanged.
+    #[tokio::test]
+    async fn accept_stale_summarize_proposal_after_finalize_is_422() {
+        let (app, _sink, store) = test_app_with_store().await;
+        let review = store
+            .create_review(&NewReview {
+                kind: ReviewKind::Weekly,
+                period: "2026-W39".into(),
+            })
+            .await
+            .unwrap();
+
+        let resp = app
+            .clone()
+            .oneshot(automation_req(
+                "POST",
+                "/ai/summarize",
+                json!({"review_id": review.id}),
+            ))
+            .await
+            .unwrap();
+        let run_id = body_json(resp).await["run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (state_str, items) = poll_run_to_done(&app, &run_id).await;
+        assert_eq!(state_str, "done");
+        assert_eq!(items.as_array().unwrap()[0]["result"], "proposed");
+
+        let pending = store.list_pending_proposals().await.unwrap();
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        let proposal_id = pending[0].id.clone();
+
+        // Finalize the review WHILE the proposal is still pending.
+        store.finalize_review(&review.id).await.unwrap();
+
+        let resp = app
+            .oneshot(human_req(
+                "POST",
+                &format!("/proposals/{proposal_id}/accept"),
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = body_json(resp).await;
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("ReviewNotDraft")
+                || body["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .to_lowercase()
+                    .contains("draft"),
+            "{body:?}"
+        );
+
+        let untouched = store.get_review(&review.id).await.unwrap();
+        assert_eq!(untouched.status, crate::core::ReviewStatus::Finalized);
+    }
+
+    /// Pre-seeds the registry directly (rather than racing two real
+    /// requests, which would be flaky against a background `tokio::spawn`)
+    /// to pin the single-flight 409 shape — same technique `ai_classify`/
+    /// `ai_propose`'s own tests use.
+    #[tokio::test]
+    async fn trigger_summarize_busy_returns_409_with_existing_run_id() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let review = store
+            .create_review(&NewReview {
+                kind: ReviewKind::Weekly,
+                period: "2026-W39".into(),
+            })
+            .await
+            .unwrap();
+        let state = Sin90State::new(
+            store,
+            Arc::new(RecordingSink::default()),
+            ActorKeys {
+                human: HUMAN.into(),
+                automation: AUTOMATION.into(),
+            },
+        );
+        state
+            .ai_runs
+            .lock()
+            .unwrap()
+            .start(Capability::Summarize, "run-already-going");
+        let app = router(state, false);
+        let resp = app
+            .oneshot(automation_req(
+                "POST",
+                "/ai/summarize",
+                json!({"review_id": review.id}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "ai_busy");
+        assert_eq!(body["run_id"], "run-already-going");
+    }
+
+    /// End-to-end through the real router — `202` → background run → polled
+    /// to completion via `GET /ai/runs/{id}` — with NO real `ModelPort`
+    /// wired yet (T5.1.2), so this exercises the reflex fallback (a
+    /// facts-only body, always decisive).
+    #[tokio::test]
+    async fn trigger_summarize_runs_in_background_and_is_pollable_to_done() {
+        let (app, sink, store) = test_app_with_store().await;
+        let area = store.create_area("Coding").await.unwrap();
+        let direction = store
+            .create_direction("Ship the thing", "2026-Q4", Some(&area.id))
+            .await
+            .unwrap();
+        let block = store
+            .create_block(Some(&direction.id), None, 90)
+            .await
+            .unwrap();
+        store
+            .transition_block(&block.id, crate::core::ScheduleBlockStatus::Started)
+            .await
+            .unwrap();
+        store
+            .transition_block(&block.id, crate::core::ScheduleBlockStatus::Completed)
+            .await
+            .unwrap();
+        crate::store::test_hooks::set_last_event_at(
+            &store,
+            "block",
+            &block.id,
+            "2026-09-24T10:00:00Z",
+        )
+        .await
+        .unwrap();
+        let task = store
+            .create_task(
+                "Ship it",
+                None,
+                None,
+                crate::core::TaskKind::Other,
+                crate::core::Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+        for to in [
+            crate::core::TaskStatus::Planned,
+            crate::core::TaskStatus::InProgress,
+            crate::core::TaskStatus::Done,
+        ] {
+            store.transition_task(&task.id, to).await.unwrap();
+        }
+        crate::store::test_hooks::set_last_event_at(
+            &store,
+            "task",
+            &task.id,
+            "2026-09-24T10:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        // Ground truth (T4.3.1's own function, independently of anything
+        // `ai::summarize` computes).
+        let t431 = store.weekly_draft("2026-W39").await.unwrap();
+        assert_eq!(t431.by_direction[0].minutes, 90);
+        assert_eq!(t431.tasks_done, 1);
+
+        let review = store
+            .create_review(&NewReview {
+                kind: ReviewKind::Weekly,
+                period: "2026-W39".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(review.body, "", "a freshly created review's body is empty");
+
+        let resp = app
+            .clone()
+            .oneshot(automation_req(
+                "POST",
+                "/ai/summarize",
+                json!({"review_id": review.id}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body = body_json(resp).await;
+        assert_eq!(body["capability"], "summarize");
+        let run_id = body["run_id"].as_str().unwrap().to_string();
+
+        let (state_str, items) = poll_run_to_done(&app, &run_id).await;
+        assert_eq!(state_str, "done", "run never finished: items={items:?}");
+        let items = items.as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["target"], review.id);
+        assert_eq!(items[0]["result"], "proposed");
+        assert!(items[0].get("reason").is_none(), "{items:?}");
+
+        let proposed = store.get_review(&review.id).await.unwrap();
+        // The review itself is UNCHANGED (the proposal is only `pending`,
+        // §11.5's structural guarantee — a trigger never writes business
+        // state directly).
+        assert_eq!(proposed.body, "");
+
+        let pending: Vec<_> = store
+            .list_pending_proposals()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|p| {
+                matches!(
+                    p.ops.as_slice(),
+                    [crate::core::Sin90Op::DraftReviewBody { review_id, .. }]
+                        if review_id == &review.id
+                )
+            })
+            .collect();
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        let crate::core::Sin90Op::DraftReviewBody {
+            body: proposed_body,
+            ..
+        } = &pending[0].ops[0]
+        else {
+            unreachable!()
+        };
+        // 90 minutes -> "1 小时 30 分钟" — computed the SAME way
+        // `t431.by_direction[0].minutes` was independently read above.
+        assert!(
+            proposed_body.contains("投入：1 小时 30 分钟"),
+            "{proposed_body}"
+        );
+        assert!(proposed_body.contains("完成任务数：1"), "{proposed_body}");
+        assert!(proposed_body.contains("本周数字"), "{proposed_body}");
+
+        // H2 (design §11.4 公共's L1): mirrored through the SAME `EventSink`
+        // the human `POST /proposals` path uses.
+        let submitted: Vec<_> = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(kind, _)| kind == "proposal.submitted")
+            .cloned()
+            .collect();
+        assert_eq!(submitted.len(), 1, "{submitted:?}");
+    }
+
+    /// Q7/J19 (design §11.4.2's "可改写条件"): a human-written line under the
+    /// program's own facts block means this run produces NOTHING — the item
+    /// result is `skipped` with `reason: "human_text"`.
+    #[tokio::test]
+    async fn trigger_summarize_human_text_is_skipped() {
+        let (app, _sink, store) = test_app_with_store().await;
+        let review = store
+            .create_review(&NewReview {
+                kind: ReviewKind::Weekly,
+                period: "2026-W39".into(),
+            })
+            .await
+            .unwrap();
+        store
+            .update_review_body(&review.id, "我自己写的复盘，AI 别碰。")
+            .await
+            .unwrap();
+
+        let resp = app
+            .clone()
+            .oneshot(automation_req(
+                "POST",
+                "/ai/summarize",
+                json!({"review_id": review.id}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let run_id = body_json(resp).await["run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let (state_str, items) = poll_run_to_done(&app, &run_id).await;
+        assert_eq!(state_str, "done");
+        let items = items.as_array().unwrap();
+        assert_eq!(items[0]["result"], "skipped");
+        assert_eq!(items[0]["reason"], "human_text");
+
+        let untouched = store.get_review(&review.id).await.unwrap();
+        assert_eq!(untouched.body, "我自己写的复盘，AI 别碰。");
+        let pending = store.list_pending_proposals().await.unwrap();
+        assert!(
+            pending.is_empty(),
+            "human text must never produce a proposal: {pending:?}"
+        );
+    }
+
+    /// §11.4 公共's "去重", generic form (§11.4.2 gives summarize no
+    /// capability-specific refinement): a second trigger while a still-valid
+    /// pending `DraftReviewBody` proposal already targets this review is
+    /// skipped entirely, `reason: "dedup"`, without even reading
+    /// `weekly_draft` again.
+    #[tokio::test]
+    async fn trigger_summarize_dedup_skips_repeat_run() {
+        let (app, _sink, store) = test_app_with_store().await;
+        let review = store
+            .create_review(&NewReview {
+                kind: ReviewKind::Weekly,
+                period: "2026-W39".into(),
+            })
+            .await
+            .unwrap();
+
+        let resp1 = app
+            .clone()
+            .oneshot(automation_req(
+                "POST",
+                "/ai/summarize",
+                json!({"review_id": review.id}),
+            ))
+            .await
+            .unwrap();
+        let run1 = body_json(resp1).await["run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (state1, items1) = poll_run_to_done(&app, &run1).await;
+        assert_eq!(state1, "done");
+        assert_eq!(items1.as_array().unwrap()[0]["result"], "proposed");
+
+        let resp2 = app
+            .clone()
+            .oneshot(automation_req(
+                "POST",
+                "/ai/summarize",
+                json!({"review_id": review.id}),
+            ))
+            .await
+            .unwrap();
+        let run2 = body_json(resp2).await["run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (state2, items2) = poll_run_to_done(&app, &run2).await;
+        assert_eq!(state2, "done");
+        assert_eq!(items2.as_array().unwrap()[0]["result"], "skipped");
+        assert_eq!(items2.as_array().unwrap()[0]["reason"], "dedup");
+
+        let pending = store.list_pending_proposals().await.unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "the second run must not have produced a duplicate proposal: {pending:?}"
+        );
+
+        // Positive control: accept the first proposal, then dedup itself
+        // (`dedup_summarize`) — the SAME query the trigger route uses —
+        // reports it no longer blocks a third run (the pending proposal is
+        // gone, `precheck` has nothing left to find valid).
+        store.apply_proposal(&pending[0].id).await.unwrap();
+        let skip_after_accept = crate::http::ai_summarize::dedup_summarize(&store, &review.id)
+            .await
+            .unwrap();
+        assert!(
+            !skip_after_accept,
+            "an applied proposal must not dedup-block a future run"
         );
     }
 }

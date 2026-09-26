@@ -205,11 +205,15 @@ pub async fn trigger_classify(
             .map(|task_id| AiRunItem {
                 target: task_id,
                 result: "skipped".to_string(),
+                // M2 (2026-09-26 review): this run never even tried — a
+                // still-valid pending proposal already covers it.
+                reason: Some("dedup"),
             })
             .collect();
         items.extend(outcomes.into_iter().map(|o| AiRunItem {
             target: o.task_id,
             result: item_result_str(&o.result).to_string(),
+            reason: None,
         }));
 
         let final_state = if aborted { "aborted" } else { "done" };
