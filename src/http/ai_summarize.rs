@@ -90,21 +90,23 @@ pub async fn trigger_summarize(
         // target about to be skipped anyway should not pay for an extra
         // round trip before the slot claim, and the trigger itself must not
         // race a background run that is about to discover the same thing.
-        let skip = match dedup_summarize(store, &review.id).await {
+        let skip_reason = match dedup_summarize(store, &review.id).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, run_id = %rid, "summarize: dedup query failed; running WITHOUT dedup for this run");
-                false
+                None
             }
         };
 
-        let item = if skip {
+        let item = if let Some(reason) = skip_reason {
             AiRunItem {
                 target: review.id.clone(),
                 result: "skipped".to_string(),
-                // M2 (2026-09-26 review): this run never even tried — a
-                // still-valid pending proposal already covers this review.
-                reason: Some("dedup"),
+                // M2 (2026-09-26 review): this run never even tried — either
+                // a still-valid pending proposal already covers this review
+                // (`"dedup"`) or (T5.7.2, design §2 #31) a rejected one does,
+                // unchanged since (`"suppressed_rejected"`).
+                reason: Some(reason),
             }
         } else {
             // T5.1.2 (closes the TODO this used to carry — mirrors
@@ -237,7 +239,7 @@ fn summarize_input_error(e: SummarizeInputError) -> Response {
 pub(crate) async fn dedup_summarize(
     store: &Sin90Store,
     review_id: &str,
-) -> Result<bool, StoreError> {
+) -> Result<Option<&'static str>, StoreError> {
     let pending = store.list_pending_proposals().await?;
     let mut drafts = Vec::new();
     for p in pending {
@@ -251,9 +253,39 @@ pub(crate) async fn dedup_summarize(
             }
         }
     }
-    if drafts.is_empty() {
-        return Ok(false);
+    if !drafts.is_empty() {
+        let valid = AiSink::precheck(store, Capability::Summarize, &drafts).await;
+        if valid.into_iter().any(|ok| ok) {
+            return Ok(Some("dedup"));
+        }
     }
-    let valid = AiSink::precheck(store, Capability::Summarize, &drafts).await;
-    Ok(valid.into_iter().any(|ok| ok))
+
+    // T5.7.2 (design §2 #31): rejection-based suppression, fingerprinted by
+    // `review_id` ALONE (body/`base_body_sha256` deliberately excluded — a
+    // rewrite's WORDING differs every run even when "should this review be
+    // rewritten at all" hasn't changed, so comparing bodies would make the
+    // suppression never actually fire). "Situation changed" reuses the SAME
+    // SHA-256 `DraftReviewBody`'s own D6 check already relies on: has the
+    // review's CURRENT body moved on from the snapshot the rejected proposal
+    // was generated against? The "新 Direction" leg does not apply here (§2
+    // #31: a weekly draft's numbers already fold in every Direction that
+    // exists at RUN time regardless of one more appearing, so a new
+    // Direction is not itself evidence that "this review should be
+    // rewritten" the way it is for classify/propose).
+    let rejected = store
+        .list_rejected_ops(Capability::Summarize.as_str())
+        .await?;
+    let Some(latest) = rejected.iter().rev().find_map(|r| match r.ops.as_slice() {
+        [Sin90Op::DraftReviewBody {
+            review_id: rid,
+            base_body_sha256,
+            ..
+        }] if rid == review_id => Some(base_body_sha256.clone()),
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+    let current = store.get_review(review_id).await?;
+    let current_hash = crate::core::body_sha256(&current.body);
+    Ok((current_hash == latest).then_some("suppressed_rejected"))
 }

@@ -9775,8 +9775,197 @@ mod ai_summarize {
             .await
             .unwrap();
         assert!(
-            !skip_after_accept,
+            skip_after_accept.is_none(),
             "an applied proposal must not dedup-block a future run"
+        );
+    }
+
+    // ---- T5.7.2 (design §2 #31): rejected-suggestion suppression ----------
+
+    /// `cargo test suppress_`'s summarize half: a REJECTED `DraftReviewBody`
+    /// keeps `dedup_summarize` reporting `"suppressed_rejected"` for the SAME
+    /// review while the body is untouched, and stops (`dedup_summarize`
+    /// returns `None` — dedup no longer blocks this review; whether the NEXT
+    /// `/ai/summarize` run actually PRODUCES a fresh rewrite is a separate
+    /// question the ladder itself decides, not something this dedup-only
+    /// check claims) the moment the body is edited out from under it (the
+    /// fingerprint's own "situation changed" leg — §2 #31's summarize-
+    /// specific reuse of `DraftReviewBody`'s D6 hash comparison; no "新
+    /// Direction" leg here, by design).
+    #[tokio::test]
+    async fn suppress_rejected_summarize_blocks_until_body_edited() {
+        let (_app, _sink, store) = test_app_with_store().await;
+        let review = store
+            .create_review(&NewReview {
+                kind: ReviewKind::Weekly,
+                period: "2026-W40".into(),
+            })
+            .await
+            .unwrap();
+        let base_hash = crate::core::body_sha256(&review.body);
+        let draft = crate::ai::ProposalDraft {
+            id: "p-suppress-summarize-1".into(),
+            ops: vec![crate::core::Sin90Op::DraftReviewBody {
+                review_id: review.id.clone(),
+                base_body_sha256: base_hash,
+                body: "a first draft".into(),
+            }],
+            rationale: None,
+        };
+        let rec = crate::ai::AiCallRecord {
+            id: "c-suppress-summarize-1".into(),
+            run_id: "run-suppress-summarize".into(),
+            task_kind: Capability::Summarize,
+            engine: crate::ai::Engine::Reflex,
+            fallback_from: None,
+            served_tier: None,
+            model_id: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            latency_ms: 0,
+            ok: true,
+            error_kind: None,
+            proposal_id: None,
+            at: "2026-09-24T00:00:00Z".into(),
+        };
+        crate::ai::AiSink::submit(&store, Capability::Summarize, draft, rec)
+            .await
+            .unwrap();
+        store
+            .reject_proposal("p-suppress-summarize-1", None)
+            .await
+            .unwrap();
+
+        // Negative control: the body is exactly what it was when the
+        // rejected proposal was generated against it — still suppressed.
+        let reason = crate::http::ai_summarize::dedup_summarize(&store, &review.id)
+            .await
+            .unwrap();
+        assert_eq!(reason, Some("suppressed_rejected"));
+
+        // Positive control: a human edits the review's own body.
+        store
+            .update_review_body(&review.id, "a human rewrote this")
+            .await
+            .unwrap();
+        let reason2 = crate::http::ai_summarize::dedup_summarize(&store, &review.id)
+            .await
+            .unwrap();
+        assert_eq!(reason2, None, "an edited body must lift the suppression");
+    }
+
+    /// T5.7.2 review round 2 (M4): the SAME review rejected TWICE, with a
+    /// human body edit in between — `dedup_summarize` must compare against
+    /// the MOST RECENT rejection's `base_body_sha256`, not the first one
+    /// (`list_rejected_ops` is oldest-first; `dedup_summarize`'s own
+    /// `.iter().rev().find_map(..)` is what picks the last match instead of
+    /// the first). Mutation target: drop the `.rev()` and this goes red —
+    /// the STALE first rejection's base hash no longer matches the current
+    /// body, so suppression wrongly lifts.
+    #[tokio::test]
+    async fn suppress_rejected_summarize_uses_the_most_recent_rejections_base_hash() {
+        let (_app, _sink, store) = test_app_with_store().await;
+        let review = store
+            .create_review(&NewReview {
+                kind: ReviewKind::Weekly,
+                period: "2026-W41".into(),
+            })
+            .await
+            .unwrap();
+
+        // Round 1: rejected against the ORIGINAL body.
+        let base_hash_1 = crate::core::body_sha256(&review.body);
+        let draft1 = crate::ai::ProposalDraft {
+            id: "p-suppress-summarize-2a".into(),
+            ops: vec![crate::core::Sin90Op::DraftReviewBody {
+                review_id: review.id.clone(),
+                base_body_sha256: base_hash_1.clone(),
+                body: "a first draft".into(),
+            }],
+            rationale: None,
+        };
+        let rec1 = crate::ai::AiCallRecord {
+            id: "c-suppress-summarize-2a".into(),
+            run_id: "run-suppress-summarize-2".into(),
+            task_kind: Capability::Summarize,
+            engine: crate::ai::Engine::Reflex,
+            fallback_from: None,
+            served_tier: None,
+            model_id: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            latency_ms: 0,
+            ok: true,
+            error_kind: None,
+            proposal_id: None,
+            at: "2026-09-24T00:00:00Z".into(),
+        };
+        crate::ai::AiSink::submit(&store, Capability::Summarize, draft1, rec1)
+            .await
+            .unwrap();
+        store
+            .reject_proposal("p-suppress-summarize-2a", None)
+            .await
+            .unwrap();
+
+        // A human edits the body BETWEEN the two rejections.
+        store
+            .update_review_body(&review.id, "edited between rejections")
+            .await
+            .unwrap();
+        let current_after_edit = store.get_review(&review.id).await.unwrap();
+        let base_hash_2 = crate::core::body_sha256(&current_after_edit.body);
+        assert_ne!(
+            base_hash_1, base_hash_2,
+            "the edit must actually change the hash"
+        );
+
+        // Round 2: rejected against the NEW (post-edit) body — the body is
+        // NOT touched again after this.
+        let draft2 = crate::ai::ProposalDraft {
+            id: "p-suppress-summarize-2b".into(),
+            ops: vec![crate::core::Sin90Op::DraftReviewBody {
+                review_id: review.id.clone(),
+                base_body_sha256: base_hash_2.clone(),
+                body: "a second draft".into(),
+            }],
+            rationale: None,
+        };
+        let rec2 = crate::ai::AiCallRecord {
+            id: "c-suppress-summarize-2b".into(),
+            run_id: "run-suppress-summarize-2".into(),
+            task_kind: Capability::Summarize,
+            engine: crate::ai::Engine::Reflex,
+            fallback_from: None,
+            served_tier: None,
+            model_id: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            latency_ms: 0,
+            ok: true,
+            error_kind: None,
+            proposal_id: None,
+            at: "2026-09-24T00:00:01Z".into(),
+        };
+        crate::ai::AiSink::submit(&store, Capability::Summarize, draft2, rec2)
+            .await
+            .unwrap();
+        store
+            .reject_proposal("p-suppress-summarize-2b", None)
+            .await
+            .unwrap();
+
+        // The body is still exactly what round 2's rejection saw
+        // (`base_hash_2`) — must be suppressed. A buggy implementation that
+        // picked the FIRST (oldest) rejection instead would compare against
+        // `base_hash_1`, which no longer matches, and wrongly lift it.
+        let reason = crate::http::ai_summarize::dedup_summarize(&store, &review.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            reason,
+            Some("suppressed_rejected"),
+            "must compare against the MOST RECENT rejection's base hash, not the first one"
         );
     }
 }
