@@ -5545,6 +5545,143 @@ mod ai_classify {
             "an explicit choice==\"none\" must not carry a reason key at all: {items:?}"
         );
     }
+
+    /// A `ModelPort`/`ModelCaller` whose `complete` never resolves — stands
+    /// in for a genuinely hung `_a24/model/complete` call (or the kernel
+    /// simply vanishing mid-call) so `with_hard_deadline` (`ai_runs`) is the
+    /// ONLY thing that can ever end the run.
+    struct HangingModelCaller;
+    impl crate::http::ModelCaller for HangingModelCaller {
+        fn complete<'a>(
+            &'a self,
+            _req: crate::ai::ModelRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<crate::ai::ModelReply, crate::ai::ModelFailure>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// M-2 (2026-09-26 review round 2): `trigger_classify`'s `Err(_elapsed)`
+    /// branch, exercised end-to-end through the REAL router — `ai_runs`'s
+    /// own `with_hard_deadline_*` tests only prove the wrapping mechanism in
+    /// isolation, never a route that actually reaches it. Injects a
+    /// millisecond-scale [`Sin90State::run_hard_deadline`] and a
+    /// [`HangingModelCaller`] (so the ladder's `Step::Model(Local)` call
+    /// never returns on its own) and asserts all three things the round-2
+    /// review asked for: `GET /ai/runs/{id}` reports `aborted`, the
+    /// single-flight slot is released, and an immediate second trigger gets
+    /// `202`, not `409`.
+    ///
+    /// Real (unpaused) time, not `tokio::time::pause` — tried first and
+    /// abandoned: mixing a paused/auto-advancing clock with a REAL
+    /// background `tokio::spawn` task plus real (if in-memory) SQLite work
+    /// reproduced the exact same unpredictable-overshoot behavior
+    /// `adapter_agent24::clients::model`'s own L2 timeout test had to work
+    /// around for a raw socket — not worth re-fighting here when a small
+    /// REAL deadline (the same choice `trigger_classify_runs_in_background_
+    /// and_is_pollable_to_done` above already makes for this same shape of
+    /// test) is both simpler and just as deterministic in practice.
+    #[tokio::test]
+    async fn trigger_classify_hard_deadline_aborts_releases_slot_and_allows_a_second_trigger() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        // `classify_one` short-circuits straight to `Nothing` (no model
+        // call at all) when there are zero Direction candidates — need at
+        // least one so the ladder actually reaches `Step::Model(Local)`.
+        store
+            .create_direction("Unrelated Direction", "2026-Q4", None)
+            .await
+            .unwrap();
+        store
+            .create_task(
+                "a brand new task with no classification history",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+        let mut state = Sin90State::new(
+            store,
+            Arc::new(RecordingSink::default()),
+            crate::http::ActorKeys {
+                human: HUMAN.into(),
+                automation: AUTOMATION.into(),
+            },
+        );
+        // A model IS wired (so `plan()` schedules `Step::Model(Local)`
+        // regardless of `ModelAccess` — `ai::ladder::plan`'s own doc), but
+        // it never answers — the run can only ever end via the hard
+        // deadline below.
+        state.model = Some(Arc::new(HangingModelCaller));
+        state.run_hard_deadline = std::time::Duration::from_millis(50);
+        let app = router(state.clone(), false);
+
+        let resp = app
+            .clone()
+            .oneshot(automation_req("POST", "/ai/classify", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let run_id = body_json(resp).await["run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Real, small wall-clock ceiling (same style as `trigger_classify_
+        // runs_in_background_and_is_pollable_to_done` above): the 50ms hard
+        // deadline should end this in well under a second, but a 5s ceiling
+        // means a slow CI box doesn't turn a real pass into a flaky failure.
+        let poll_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut state_str = "running".to_string();
+        while tokio::time::Instant::now() < poll_deadline {
+            let r = body_json(
+                app.clone()
+                    .oneshot(get_req(&format!("/ai/runs/{run_id}")))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            state_str = r["state"].as_str().unwrap().to_string();
+            if state_str != "running" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            state_str, "aborted",
+            "a run cancelled by the hard deadline must report aborted, not done/running"
+        );
+
+        // Single-flight slot released.
+        assert!(
+            state
+                .ai_runs
+                .lock()
+                .unwrap()
+                .busy_run(Capability::Classify)
+                .is_none(),
+            "the single-flight slot must be released once the hard deadline cancels the run"
+        );
+
+        // An immediate second trigger must be accepted, not bounced with 409.
+        let resp2 = app
+            .oneshot(automation_req("POST", "/ai/classify", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp2.status(),
+            StatusCode::ACCEPTED,
+            "the slot must be free for a brand new run right after the aborted one"
+        );
+    }
 }
 
 // ---- POST /ai/propose (T5.4.1, design §11.4 公共 + §11.4.3) ----------------

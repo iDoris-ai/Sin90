@@ -164,7 +164,7 @@ async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
     // what `wire_kernel_clients` decided about wiring a business client to
     // it. Dropping it early would close the kernel's only connection for
     // this generation, which the kernel treats as this generation crashing.
-    let (sink, clients_handle) = wire_kernel_clients(&offer, Arc::new(clients));
+    let (sink, model, clients_handle) = wire_kernel_clients(&offer, Arc::new(clients));
     // T3.3.2: the reconciler only ever runs HERE, mounted mode — it needs a
     // real `SchedulerClient`, which only exists once the kernel's `Offer`
     // actually granted `_a24/scheduler/` (`SchedulerClient::new`'s own doc).
@@ -180,7 +180,10 @@ async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
              in sin90_outbox as pending until a future generation is granted it"
         );
     }
-    let state = Sin90State::new(store, sink, keys);
+    let mut state = Sin90State::new(store, sink, keys);
+    // T5.1.2: `Some` only when the kernel granted `_a24/model/` at
+    // handshake — `Sin90State::model`'s own doc.
+    state.model = model;
 
     let listener = listener_from_fd(env.listen_fd)?;
     tracing::info!("sin90: accepting on kernel-bound listener");

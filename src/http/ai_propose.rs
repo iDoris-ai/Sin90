@@ -22,13 +22,13 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::ai::propose::{self, ProposeDedup, ProposeInputError, ProposeItemResult};
-use crate::ai::{AiSink, Capability, ModelAccess, NoModelPort, ProposalDraft};
+use crate::ai::{AiSink, Capability, ProposalDraft, MODEL_ACCESS};
 use crate::core::{Sin90Op, Task, TaskId, Week, WeekId};
 use crate::store::{Sin90Store, StoreError};
 
 use super::ai_classify::EmittingSink;
-use super::ai_runs::{lock_registry, AiRunItem, BusyGuard};
-use super::state::Sin90State;
+use super::ai_runs::{lock_registry, with_hard_deadline, AiRunItem, BusyGuard};
+use super::state::{HttpModelPort, Sin90State};
 use super::{error_response, parse};
 
 #[derive(Debug, Deserialize)]
@@ -98,47 +98,68 @@ pub async fn trigger_propose(
             }
         };
 
-        let model: Option<&NoModelPort> = None; // T5.1.2: no real adapter wired yet.
-                                                // M2 (2026-09-24 review): `EmittingSink` mirrors `proposal.submitted`
-                                                // IMMEDIATELY inside `submit` — reused verbatim from `ai_classify`'s
-                                                // own round-2 fix (design §11.4 公共's L1: "submit 成功后...补发",
-                                                // not "after the whole run finishes"), not a second implementation.
+        // T5.1.2 (closes the TODO this used to carry — mirrors
+        // `ai_classify::trigger_classify`'s own wiring): `Some` only in
+        // mounted mode with `_a24/model/` granted, `None` in `standalone`.
+        let model = bg_state.model.clone().map(HttpModelPort);
+        let model = model.as_ref();
+        // M2 (2026-09-24 review): `EmittingSink` mirrors `proposal.submitted`
+        // IMMEDIATELY inside `submit` — reused verbatim from `ai_classify`'s
+        // own round-2 fix (design §11.4 公共's L1: "submit 成功后...补发",
+        // not "after the whole run finishes"), not a second implementation.
         let emitting = EmittingSink {
             store,
             sink: bg_state.sink.clone(),
         };
-        let outcomes = propose::run_propose(
-            &rid,
-            &week,
-            &dedup,
-            // TODO(T5.1.2): hardcoded until the real `ModelPort` adapter and
-            // `domain-os.yml`'s `model_access` are wired up — this trigger
-            // route cannot request `RemoteAllowed` today regardless of the
-            // installed manifest (mirrors `ai_classify::trigger_classify`'s
-            // own TODO).
-            ModelAccess::LocalOnly,
-            model,
-            &emitting,
-            &reader,
+        // L3 (2026-09-26 review) + M-1 (round 2, mirrors `ai_classify::
+        // trigger_classify`'s own fix): a hard backstop (`RUN_HARD_DEADLINE`
+        // — deliberately bigger than `RUN_DEADLINE_SECS` alone) via
+        // `with_hard_deadline` (`ai_runs`) — see its own doc for the full
+        // reasoning.
+        let outcomes = with_hard_deadline(
+            bg_state.run_hard_deadline,
+            propose::run_propose(
+                &rid,
+                &week,
+                &dedup,
+                *MODEL_ACCESS,
+                model,
+                &emitting,
+                &reader,
+            ),
         )
         .await;
 
-        let aborted = outcomes
-            .iter()
-            .any(|o| o.result == ProposeItemResult::Aborted);
-        let items: Vec<AiRunItem> = outcomes
-            .into_iter()
-            .map(|o| AiRunItem {
-                target: o.kind.as_str().to_string(),
-                result: item_result_str(&o.result).to_string(),
-                // M2 (2026-09-26 review): propose's own `Skipped` IS
-                // dedup — the only way this capability's item-level result
-                // can be "skipped" (§11.4 公共's "去重").
-                reason: matches!(o.result, ProposeItemResult::Skipped).then_some("dedup"),
-            })
-            .collect();
+        fn to_items(outcomes: Vec<propose::ProposeItem>) -> Vec<AiRunItem> {
+            outcomes
+                .into_iter()
+                .map(|o| AiRunItem {
+                    target: o.kind.as_str().to_string(),
+                    result: item_result_str(&o.result).to_string(),
+                    // M2 (2026-09-26 review): propose's own `Skipped` IS
+                    // dedup — the only way this capability's item-level
+                    // result can be "skipped" (§11.4 公共's "去重").
+                    reason: matches!(o.result, ProposeItemResult::Skipped).then_some("dedup"),
+                })
+                .collect()
+        }
 
-        let final_state = if aborted { "aborted" } else { "done" };
+        let (final_state, items) = match outcomes {
+            Ok(outcomes) => {
+                let aborted = outcomes
+                    .iter()
+                    .any(|o| o.result == ProposeItemResult::Aborted);
+                (if aborted { "aborted" } else { "done" }, to_items(outcomes))
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    run_id = %rid,
+                    "propose: run exceeded the {:?} hard deadline; cancelled mid-flight",
+                    bg_state.run_hard_deadline
+                );
+                ("aborted", Vec::new())
+            }
+        };
         guard.finish(final_state, items);
     });
 

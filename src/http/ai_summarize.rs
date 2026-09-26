@@ -21,13 +21,13 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::ai::summarize::{self, SummarizeInputError, SummarizeItemResult};
-use crate::ai::{AiSink, Capability, ModelAccess, NoModelPort, ProposalDraft};
+use crate::ai::{AiSink, Capability, ProposalDraft, MODEL_ACCESS};
 use crate::core::Sin90Op;
 use crate::store::{Sin90Store, StoreError};
 
 use super::ai_classify::EmittingSink;
-use super::ai_runs::{lock_registry, AiRunItem, BusyGuard};
-use super::state::Sin90State;
+use super::ai_runs::{lock_registry, with_hard_deadline, AiRunItem, BusyGuard};
+use super::state::{HttpModelPort, Sin90State};
 use super::{error_response, parse};
 
 #[derive(Debug, Deserialize)]
@@ -107,10 +107,12 @@ pub async fn trigger_summarize(
                 reason: Some("dedup"),
             }
         } else {
-            // TODO(T5.1.2): hardcoded `None` until the real `ModelPort`
-            // adapter (`src/adapter_agent24/clients/model.rs`) is wired up —
-            // mirrors `ai_classify::trigger_classify`'s own TODO.
-            let model: Option<&NoModelPort> = None;
+            // T5.1.2 (closes the TODO this used to carry — mirrors
+            // `ai_classify::trigger_classify`'s own wiring): `Some` only in
+            // mounted mode with `_a24/model/` granted, `None` in
+            // `standalone`.
+            let model = bg_state.model.clone().map(HttpModelPort);
+            let model = model.as_ref();
             // M2-style (mirrors `ai_classify`/`ai_propose`'s own H2/M2 fix):
             // `EmittingSink` mirrors `proposal.submitted` IMMEDIATELY inside
             // `submit`, reused verbatim — not a second implementation.
@@ -118,28 +120,42 @@ pub async fn trigger_summarize(
                 store,
                 sink: bg_state.sink.clone(),
             };
-            let result = summarize::run_summarize(
-                &rid,
-                &review,
-                // TODO(T5.1.2): hardcoded until the real `ModelPort` adapter
-                // and `domain-os.yml`'s `model_access` are wired up — this
-                // trigger route cannot request `RemoteAllowed` today
-                // regardless of the installed manifest (mirrors
-                // `ai_classify`/`ai_propose`'s own TODO).
-                ModelAccess::LocalOnly,
-                model,
-                &emitting,
-                &reader,
+            // L3 (2026-09-26 review) + M-1 (round 2, mirrors `ai_classify`/
+            // `ai_propose`'s own fix): a hard backstop (`RUN_HARD_DEADLINE`
+            // — deliberately bigger than `RUN_DEADLINE_SECS` alone) via
+            // `with_hard_deadline` (`ai_runs`) — see its own doc for the
+            // full reasoning.
+            let outcome = with_hard_deadline(
+                bg_state.run_hard_deadline,
+                summarize::run_summarize(&rid, &review, *MODEL_ACCESS, model, &emitting, &reader),
             )
             .await;
-            // M2: `Skipped` (Q7's human-text gate) is the only result this
-            // capability can produce that carries a "why" worth naming —
-            // every other result maps to a `None` reason.
-            let reason = matches!(result, SummarizeItemResult::Skipped).then_some("human_text");
-            AiRunItem {
-                target: review.id.clone(),
-                result: item_result_str(&result).to_string(),
-                reason,
+            match outcome {
+                Ok(result) => {
+                    // M2: `Skipped` (Q7's human-text gate) is the only
+                    // result this capability can produce that carries a
+                    // "why" worth naming — every other result maps to a
+                    // `None` reason.
+                    let reason =
+                        matches!(result, SummarizeItemResult::Skipped).then_some("human_text");
+                    AiRunItem {
+                        target: review.id.clone(),
+                        result: item_result_str(&result).to_string(),
+                        reason,
+                    }
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        run_id = %rid,
+                        "summarize: run exceeded the {:?} hard deadline; cancelled mid-flight",
+                        bg_state.run_hard_deadline
+                    );
+                    AiRunItem {
+                        target: review.id.clone(),
+                        result: "aborted".to_string(),
+                        reason: None,
+                    }
+                }
             }
         };
 

@@ -19,14 +19,12 @@ use serde_json::json;
 use std::sync::Arc;
 
 use crate::ai::classify::{self, ClassifyInputError, ClassifyItem, ItemResult};
-use crate::ai::{
-    AiCallRecord, AiSink, Capability, ModelAccess, NoModelPort, ProposalDraft, SinkError,
-};
+use crate::ai::{AiCallRecord, AiSink, Capability, ProposalDraft, SinkError, MODEL_ACCESS};
 use crate::core::{ProposalStatus, Sin90Op, Task, TaskId};
 use crate::store::{Sin90Store, StoreError};
 
-use super::ai_runs::{lock_registry, AiRunItem, BusyGuard};
-use super::state::{EventSink, Sin90State};
+use super::ai_runs::{lock_registry, with_hard_deadline, AiRunItem, BusyGuard};
+use super::state::{EventSink, HttpModelPort, Sin90State};
 use super::{error_response, parse};
 
 #[derive(Debug, Deserialize)]
@@ -172,9 +170,15 @@ pub async fn trigger_classify(
             }
         };
 
-        // TODO(T5.1.2): hardcoded `None` until the real `ModelPort` adapter
-        // (`src/adapter_agent24/clients/model.rs`) is wired up.
-        let model: Option<&NoModelPort> = None;
+        // T5.1.2 (closes the TODO this used to carry): `Some` only in
+        // mounted mode, and only when the kernel granted `_a24/model/` at
+        // handshake (`Sin90State::model`'s own doc) — `standalone` mode
+        // leaves this `None`, same as before. `HttpModelPort` wraps the
+        // `http`-local `dyn ModelCaller` back into something that
+        // implements `ai::ModelPort` (`http::state`'s own doc) without this
+        // file ever naming `adapter_agent24::clients::model::ModelClient`.
+        let model = bg_state.model.clone().map(HttpModelPort);
+        let model = model.as_ref();
         // H2 (design §11.4 公共's L1, round 2 fix): `EmittingSink` mirrors
         // `proposal.submitted` IMMEDIATELY inside `submit`, one commit at a
         // time — not batched into a loop AFTER the whole run finishes (the
@@ -185,24 +189,53 @@ pub async fn trigger_classify(
             store,
             sink: bg_state.sink.clone(),
         };
-        let outcomes = classify::run_classify(
-            &rid,
-            &targets,
-            // TODO(T5.1.2): hardcoded until the real `ModelPort` adapter and
-            // `domain-os.yml`'s `model_access` are wired up (see `ai::mod`'s
-            // "T5.1.2 接线" doc) — this trigger route cannot request
-            // `RemoteAllowed` today regardless of the installed manifest.
-            ModelAccess::LocalOnly,
-            model,
-            &emitting,
-            &reader,
+        // L3 (2026-09-26 review) + M-1 (round 2): a HARD backstop on top of
+        // `ai::ladder`'s own internal between-items budget (`RunState::
+        // deadline` — checked before STARTING a step, not while one is in
+        // flight). `RUN_HARD_DEADLINE` is DELIBERATELY bigger than
+        // `RUN_DEADLINE_SECS` alone (its own doc, `ai_runs`) — a run that
+        // starts its LAST permitted call right at the internal deadline
+        // needs up to a full `MODEL_CALL_TIMEOUT` more real time to wrap up
+        // gracefully, and this backstop must not fire before that grace
+        // period ends. `with_hard_deadline` (`ai_runs`) lives outside `ai/`,
+        // which may not depend on `tokio` at all (§11.5's dependency arrow;
+        // `tests/ai_boundary.rs`'s `EXTERN_OK` does not list it).
+        let outcomes = with_hard_deadline(
+            bg_state.run_hard_deadline,
+            classify::run_classify(
+                &rid,
+                &targets,
+                // T5.1.2 (closes the TODO this used to carry): the compiled-in
+                // constant, not a hardcoded `LocalOnly` — `standalone` mode's
+                // `model` is always `None` regardless, so `plan()` never
+                // schedules a `Step::Model` there no matter which `ModelAccess`
+                // value this reads.
+                *MODEL_ACCESS,
+                model,
+                &emitting,
+                &reader,
+            ),
         )
         .await;
 
-        let aborted = outcomes.iter().any(|o| o.result == ItemResult::Aborted);
-        let items = build_classify_run_items(skipped, outcomes);
-
-        let final_state = if aborted { "aborted" } else { "done" };
+        let (final_state, items) = match outcomes {
+            Ok(outcomes) => {
+                let aborted = outcomes.iter().any(|o| o.result == ItemResult::Aborted);
+                let items = build_classify_run_items(skipped, outcomes);
+                (if aborted { "aborted" } else { "done" }, items)
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    run_id = %rid,
+                    "classify: run exceeded the {:?} hard deadline; cancelled mid-flight",
+                    bg_state.run_hard_deadline
+                );
+                // No per-item outcomes to report — the run was cancelled
+                // mid-flight, not finished — but the dedup-skipped items
+                // computed BEFORE the run started are still honest to show.
+                ("aborted", build_classify_run_items(skipped, Vec::new()))
+            }
+        };
         guard.finish(final_state, items);
     });
 

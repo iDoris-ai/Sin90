@@ -198,6 +198,22 @@ impl ModelPort for ModelClient {
     }
 }
 
+/// `http`'s own `dyn`-safe seam ([`crate::http::ModelCaller`], mirroring
+/// `KernelEventSink: EventSink`) — lets `wire_kernel_clients` hand
+/// `Sin90State::model` an `Arc<dyn ModelCaller>` without `http` ever naming
+/// [`ModelClient`] directly (lib.rs's own dependency arrow: `http` must not
+/// depend on `adapter_agent24`).
+impl crate::http::ModelCaller for ModelClient {
+    fn complete<'a>(
+        &'a self,
+        req: ModelRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ModelReply, ModelFailure>> + Send + 'a>,
+    > {
+        Box::pin(async move { ModelPort::complete(self, req).await })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

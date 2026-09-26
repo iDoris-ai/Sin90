@@ -39,7 +39,7 @@ use tokio::io::BufReader;
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, Mutex as AsyncMutex, Semaphore};
 
-use crate::http::{EventSink, NullEventSink};
+use crate::http::{EventSink, ModelCaller, NullEventSink};
 
 pub mod clients;
 mod frame;
@@ -172,15 +172,17 @@ pub fn manifest_digest(manifest_bytes: &[u8]) -> String {
 /// `KernelEventSink`; `scheduler`/`memory` (private)/`approval` have typed
 /// clients as of T3.2.1 (`clients::Clients`, built from an `Arc<KernelClients>`
 /// once the handshake is done — each one is `None` unless `Offer.provides`
-/// covers its own prefix, architecture.md 不可破边界 #7). `model` is
-/// deliberately NOT listed — Sin90 does not declare that capability this
-/// round (L4), and the `initialize` `capabilities` field below never lists
-/// it either.
+/// covers its own prefix, architecture.md 不可破边界 #7). `model` joined this
+/// list in T5.1.2 (`clients::model::ModelClient`, same "`None` unless
+/// granted" posture) — `domain-os.yml` now requests it via
+/// `kernel_capabilities: [..., models]` and [`INITIALIZE_CAPABILITIES`]
+/// lists it too.
 pub const SIN90_CAPABILITY_PREFIXES: &[&str] = &[
     "_a24/events/",
     "_a24/scheduler/",
     "_a24/memory/private/",
     "_a24/approval/",
+    "_a24/model/",
 ];
 
 /// Whether `offer` grants at least one prefix from
@@ -523,17 +525,31 @@ impl EventSink for KernelEventSink {
 /// T3.2.1, is not penalized for events being absent) — never whether the
 /// connection itself survives. The caller (`main.rs`) must hold the returned
 /// `Arc<KernelClients>` for the rest of the process's life either way.
-pub fn wire_kernel_clients(
-    offer: &[String],
-    clients: Arc<KernelClients>,
-) -> (Arc<dyn EventSink>, Arc<KernelClients>) {
+///
+/// T5.1.2 adds the model client to the tuple: `Some(Arc<dyn ModelCaller>)`
+/// — `http`'s own `dyn`-safe seam for `_a24/model/complete` (mirrors
+/// `EventSink`; `http` must never name `clients::model::ModelClient`
+/// directly, lib.rs's own dependency arrow) — only when `Offer.provides`
+/// covers `_a24/model/`; `None` otherwise (including the
+/// `provides_any_known_capability` early return below, same as every other
+/// client). `main.rs` assigns it to `Sin90State::model`.
+/// Named purely to keep [`wire_kernel_clients`]'s signature under clippy's
+/// `type_complexity` — no semantic meaning beyond "this function's own
+/// return shape".
+pub type WiredKernelClients = (
+    Arc<dyn EventSink>,
+    Option<Arc<dyn ModelCaller>>,
+    Arc<KernelClients>,
+);
+
+pub fn wire_kernel_clients(offer: &[String], clients: Arc<KernelClients>) -> WiredKernelClients {
     if !provides_any_known_capability(offer) {
         tracing::warn!(
             "sin90: kernel offered no capability Sin90 uses; the callback connection is kept \
              open regardless (N-H1 — closing it would end this generation) but no client is \
              wired to it"
         );
-        return (Arc::new(NullEventSink), clients);
+        return (Arc::new(NullEventSink), None, clients);
     }
     let sink: Arc<dyn EventSink> = if clients.provides("_a24/events/emit") {
         Arc::new(KernelEventSink::new(clients.clone()))
@@ -543,7 +559,20 @@ pub fn wire_kernel_clients(
         tracing::warn!("sin90: events not offered by kernel; running with events dropped");
         Arc::new(NullEventSink)
     };
-    (sink, clients)
+    // M3 (2026-09-26 review): wrapped in `SemaphoredModelCaller` — built
+    // ONCE here, at wiring time, and shared across every AI trigger route
+    // through this single `Arc` — so Sin90's own three-capability fan-out
+    // (classify/summarize/propose) can never put more than
+    // `MODEL_MAX_IN_FLIGHT_PER_MODULE` calls to the kernel in flight at
+    // once (`SemaphoredModelCaller`'s own doc).
+    let model: Option<Arc<dyn ModelCaller>> = clients::model::ModelClient::new(&clients).map(|m| {
+        let raw: Arc<dyn ModelCaller> = Arc::new(m);
+        Arc::new(crate::http::SemaphoredModelCaller::new(
+            raw,
+            crate::http::MODEL_MAX_IN_FLIGHT_PER_MODULE,
+        )) as Arc<dyn ModelCaller>
+    });
+    (sink, model, clients)
 }
 
 /// Build a `tokio::net::UnixListener` from the kernel-bound `A24_LISTEN_FD`.
@@ -764,7 +793,7 @@ mod tests {
         let offer: Vec<String> = vec![];
         let (clients, mut peer) = clients_over_a_socket_pair(offer.clone());
 
-        let (_sink, holder) = wire_kernel_clients(&offer, clients);
+        let (_sink, _model, holder) = wire_kernel_clients(&offer, clients);
 
         let mut buf = [0u8; 1];
         let read = tokio::time::timeout(Duration::from_millis(200), peer.read(&mut buf)).await;
@@ -787,7 +816,7 @@ mod tests {
         let offer: Vec<String> = vec![];
         let (clients, mut peer) = clients_over_a_socket_pair(offer.clone());
 
-        let (_sink, holder) = wire_kernel_clients(&offer, clients);
+        let (_sink, _model, holder) = wire_kernel_clients(&offer, clients);
         drop(holder);
 
         let mut buf = [0u8; 1];
@@ -805,7 +834,7 @@ mod tests {
         let offer = vec!["_a24/scheduler/".to_string()];
         let (clients, mut peer) = clients_over_a_socket_pair(offer.clone());
 
-        let (sink, _holder) = wire_kernel_clients(&offer, clients);
+        let (sink, _model, _holder) = wire_kernel_clients(&offer, clients);
         sink.emit("test.kind", Map::new());
 
         let mut buf = [0u8; 1];
@@ -823,7 +852,7 @@ mod tests {
         let (clients, peer) = clients_over_a_socket_pair(offer.clone());
         let mut peer_reader = BufReader::new(peer);
 
-        let (sink, _holder) = wire_kernel_clients(&offer, clients);
+        let (sink, _model, _holder) = wire_kernel_clients(&offer, clients);
         sink.emit("test.kind", Map::new());
 
         let mut buf = Vec::new();
@@ -836,6 +865,33 @@ mod tests {
         .unwrap();
         let parsed: Value = serde_json::from_slice(&buf).unwrap();
         assert_eq!(parsed["method"], "_a24/events/emit");
+    }
+
+    /// T5.1.2: `_a24/model/` granted → `ModelClient::new` returns `Some`,
+    /// wrapped into `Arc<dyn ModelCaller>` — the tuple's second slot is
+    /// `Some`, not `None`.
+    #[tokio::test]
+    async fn wiring_wires_a_model_client_when_model_is_offered() {
+        let offer = vec!["_a24/model/".to_string()];
+        let (clients, _peer) = clients_over_a_socket_pair(offer.clone());
+
+        let (_sink, model, _holder) = wire_kernel_clients(&offer, clients);
+        assert!(
+            model.is_some(),
+            "Offer.provides covering _a24/model/ must wire a ModelCaller"
+        );
+    }
+
+    /// Positive control: granted some other capability (not `_a24/model/`)
+    /// → the model slot stays `None`, same "句柄可能不在" posture every
+    /// other typed client already has.
+    #[tokio::test]
+    async fn wiring_model_is_none_when_model_is_not_offered() {
+        let offer = vec!["_a24/scheduler/".to_string()];
+        let (clients, _peer) = clients_over_a_socket_pair(offer.clone());
+
+        let (_sink, model, _holder) = wire_kernel_clients(&offer, clients);
+        assert!(model.is_none());
     }
 
     #[tokio::test]

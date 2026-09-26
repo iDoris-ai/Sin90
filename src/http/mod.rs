@@ -44,7 +44,10 @@ use crate::core::{
 use crate::store::{AutoReviewCreated, RoutineFireOutcome, StoreError};
 
 pub use actor::{Actor, ActorKeys};
-pub use state::{EventSink, NullEventSink, Sin90State};
+pub use state::{
+    EventSink, HttpModelPort, ModelCaller, NullEventSink, SemaphoredModelCaller, Sin90State,
+    MODEL_MAX_IN_FLIGHT_PER_MODULE,
+};
 
 /// The v1 error envelope every handler below returns on failure — same shape
 /// regardless of which layer produced the error, so a client cannot tell
