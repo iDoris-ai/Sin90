@@ -80,7 +80,18 @@ mod tests {
         let areas = store.list_areas().await.unwrap();
         assert_eq!(areas.len(), 5);
 
-        let directions = store.list_directions().await.unwrap();
+        // T5.2.2 (design §2 #30): `list_directions` also returns the
+        // system-reserved 待定 Direction — seeded by migration
+        // `0014_triage_direction.sql`, present in every `open_memory()` db
+        // from the start, independent of this pack. Filtered out here so
+        // this test keeps asserting only about what THIS pack installed.
+        let directions: Vec<_> = store
+            .list_directions()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|d| d.id != crate::core::TRIAGE_DIRECTION_ID)
+            .collect();
         // Each seed area has exactly one opening direction in this bundle.
         assert_eq!(directions.len(), 5);
         assert!(directions.iter().all(|d| d.area_id.is_some()));
