@@ -38,5 +38,28 @@ jobs:
       - name: cargo clippy --all-targets --features test-hooks -- -D warnings
         run: cargo clippy --all-targets --features test-hooks -- -D warnings
 
+      # L-5 (2026-09-26 review round 2): the third feature combination —
+      # `remote-allowed-manifest` compiles a genuinely different code path
+      # (`ai::ports::MANIFEST_YAML`/`MODEL_ACCESS`'s other `#[cfg]` arm) that
+      # neither of the two clippy runs above ever lints.
+      - name: cargo clippy --all-targets --features remote-allowed-manifest -- -D warnings
+        run: cargo clippy --all-targets --features remote-allowed-manifest -- -D warnings
+
       - name: cargo test
         run: cargo test
+
+      # T5.1.2 H2 (2026-09-26 review): `remote-allowed-manifest` (test
+      # package B, §11.3.2/§2 #26) swaps which domain-os*.yml gets compiled
+      # into `ai::MODEL_ACCESS` — a whole separate feature-gated code path
+      # (`ai::ports::manifest_tests::model_access_is_remote_allowed_when_
+      # the_test_feature_is_on`, the `domain-os.remote-allowed.yml` embed)
+      # that the plain `cargo test` above never compiles at all.
+      - name: cargo test --features remote-allowed-manifest
+        run: cargo test --features remote-allowed-manifest
+
+      # J23b automation: builds BOTH package variants and cross-checks
+      # `sin90 print-model-access`'s output against the `model_access` value
+      # parsed out of each one's own domain-os*.yml — plus one deliberate
+      # cross-mismatch positive control. See the script's own header.
+      - name: scripts/check-model-access.sh
+        run: ./scripts/check-model-access.sh
