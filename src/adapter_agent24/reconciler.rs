@@ -1165,7 +1165,7 @@ mod tests {
         // SAME dedup_key `store::repo`'s own writers always use.
         let auto_row = test_hooks::outbox_rows_for(&store, &dedup).await.unwrap()[0].clone();
         store
-            .outbox_mark_done(&auto_row.id, auto_row.version)
+            .outbox_mark_done(&auto_row.id, auto_row.version, None)
             .await
             .unwrap();
         test_hooks::insert_raw_outbox_row(
@@ -1439,7 +1439,10 @@ mod tests {
         // that delivery had genuinely been lost.
         for row in test_hooks::outbox_rows_for(&store, &dedup).await.unwrap() {
             if row.status == "pending" {
-                store.outbox_mark_done(&row.id, row.version).await.unwrap();
+                store
+                    .outbox_mark_done(&row.id, row.version, None)
+                    .await
+                    .unwrap();
             }
         }
 
