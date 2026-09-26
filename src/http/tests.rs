@@ -8477,36 +8477,53 @@ mod ai_propose {
         );
     }
 
-    /// M-c pin (M1, `Sin90Store::task_modified_since`): the SAME reorder-
-    /// suppression setup as the sibling test above, but the change after the
-    /// rejection is a `direction_assigned` event (an accepted classify
-    /// proposal), not a status transition — this must NOT count as "the
-    /// task was modified" and must NOT lift the suppression, unlike M3's own
-    /// `transitioned` leg. `AssignTaskDirection`'s own event is deliberately
-    /// EXCLUDED from `task_modified_since` (`repo.rs`'s own doc: reassigning
-    /// a task's Direction, including the 待定 fallback itself, is classify's
-    /// own action, not "the user edited this task's content"). Mutation
-    /// target: delete the `AND kind != 'direction_assigned'` clause from
-    /// `task_modified_since`'s SQL and this goes red (round 3 stops being
-    /// `"skipped"`). Calls `dedup_propose` DIRECTLY (like `suppress_rejected_
-    /// propose_create_blocks_per_direction`/`dedup_propose_excludes_create_
-    /// directions_per_item_not_all_or_nothing` above) rather than round-
-    /// tripping through the real `/ai/propose` trigger — the target
-    /// Direction is created BEFORE the rejection (so it is never "new"
-    /// relative to `proposed_at`, isolating this test to ONLY the
-    /// `task_modified_since` leg; going through the full reflex pipeline
-    /// would also need a genuinely new Direction to prove the OTHER leg
-    /// isn't what is lifting the suppression, which is a different test).
+    /// 2026-09-26 external review (blocking): the OLD reorder-suppression
+    /// judgement (task-set coverage + `task_modified_since`) could not see a
+    /// `direction_assigned` reassignment change `reorder_reflex`'s OWN
+    /// ranking — `reorder_reflex` (`ai::propose`) sorts by `status_tier`
+    /// THEN by the task's Direction's rhythm-alloc `pct` (descending), but
+    /// `task_modified_since` deliberately excludes `direction_assigned`
+    /// events (that exclusion is correct for its OTHER caller; it just made
+    /// this one blind). Reproduces the review's own repro: D1 `pct: 50`, D2
+    /// `pct: 90`, task `b` starts under D1 — round 1's reflex order is
+    /// `[b, a, c]` (a/c have no Direction, `pct` 0, tie broken by
+    /// `created_at`); rejecting it and then reassigning `c` to the
+    /// ALREADY-EXISTING D2 (never "new" relative to `proposed_at`, so the
+    /// situation-changed gate above stays closed and cannot be what lifts
+    /// this) must still lift the suppression, because recomputing
+    /// `reorder_reflex` right now yields `[c, b, a]` — a different order
+    /// than the one that was rejected. Goes through the real `/ai/propose`
+    /// trigger (not `dedup_propose` directly) so the reproduced order itself
+    /// — not just `skip_reorder`'s boolean — is pinned.
     #[tokio::test]
-    async fn suppress_rejected_propose_reorder_unaffected_by_direction_assigned() {
-        let (_app, _sink, store) = test_app_with_store().await;
-        let real = store
-            .create_direction("Real home", "2026-Q4", None)
+    async fn suppress_rejected_propose_reorder_lifts_on_direction_requota() {
+        let (app, _sink, store) = test_app_with_store().await;
+        let d1 = store.create_direction("D1", "2026-Q4", None).await.unwrap();
+        let d2 = store.create_direction("D2", "2026-Q4", None).await.unwrap();
+        crate::store::test_hooks::insert_rhythm(&store, "rhythm-d1-d2")
             .await
             .unwrap();
-        let target = store.create_week("2026-W48").await.unwrap();
+        sqlx::query("UPDATE sin90_rhythms SET allocations = ? WHERE id = ?")
+            .bind(
+                serde_json::to_string(&vec![
+                    crate::core::Alloc {
+                        direction_id: d1.id.clone(),
+                        pct: 50,
+                    },
+                    crate::core::Alloc {
+                        direction_id: d2.id.clone(),
+                        pct: 90,
+                    },
+                ])
+                .unwrap(),
+            )
+            .bind("rhythm-d1-d2")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let target = store.create_week("2026-W49").await.unwrap();
         let seed = crate::core::Sin90Proposal {
-            id: "seed-reorder-tasks-mc".into(),
+            id: "seed-reorder-tasks-requota".into(),
             status: crate::core::ProposalStatus::Pending,
             source: crate::core::ProposalSource::Rule,
             ops: vec![Sin90Op::CreateTasks {
@@ -8518,6 +8535,10 @@ mod ai_propose {
                     },
                     NewTask {
                         title: "task b".into(),
+                        direction_id: Some(d1.id.clone()),
+                    },
+                    NewTask {
+                        title: "task c".into(),
                         direction_id: None,
                     },
                 ],
@@ -8533,88 +8554,121 @@ mod ai_propose {
         .fetch_all(store.pool())
         .await
         .unwrap();
+        assert_eq!(task_ids.len(), 3);
         let task_a = task_ids[0].clone();
         let task_b = task_ids[1].clone();
+        let task_c = task_ids[2].clone();
 
-        // An AI-produced (`capability_source = "propose"`) reorder proposal
-        // covering both current tasks — content doesn't matter beyond
-        // `dedup_propose`'s own "covers the current non-terminal set" check.
-        let reorder_draft = crate::ai::ProposalDraft {
-            id: "p-mc-reorder".into(),
-            ops: vec![Sin90Op::ReorderTasks {
-                week_id: target.id.clone(),
-                order: vec![task_b.clone(), task_a.clone()],
-            }],
-            rationale: None,
-        };
-        let rec = crate::ai::AiCallRecord {
-            id: "call-mc-reorder".into(),
-            run_id: "run-mc-reorder".into(),
-            task_kind: Capability::Propose,
-            engine: crate::ai::Engine::Reflex,
-            fallback_from: None,
-            served_tier: None,
-            model_id: None,
-            prompt_tokens: None,
-            completion_tokens: None,
-            latency_ms: 0,
-            ok: true,
-            error_kind: None,
-            proposal_id: None,
-            at: "2026-09-24T00:00:00Z".into(),
-        };
-        crate::ai::AiSink::submit(&store, Capability::Propose, reorder_draft, rec)
-            .await
-            .unwrap();
-        store.reject_proposal("p-mc-reorder", None).await.unwrap();
+        // Round 1: b's D1 quota (50) outranks a/c's un-Directioned 0 —
+        // reflex proposes [b, a, c].
+        let run1 = body_json(
+            app.clone()
+                .oneshot(automation_req(
+                    "POST",
+                    "/ai/propose",
+                    json!({"week_id": target.id}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let (state1, items1) = poll_run_to_done(&app, run1["run_id"].as_str().unwrap()).await;
+        assert_eq!(state1, "done");
+        assert_eq!(item_result(&items1, "propose.reorder"), "proposed");
+        let pending1 = store.list_pending_proposals().await.unwrap();
+        let reorder1 = pending1
+            .iter()
+            .find(|p| matches!(p.ops.as_slice(), [Sin90Op::ReorderTasks { .. }]))
+            .expect("round 1 must have produced a reorder proposal");
+        match reorder1.ops.as_slice() {
+            [Sin90Op::ReorderTasks { order, .. }] => {
+                assert_eq!(
+                    order,
+                    &vec![task_b.clone(), task_a.clone(), task_c.clone()],
+                    "round 1 reflex order must rank b (D1 pct 50) first"
+                );
+            }
+            _ => unreachable!(),
+        }
+        store.reject_proposal(&reorder1.id, None).await.unwrap();
 
-        // Baseline: nothing has changed since the rejection — suppressed.
-        let dedup = crate::http::ai_propose::dedup_propose(&store, &target)
-            .await
-            .unwrap();
-        assert!(
-            dedup.skip_reorder,
-            "an unchanged rejected reorder must stay suppressed: {dedup:?}"
+        // Round 2: nothing changed since the rejection — negative control,
+        // must stay suppressed.
+        let run2 = body_json(
+            app.clone()
+                .oneshot(automation_req(
+                    "POST",
+                    "/ai/propose",
+                    json!({"week_id": target.id}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let (state2, items2) = poll_run_to_done(&app, run2["run_id"].as_str().unwrap()).await;
+        assert_eq!(state2, "done");
+        assert_eq!(
+            item_result(&items2, "propose.reorder"),
+            "skipped",
+            "an unchanged rejected reorder must stay suppressed"
         );
 
-        // task_a gets classified into the (already-existing, never "new")
-        // Direction — the SAME `direction_assigned` event an accepted
-        // classify run would produce.
+        // c gets reassigned to D2 — ALREADY-EXISTING (created before the
+        // rejection), so it is never "new" relative to `proposed_at`; the
+        // situation-changed (new-Direction) gate must stay closed, isolating
+        // this to reorder's OWN recomputed-order check.
         let assign = crate::core::Sin90Proposal {
-            id: "assign-task-a-mc".into(),
+            id: "assign-task-c-to-d2".into(),
             status: crate::core::ProposalStatus::Pending,
             source: crate::core::ProposalSource::Rule,
-            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
-                task_id: task_a.clone(),
-                direction_id: real.id.clone(),
+            ops: vec![Sin90Op::AssignTaskDirection {
+                task_id: task_c.clone(),
+                direction_id: d2.id.clone(),
             }],
             rationale: None,
         };
         store.submit_proposal(&assign).await.unwrap();
         store.apply_proposal(&assign.id).await.unwrap();
-        // Pushed safely past the rejection's `proposed_at` —
-        // `now_iso8601()`'s second resolution would otherwise tie the
-        // `direction_assigned` event's `at` with `proposed_at` in the same
-        // wall-clock second, satisfying neither `>` comparison regardless of
-        // the exclusion this test pins (same reasoning every other
-        // backdating/forward-dating test in this suite documents).
-        crate::store::test_hooks::set_task_direction_assigned_event_at(
-            &store,
-            &task_a,
-            "2099-01-01T00:00:00Z",
-        )
-        .await
-        .unwrap();
 
-        // STILL suppressed — a `direction_assigned` event is not "the task
-        // was modified".
-        let dedup2 = crate::http::ai_propose::dedup_propose(&store, &target)
-            .await
-            .unwrap();
-        assert!(
-            dedup2.skip_reorder,
-            "a direction_assigned event must NOT count as the task being modified: {dedup2:?}"
+        // Round 3: c's new D2 quota (90) now outranks everything — the
+        // recomputed reflex order [c, b, a] differs from the rejected
+        // [b, a, c], so the suppression must lift and reproduce it.
+        let run3 = body_json(
+            app.clone()
+                .oneshot(automation_req(
+                    "POST",
+                    "/ai/propose",
+                    json!({"week_id": target.id}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let (state3, items3) = poll_run_to_done(&app, run3["run_id"].as_str().unwrap()).await;
+        assert_eq!(state3, "done");
+        assert_eq!(
+            item_result(&items3, "propose.reorder"),
+            "proposed",
+            "reassigning c to a Direction with a higher quota must lift the \
+             suppression even though D2 itself is not new: {items3:?}"
         );
+        let pending3 = store.list_pending_proposals().await.unwrap();
+        let reorder3 = pending3
+            .iter()
+            .find(|p| {
+                matches!(p.ops.as_slice(), [Sin90Op::ReorderTasks { .. }]) && p.id != reorder1.id
+            })
+            .expect("round 3 must have produced a NEW reorder proposal");
+        match reorder3.ops.as_slice() {
+            [Sin90Op::ReorderTasks { order, .. }] => {
+                assert_eq!(
+                    order,
+                    &vec![task_c.clone(), task_b.clone(), task_a.clone()],
+                    "round 3 reflex order must re-rank c (now D2 pct 90) first"
+                );
+            }
+            _ => unreachable!(),
+        }
     }
 
     /// T5.7.2 review round 2 (M4): create's rejection-suppression is
