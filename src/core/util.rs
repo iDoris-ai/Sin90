@@ -57,6 +57,15 @@ pub fn now_iso8601() -> String {
     iso8601_at(epoch_secs())
 }
 
+/// Same fixed-width shape as [`now_iso8601`], `secs_from_now` seconds later —
+/// used by the outbox reconciler (`adapter_agent24::reconciler`, T3.3.2) to
+/// compute a retryable failure's `next_attempt_at` (spec.md M3's exponential
+/// backoff) without pulling a full date-arithmetic dependency into `core`.
+/// Saturates rather than overflowing for an absurdly large input.
+pub fn iso8601_after_secs(secs_from_now: u64) -> String {
+    iso8601_at(epoch_secs().saturating_add(secs_from_now))
+}
+
 /// Start of the user's current local day, as a fixed-width UTC timestamp
 /// comparable with event `at` values. "Local" is the system timezone (`TZ`,
 /// which Agent24 passes to modules, else `/etc/localtime`); a personal OS's

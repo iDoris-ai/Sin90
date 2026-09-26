@@ -22,8 +22,8 @@ pub use ai_port::{AiCallSummary, AiReader};
 pub use attention::{AttentionRow, WeekAttention};
 pub use packs::{five_life_systems, SeedArea};
 pub use repo::{
-    AppliedProposal, ApplyOutcome, AutoReviewCreated, EventRow, RejectOutcome, ReviewUpdate,
-    RoutineFireOutcome, RoutineUpdate, StoredProposal, TodayView,
+    AppliedProposal, ApplyOutcome, AutoReviewCreated, EventRow, OutboxRow, RejectOutcome,
+    ReviewUpdate, RoutineFireOutcome, RoutineUpdate, StoredProposal, TodayView,
 };
 pub use weekly_draft::{
     render_weekly_draft_markdown, AreaMinutes, DirectionMinutes, RoutineDraftRow, WeeklyDraft,
@@ -105,6 +105,25 @@ pub struct Sin90Store {
     /// unless overridden by the test-only
     /// [`Sin90Store::open_memory_with_data_dir`].
     data_dir: Option<std::path::PathBuf>,
+    /// T3.3.2 review L3: a wake signal for the reconciler's background pump
+    /// (`adapter_agent24::reconciler`) — every write that puts a fresh
+    /// `pending` `sin90_outbox` row in place (`create_routine`/
+    /// `update_routine`/`transition_routine`, and the reconciler's own
+    /// `outbox_enqueue_upsert_for_routine`/`outbox_enqueue_delete_for_orphan`)
+    /// calls `.notify_one()` on it, so a Routine change lands on the kernel
+    /// as soon as the pump task wakes up rather than waiting for its next
+    /// fixed-interval tick (up to `PUMP_TICK`, 5s). A plain
+    /// `tokio::sync::Notify`, not anything Agent24-specific — `store` staying
+    /// ignorant of `adapter_agent24` (`lib.rs`'s one-way layering) only
+    /// requires that this type not know who is listening, not that it avoid
+    /// tokio itself (the whole crate is already async on tokio).
+    /// `notify_one()` called before anyone is `.notified().await`-ing yet is
+    /// NOT lost — `tokio::sync::Notify` stores one permit, so the next
+    /// `.notified()` call (even one that hasn't happened yet) returns
+    /// immediately. A Routine mutation in `standalone` mode, where nothing
+    /// ever calls [`Self::outbox_notify`] to begin with, simply accumulates
+    /// (harmlessly capped at one) permits nobody ever consumes.
+    notify: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl Sin90Store {
@@ -131,6 +150,7 @@ impl Sin90Store {
             pool,
             ai_pool,
             data_dir: path.parent().map(|p| p.to_path_buf()),
+            notify: std::sync::Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -182,6 +202,7 @@ impl Sin90Store {
             pool,
             ai_pool,
             data_dir: None,
+            notify: std::sync::Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -209,6 +230,16 @@ impl Sin90Store {
     #[must_use]
     pub fn ai_reader(&self) -> crate::store::ai_port::AiReader {
         crate::store::ai_port::AiReader::new(self.ai_pool.clone())
+    }
+
+    /// T3.3.2 review L3: a clone of the wake signal the reconciler's pump
+    /// loop can `.notified().await` on, raced against its own fixed tick —
+    /// see the `notify` field's own doc for who calls `.notify_one()` and
+    /// why a caller that never invokes this method (e.g. `standalone` mode,
+    /// which never constructs a reconciler at all) loses nothing.
+    #[must_use]
+    pub fn outbox_notify(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        self.notify.clone()
     }
 }
 
@@ -390,6 +421,11 @@ pub mod test_hooks {
         pub failure_kind: Option<String>,
         pub last_error: Option<String>,
         pub next_attempt_at: Option<String>,
+        /// T3.3.2 review C1: `upsert_outbox`'s optimistic-concurrency
+        /// counter — see [`crate::store::repo::OutboxRow`]'s doc.
+        pub version: i64,
+        /// T3.3.2 review L1 — see [`crate::store::repo::OutboxRow`]'s doc.
+        pub other_bucket_attempts: i64,
     }
 
     /// All `sin90_outbox` rows for a `dedup_key`, oldest first. Production
@@ -403,7 +439,7 @@ pub mod test_hooks {
     ) -> Result<Vec<OutboxTestRow>> {
         let rows = sqlx::query(
             "SELECT id, kind, dedup_key, desired, status, attempts, failure_kind, \
-                    last_error, next_attempt_at
+                    last_error, next_attempt_at, version, other_bucket_attempts
              FROM sin90_outbox WHERE dedup_key = ? ORDER BY created_at ASC, rowid ASC",
         )
         .bind(dedup_key)
@@ -421,6 +457,8 @@ pub mod test_hooks {
                     failure_kind: r.get("failure_kind"),
                     last_error: r.get("last_error"),
                     next_attempt_at: r.get("next_attempt_at"),
+                    version: r.get("version"),
+                    other_bucket_attempts: r.get("other_bucket_attempts"),
                 })
             })
             .collect()
@@ -453,6 +491,35 @@ pub mod test_hooks {
         )
         .bind(failure_kind)
         .bind(id)
+        .execute(store.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Insert a `pending` `sin90_outbox` row straight via raw SQL, bypassing
+    /// `upsert_outbox` entirely — T3.3.2 review H3's own test setup: a row
+    /// whose `kind`/`desired` the reconciler cannot make sense of (a bad
+    /// `desired` payload, or a `kind` it does not recognize) is not
+    /// reachable through any production writer (`create_routine`/
+    /// `update_routine`/`transition_routine` only ever write the two known
+    /// shapes) — this hook is the only way to construct one for a test.
+    pub async fn insert_raw_outbox_row(
+        store: &Sin90Store,
+        id: &str,
+        kind: &str,
+        dedup_key: &str,
+        desired_json: &str,
+        created_at: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO sin90_outbox (id, kind, dedup_key, desired, status, created_at, done_at)
+             VALUES (?, ?, ?, ?, 'pending', ?, NULL)",
+        )
+        .bind(id)
+        .bind(kind)
+        .bind(dedup_key)
+        .bind(desired_json)
+        .bind(created_at)
         .execute(store.pool())
         .await?;
         Ok(())

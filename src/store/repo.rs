@@ -490,6 +490,25 @@ pub struct TodayView {
     /// rule `carry_over_candidates` above uses), deduplicated so a routine
     /// that fired more than once today appears exactly once.
     pub fired_routines: Vec<Routine>,
+    /// New (T3.3.2, tasks.md "user_suspended 的行不去碰，并在 /today 标出「已被你在
+    /// 内核侧暂停」"): every `Routine` the reconciler's most recent FULL pass
+    /// saw the kernel report `user_suspended: true` for — the reconciler
+    /// leaves the outbox/kernel state alone for these, so this is the only
+    /// place that fact becomes visible. Recomputed from
+    /// `sin90_routines.kernel_suspended_at` (design §2 #29), which the
+    /// reconciler rebuilds whole-column on every full-reconcile pass.
+    ///
+    /// **Freshness correction (Opus review, post-launch M1/H2)**: this is
+    /// NOT "never stale beyond one reconcile interval" the way an early
+    /// draft of this doc claimed — full reconcile only runs at process
+    /// startup (retried with backoff until it succeeds once) and then on a
+    /// low-frequency HOURLY cadence (`adapter_agent24::reconciler`'s own
+    /// module doc has the exact numbers); the fast per-tick pump in between
+    /// only drains `sin90_outbox`, it never touches this column. A human who
+    /// un-suspends a Routine directly on the kernel side can therefore see
+    /// it listed here for up to about an hour before the next full pass
+    /// clears it — a real staleness window, not a rounding error.
+    pub kernel_suspended_routines: Vec<Routine>,
 }
 
 pub(crate) type Tx<'a> = Transaction<'a, Sqlite>;
@@ -665,6 +684,32 @@ fn routine_outbox_delete_desired(id: &str) -> serde_json::Value {
     json!({"key": format!("routine.{id}")})
 }
 
+/// One `sin90_outbox` row, as the reconciler (T3.3.2,
+/// `adapter_agent24::reconciler`) reads it back to drive a kernel call —
+/// [`Sin90Store::outbox_due_pending`]'s element type. Deliberately narrower
+/// than `store::test_hooks::OutboxTestRow`: the reconciler never needs
+/// `status`/`failure_kind`/`last_error`/`next_attempt_at` (it only ever reads
+/// rows already filtered to "due `pending`"), just enough to make the call
+/// and to write the retry/done/failed outcome back by `id` — PLUS `version`
+/// (C1 review), which every `outbox_mark_*` write-back call MUST echo back
+/// unchanged; see [`upsert_outbox`]'s own doc for why.
+#[derive(Debug, Clone)]
+pub struct OutboxRow {
+    pub id: String,
+    pub kind: String,
+    pub dedup_key: String,
+    pub desired: serde_json::Value,
+    pub attempts: i64,
+    pub version: i64,
+    /// T3.3.2 review L1: how many times, IN A ROW, this row has failed with
+    /// an UNCLASSIFIED ("other" bucket) error specifically — separate from
+    /// `attempts` (which every retryable cause increments, for backoff
+    /// timing) so a string of `rate_limited`/`busy`/`not_ready`/`draining`
+    /// retries never counts toward the exhaustion threshold. See migration
+    /// `0012_outbox_other_bucket_attempts.sql`'s own comment.
+    pub other_bucket_attempts: i64,
+}
+
 /// T3.3.1 (design §2 #15, §4.1; spec.md M3 "outbox"; architecture.md #2:
 /// "写内核的副作用只经 `sin90_outbox` 幂等对账，不跨库两阶段提交"): idempotently
 /// upsert ONE outbox row for `dedup_key`, inside the CALLER's transaction —
@@ -679,12 +724,24 @@ fn routine_outbox_delete_desired(id: &str) -> serde_json::Value {
 ///   changes to the same Routine collapse to exactly one row holding the
 ///   LATEST desired state — never a queue of stale intents — and what makes
 ///   a `failed` row recover on the Routine's next change rather than being
-///   stuck forever (spec.md "错误处理": "Routine 下次变更时重置为 pending").
+///   stuck forever (spec.md "错误处理": "Routine 下次变更时重置为 pending", and —
+///   T3.3.2 review L4 — this collapse is ALSO what reactivates a `failed`
+///   row for one more attempt on the Routine's very next change, or the
+///   reconciler's own next full-reconcile pass finding it still needs
+///   correcting: nothing distinguishes "collapsing onto a pending row" from
+///   "collapsing onto a failed row" below, both just overwrite in place and
+///   reset to `pending`).
 /// - If the only existing row for this `dedup_key` is `done` (or there is no
 ///   row at all), a NEW row is inserted. The `done` row is left alone as a
 ///   historical record — it is never resurrected — so `done_at` keeps
 ///   meaning "this exact desired state was confirmed landed onto the
 ///   kernel", not "some earlier, possibly-different state was".
+/// - **C1 review**: `version` increments on every in-place overwrite (starts
+///   at the column default, `1`, on a fresh `INSERT`) — what lets
+///   `outbox_mark_{done,retry,failed}` refuse to write an outcome for a
+///   version that has since moved on; see those methods' own docs for the
+///   failure mode this closes (a v1 kernel call succeeding AFTER the row was
+///   already collapsed onto v2 must not mark v2 `done`).
 async fn upsert_outbox(
     tx: &mut Tx<'_>,
     kind: &str,
@@ -704,8 +761,8 @@ async fn upsert_outbox(
     if let Some(id) = existing {
         sqlx::query(
             "UPDATE sin90_outbox
-             SET kind = ?, desired = ?, status = 'pending', attempts = 0,
-                 failure_kind = NULL, last_error = NULL, next_attempt_at = NULL
+             SET kind = ?, desired = ?, status = 'pending', attempts = 0, other_bucket_attempts = 0,
+                 version = version + 1, failure_kind = NULL, last_error = NULL, next_attempt_at = NULL
              WHERE id = ?",
         )
         .bind(kind)
@@ -1589,6 +1646,27 @@ impl Sin90Store {
         .map(row_to_routine)
         .collect::<Result<Vec<_>>>()?;
 
+        // T3.3.2 (M1 review — superseded the earlier `sin90_routine_kernel_
+        // notices` table design, design §2 #29): routines the reconciler's
+        // most recent full pass observed the kernel reporting
+        // `user_suspended: true` for. `status <> 'retired'` is defensive,
+        // not load-bearing — a retired Routine is excluded from the
+        // reconciler's own "local desired state" set (`adapter_agent24::
+        // reconciler::local_desired_map`), so it is never a candidate this
+        // column gets re-set for in the first place; this guard is here so a
+        // stale value surviving some future code path change never leaks
+        // into `/today` for an entity the human considers closed.
+        let kernel_suspended_routines = sqlx::query(&format!(
+            "SELECT {ROUTINE_COLUMNS} FROM sin90_routines
+             WHERE kernel_suspended_at IS NOT NULL AND status <> 'retired'
+             ORDER BY title ASC"
+        ))
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(row_to_routine)
+        .collect::<Result<Vec<_>>>()?;
+
         tx.commit().await?;
         Ok(TodayView {
             must_do,
@@ -1596,6 +1674,7 @@ impl Sin90Store {
             inbox,
             carry_over_candidates,
             fired_routines,
+            kernel_suspended_routines,
         })
     }
 
@@ -1704,6 +1783,7 @@ impl Sin90Store {
         )
         .await?;
         tx.commit().await?;
+        self.notify.notify_one(); // T3.3.2 review L3: a fresh pending row just landed.
         Ok(Routine {
             id,
             area_id: new.area_id.clone(),
@@ -1921,7 +2001,8 @@ impl Sin90Store {
         // does" test pair). `enabled` follows the routine's CURRENT status
         // (patches never touch status) — a paused routine whose cron just
         // moved must still land as `enabled: false`, not `true`.
-        if changed.contains(&"cron") || changed.contains(&"tz") {
+        let touched_outbox = changed.contains(&"cron") || changed.contains(&"tz");
+        if touched_outbox {
             let enabled = current.status == RoutineStatus::Active;
             upsert_outbox(
                 &mut tx,
@@ -1932,6 +2013,9 @@ impl Sin90Store {
             .await?;
         }
         tx.commit().await?;
+        if touched_outbox {
+            self.notify.notify_one(); // T3.3.2 review L3: a fresh pending row just landed.
+        }
         Ok(RoutineUpdate {
             routine: updated,
             changed,
@@ -2014,11 +2098,341 @@ impl Sin90Store {
             }
         }
         tx.commit().await?;
+        self.notify.notify_one(); // T3.3.2 review L3: a fresh pending row just landed.
         Ok(Routine {
             status: to,
             updated_at: now,
             ..current
         })
+    }
+
+    // ----- T3.3.2 reconciler-facing outbox operations --------------------------
+    //
+    // The reconciler (`adapter_agent24::reconciler`) is the ONLY caller of
+    // everything below: T3.3.1's own writers (`create_routine`/
+    // `update_routine`/`transition_routine` above) only ever produce a
+    // `pending` row via `upsert_outbox`; nothing in THIS layer ever calls the
+    // kernel — that boundary belongs to `adapter_agent24` alone (`lib.rs`'s
+    // layering doc: `core <- store <- http <- adapter_agent24`). These
+    // methods are Sin90's half of "make the kernel match the outbox"; the
+    // actual `_a24/scheduler/*` calls and their error classification live one
+    // layer out.
+
+    /// Every `pending` `sin90_outbox` row whose backoff has elapsed —
+    /// `next_attempt_at IS NULL` (never failed yet) or `next_attempt_at <=
+    /// now` (a retry is due). Ordered oldest-created first so an outage that
+    /// piles up several routines' worth of pending rows drains them in the
+    /// order they were queued, not an arbitrary one.
+    pub async fn outbox_due_pending(&self, now: &str) -> Result<Vec<OutboxRow>> {
+        let rows = sqlx::query(
+            "SELECT id, kind, dedup_key, desired, attempts, version, other_bucket_attempts
+             FROM sin90_outbox
+             WHERE status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+             ORDER BY created_at ASC, rowid ASC",
+        )
+        .bind(now)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(|r| {
+                Ok(OutboxRow {
+                    id: r.get("id"),
+                    kind: r.get("kind"),
+                    dedup_key: r.get("dedup_key"),
+                    desired: serde_json::from_str(&r.get::<String, _>("desired"))?,
+                    attempts: r.get("attempts"),
+                    version: r.get("version"),
+                    other_bucket_attempts: r.get("other_bucket_attempts"),
+                })
+            })
+            .collect()
+    }
+
+    /// T3.3.2 review M3: re-confirms, right before `adapter_agent24::
+    /// reconciler::apply_one` actually calls the kernel, that `id` is STILL
+    /// `pending` at exactly `version` — closing the window between
+    /// [`Self::outbox_due_pending`]'s own read (a batch snapshot) and this
+    /// ONE row's turn to be processed, during which the row could have been
+    /// collapsed onto a newer version (a concurrent Routine mutation, or an
+    /// earlier row in the SAME batch triggering a full-reconcile correction
+    /// that touches this dedup_key too). A caller that gets `false` back
+    /// must NOT send anything to the kernel for this row — sending the STALE
+    /// desired state would be actively wrong, not merely redundant; the
+    /// newer version is already sitting there `pending` for a later pass to
+    /// pick up on its own.
+    pub async fn outbox_row_is_current(&self, id: &str, version: i64) -> Result<bool> {
+        let found: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM sin90_outbox WHERE id = ? AND status = 'pending' AND version = ?",
+        )
+        .bind(id)
+        .bind(version)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(found.is_some())
+    }
+
+    /// H1 review — the atomic core of "does Routine `routine_id` currently
+    /// need a `scheduler.upsert` correction, and if so, what exactly should
+    /// it say": re-reads `sin90_routines` FRESH, inside its OWN
+    /// `BEGIN IMMEDIATE`, rather than trusting whatever desired state a
+    /// caller computed from an earlier, possibly stale, `list()` snapshot.
+    /// This is what makes a full-reconcile pass safe to run against a moving
+    /// target:
+    ///
+    /// - If the Routine is gone, or has since reached `retired`, this is a
+    ///   silent no-op — re-asserting a retired Routine into the kernel is
+    ///   exactly the bug H1 reported ("对账窗口期内 retire，最终不应被补回"); a
+    ///   retired Routine's own `transition_routine` call already enqueued the
+    ///   `scheduler.delete` this dedup_key needs, and that is what must win.
+    /// - If a `pending` row ALREADY exists for this Routine's dedup_key, this
+    ///   is ALSO a no-op — some other write (a Routine mutation racing in
+    ///   concurrently, or an earlier iteration of this same full-reconcile
+    ///   pass) already owns the next thing the kernel should see, and it is
+    ///   guaranteed to be at least as fresh as what this call would compute
+    ///   (it was itself derived from `sin90_routines` at a strictly later
+    ///   point, under the same write lock this call also takes). Overwriting
+    ///   it with THIS call's own fresh-but-not-guaranteed-freshest read could
+    ///   only ever regress it, never improve it.
+    /// - Otherwise, `desired` is built from the row THIS call just read
+    ///   (never from a caller-supplied value), so the eventual kernel call
+    ///   always reflects the Routine's TRUE state at enqueue time, not
+    ///   whatever `list()` saw moments (or a full hour, see
+    ///   `adapter_agent24::reconciler`'s module doc) earlier.
+    pub async fn outbox_enqueue_upsert_for_routine(&self, routine_id: &str) -> Result<()> {
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let row = sqlx::query(&format!(
+            "SELECT {ROUTINE_COLUMNS} FROM sin90_routines WHERE id = ?"
+        ))
+        .bind(routine_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            return Ok(()); // gone entirely — nothing to (re-)assert.
+        };
+        let routine = row_to_routine(row)?;
+        if routine.status == RoutineStatus::Retired {
+            return Ok(()); // H1: retired since the caller's snapshot — do not resurrect it.
+        }
+        let dedup_key = routine_dedup_key(routine_id);
+        let already_pending: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM sin90_outbox WHERE dedup_key = ? AND status = 'pending'",
+        )
+        .bind(&dedup_key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if already_pending.is_some() {
+            return Ok(()); // H1: don't clobber a fresher intent already queued.
+        }
+        let enabled = routine.status == RoutineStatus::Active;
+        let desired =
+            routine_outbox_upsert_desired(routine_id, &routine.cron, &routine.tz, enabled);
+        upsert_outbox(&mut tx, "scheduler.upsert", &dedup_key, &desired).await?;
+        tx.commit().await?;
+        self.notify.notify_one();
+        Ok(())
+    }
+
+    /// H1's counterpart for the orphan-delete side of full reconcile: same
+    /// atomic re-read-then-decide shape as
+    /// [`Self::outbox_enqueue_upsert_for_routine`], for a kernel key that
+    /// LOOKED like an orphan (no matching local `active`/`paused` Routine) at
+    /// `list()` time.
+    ///
+    /// - If a Routine now exists for `routine_id` and is NOT `retired`, this
+    ///   key is no longer an orphan (e.g. it was created, or un-retired —
+    ///   Routine has no un-retire path today, but this call does not assume
+    ///   that will always be true) — no-op, do not delete a schedule Sin90
+    ///   now legitimately wants.
+    /// - If a `pending` row already exists for this dedup_key, same
+    ///   reasoning as the upsert side: don't clobber a fresher intent.
+    /// - Otherwise, enqueue `scheduler.delete` for the literal kernel `key`
+    ///   the caller observed (not reconstructed from `routine_id` — a caller
+    ///   that could not parse an id out of the key at all has no business
+    ///   calling this method; `adapter_agent24::reconciler` only calls it for
+    ///   keys under its own `routine.` prefix, M3 review).
+    pub async fn outbox_enqueue_delete_for_orphan(
+        &self,
+        routine_id: &str,
+        kernel_key: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let row = sqlx::query(&format!(
+            "SELECT {ROUTINE_COLUMNS} FROM sin90_routines WHERE id = ?"
+        ))
+        .bind(routine_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(row) = row {
+            let routine = row_to_routine(row)?;
+            if routine.status != RoutineStatus::Retired {
+                return Ok(()); // no longer an orphan.
+            }
+        }
+        let dedup_key = routine_dedup_key(routine_id);
+        let already_pending: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM sin90_outbox WHERE dedup_key = ? AND status = 'pending'",
+        )
+        .bind(&dedup_key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if already_pending.is_some() {
+            return Ok(());
+        }
+        upsert_outbox(
+            &mut tx,
+            "scheduler.delete",
+            &dedup_key,
+            &json!({"key": kernel_key}),
+        )
+        .await?;
+        tx.commit().await?;
+        self.notify.notify_one();
+        Ok(())
+    }
+
+    /// A pending row landed on the kernel successfully. `expected_version`
+    /// (C1 review) must match the row's CURRENT `version` or this is a
+    /// silent no-op: the row already moved on to a newer desired state while
+    /// the kernel call that produced this success was in flight, so marking
+    /// it `done` now would incorrectly claim the NEW state landed when only
+    /// the old one did. The next pump pass picks the (still-`pending`, now
+    /// newer-version) row back up on its own — nothing else to do here.
+    pub async fn outbox_mark_done(&self, id: &str, expected_version: i64) -> Result<()> {
+        let now = now_iso8601();
+        sqlx::query(
+            "UPDATE sin90_outbox SET status = 'done', done_at = ? \
+             WHERE id = ? AND status = 'pending' AND version = ?",
+        )
+        .bind(&now)
+        .bind(id)
+        .bind(expected_version)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// A pending row hit a retryable kernel/transport error (spec.md M3:
+    /// `rate_limited`/`busy`/`timeout`/断连/`not_ready`/`draining`) — stays
+    /// `pending`, `attempts` increments, and `next_attempt_at` records when
+    /// the reconciler may try again (exponential backoff — the caller,
+    /// `adapter_agent24::reconciler`, computes the value from the row's
+    /// PRE-increment `attempts`). `expected_version`: same C1 guard as
+    /// [`Self::outbox_mark_done`] — a version that has since moved on means
+    /// this failure was about a desired state that no longer matters; the
+    /// NEW version's own next attempt starts its backoff fresh, unpolluted
+    /// by an old version's failure count.
+    ///
+    /// `bump_other_bucket` (T3.3.2 review L1): also increments
+    /// `other_bucket_attempts` — the caller passes `true` ONLY for the
+    /// unclassified ("other") failure bucket, never for
+    /// `rate_limited`/`busy`/`not_ready`/`draining` (see
+    /// `other_bucket_attempts`'s own doc on [`OutboxRow`] for why the two
+    /// counters must stay independent).
+    pub async fn outbox_mark_retry(
+        &self,
+        id: &str,
+        expected_version: i64,
+        error: &str,
+        next_attempt_at: &str,
+        bump_other_bucket: bool,
+    ) -> Result<()> {
+        if bump_other_bucket {
+            sqlx::query(
+                "UPDATE sin90_outbox
+                 SET attempts = attempts + 1, other_bucket_attempts = other_bucket_attempts + 1,
+                     last_error = ?, next_attempt_at = ?
+                 WHERE id = ? AND status = 'pending' AND version = ?",
+            )
+            .bind(error)
+            .bind(next_attempt_at)
+            .bind(id)
+            .bind(expected_version)
+            .execute(self.pool())
+            .await?;
+        } else {
+            sqlx::query(
+                "UPDATE sin90_outbox
+                 SET attempts = attempts + 1, last_error = ?, next_attempt_at = ?
+                 WHERE id = ? AND status = 'pending' AND version = ?",
+            )
+            .bind(error)
+            .bind(next_attempt_at)
+            .bind(id)
+            .bind(expected_version)
+            .execute(self.pool())
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// A pending row hit a PERMANENT kernel error (spec.md M3:
+    /// `forbidden`/`quota_exceeded`/`invalid_params`, carried over by
+    /// `adapter_agent24::clients::ClientError::is_permanent` to also cover
+    /// `token_invalid`/`payload_too_large`; T3.3.2 review M2 also routes an
+    /// `Other`-bucket error here after 20 attempts, `failure_kind =
+    /// "exhausted"`) — flips to `failed` and stops retrying; a Routine's
+    /// NEXT change resets it to `pending` (`upsert_outbox`'s own collapse
+    /// rule already does this — see its doc's L4 note — no extra code
+    /// needed here). `expected_version`: same C1 guard as
+    /// [`Self::outbox_mark_done`].
+    pub async fn outbox_mark_failed(
+        &self,
+        id: &str,
+        expected_version: i64,
+        failure_kind: &str,
+        error: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE sin90_outbox
+             SET status = 'failed', attempts = attempts + 1, failure_kind = ?, last_error = ?,
+                 next_attempt_at = NULL
+             WHERE id = ? AND status = 'pending' AND version = ?",
+        )
+        .bind(failure_kind)
+        .bind(error)
+        .bind(id)
+        .bind(expected_version)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    // ----- T3.3.2 kernel-side user-suspend visibility (`/today`, design §2 #29) -
+
+    /// Rebuilds `sin90_routines.kernel_suspended_at` WHOLE-COLUMN, in one
+    /// transaction: every row is cleared first, then re-set (to `now`) for
+    /// exactly the ids in `suspended_routine_ids` — the reconciler's full
+    /// pass calls this ONCE per pass with the complete set it observed this
+    /// time, never incrementally. This is a derived, recomputed-from-scratch
+    /// fact about the KERNEL's current state (M1 review — this superseded an
+    /// earlier `sin90_routine_kernel_notices` table design; design §2 #29
+    /// has the full reasoning), not a Routine-entity change: it does not
+    /// touch `updated_at` and appends no `sin90_events` row. Clearing
+    /// unconditionally first is also what makes a `retired` Routine's stale
+    /// notice (if any) disappear on the very next pass — retired Routines
+    /// are never in `suspended_routine_ids` (they are excluded from the
+    /// reconciler's own local-desired-state set), so they are cleared and
+    /// never re-set.
+    pub async fn sync_kernel_suspended_routines(
+        &self,
+        suspended_routine_ids: &[String],
+    ) -> Result<()> {
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query("UPDATE sin90_routines SET kernel_suspended_at = NULL")
+            .execute(&mut *tx)
+            .await?;
+        if !suspended_routine_ids.is_empty() {
+            let now = now_iso8601();
+            for id in suspended_routine_ids {
+                sqlx::query("UPDATE sin90_routines SET kernel_suspended_at = ? WHERE id = ?")
+                    .bind(&now)
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     // ----- fired receipt (T3.2.2, design §2 #16, spec.md M3 "fired") ---------
@@ -5385,6 +5799,496 @@ mod outbox_tests {
              (found {versions:?}) — a gap means a future migration filling it in \
              would apply out of chronological order on an already-upgraded db"
         );
+    }
+}
+
+// ----- T3.3.2: the reconciler-facing outbox operations, tested at the ------
+// store layer alone (no `adapter_agent24`/`SchedulerClient` involved) -------
+
+#[cfg(test)]
+mod outbox_reconciler_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::routine_tests::{create_ok, nr};
+    use super::*;
+    use crate::core::{RoutineKind, RoutinePatch};
+    use crate::store::test_hooks;
+
+    async fn new_store() -> Sin90Store {
+        Sin90Store::open_memory().await.unwrap()
+    }
+
+    fn dedup_key(routine_id: &str) -> String {
+        format!("routine:{routine_id}")
+    }
+
+    // ----- H1: a stale full-reconcile decision must not resurrect/clobber ---
+
+    /// The exact bug H1 reported: a Routine retires DURING the window a
+    /// full-reconcile pass was deciding "this key needs re-upserting" (from
+    /// a `list()` snapshot taken before the retire). The re-read-then-decide
+    /// atomic enqueue must refuse to act on a now-stale intent.
+    #[tokio::test]
+    async fn outbox_enqueue_upsert_for_routine_skips_a_retired_routine() {
+        let store = new_store().await;
+        let routine = create_ok(&store).await;
+        let key = dedup_key(&routine.id);
+
+        // Simulate the initial upsert having already landed successfully.
+        let rows = test_hooks::outbox_rows_for(&store, &key).await.unwrap();
+        store
+            .outbox_mark_done(&rows[0].id, rows[0].version)
+            .await
+            .unwrap();
+
+        // The Routine retires — this itself enqueues the correct
+        // `scheduler.delete` pending row.
+        store
+            .transition_routine(&routine.id, RoutineStatus::Retired)
+            .await
+            .unwrap();
+
+        // Land the retire's own delete too, so the ONLY thing left standing
+        // between a stale enqueue and a resurrected schedule is the
+        // retired-status check itself — the "already pending" guard
+        // (`outbox_enqueue_upsert_for_routine_never_clobbers_an_already_
+        // pending_row`, its own test) would otherwise also block this call
+        // and this test would pass for the wrong reason.
+        let delete_row = test_hooks::outbox_rows_for(&store, &key)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.status == "pending")
+            .expect("the retire's own delete row");
+        store
+            .outbox_mark_done(&delete_row.id, delete_row.version)
+            .await
+            .unwrap();
+
+        // A full-reconcile pass built its "this Routine needs a
+        // scheduler.upsert" decision from a `list()` snapshot taken BEFORE
+        // the retire above — exactly what `outbox_enqueue_upsert_for_routine`
+        // must refuse to act on now, with NO pending row left to fall back
+        // on for protection.
+        store
+            .outbox_enqueue_upsert_for_routine(&routine.id)
+            .await
+            .unwrap();
+
+        let rows = test_hooks::outbox_rows_for(&store, &key).await.unwrap();
+        let pending: Vec<_> = rows.iter().filter(|r| r.status == "pending").collect();
+        assert!(
+            pending.is_empty(),
+            "the stale upsert must not have been enqueued for a retired Routine: {pending:?}"
+        );
+    }
+
+    /// The other half of H1: a `pending` row that already exists (any
+    /// reason — a concurrent Routine mutation, or another reconcile pass)
+    /// must never be clobbered by a stale enqueue attempt.
+    #[tokio::test]
+    async fn outbox_enqueue_upsert_for_routine_never_clobbers_an_already_pending_row() {
+        let store = new_store().await;
+        let routine = create_ok(&store).await;
+        let key = dedup_key(&routine.id);
+        let original_version = test_hooks::outbox_rows_for(&store, &key).await.unwrap()[0].version;
+
+        store
+            .outbox_enqueue_upsert_for_routine(&routine.id)
+            .await
+            .unwrap();
+
+        let rows = test_hooks::outbox_rows_for(&store, &key).await.unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "must not have collapsed a second time / touched the row at all"
+        );
+        assert_eq!(
+            rows[0].version, original_version,
+            "version must be unchanged — the row was left completely alone"
+        );
+    }
+
+    /// Positive control for the H1 tests above: when NEITHER guard applies
+    /// (the Routine is still active/paused AND no pending row already
+    /// exists), the enqueue call DOES write a correction — H1's fix must not
+    /// have accidentally made this method a permanent no-op.
+    #[tokio::test]
+    async fn outbox_enqueue_upsert_for_routine_positive_control_writes_when_nothing_blocks_it() {
+        let store = new_store().await;
+        let routine = create_ok(&store).await;
+        let key = dedup_key(&routine.id);
+        let rows = test_hooks::outbox_rows_for(&store, &key).await.unwrap();
+        store
+            .outbox_mark_done(&rows[0].id, rows[0].version)
+            .await
+            .unwrap();
+
+        store
+            .outbox_enqueue_upsert_for_routine(&routine.id)
+            .await
+            .unwrap();
+
+        let rows = test_hooks::outbox_rows_for(&store, &key).await.unwrap();
+        assert_eq!(rows.len(), 2, "a fresh row for the new correction");
+        assert_eq!(rows[1].status, "pending");
+    }
+
+    // ----- H1's counterpart for the orphan-delete side -----------------------
+
+    /// A retired Routine (or an id with no Routine row at all) is exactly
+    /// what makes a kernel key an orphan — `outbox_enqueue_delete_for_orphan`
+    /// must write the delete for both cases.
+    #[tokio::test]
+    async fn outbox_enqueue_delete_for_orphan_writes_for_a_retired_or_unknown_routine() {
+        let store = new_store().await;
+        let routine = create_ok(&store).await;
+        let key = dedup_key(&routine.id);
+        let rows = test_hooks::outbox_rows_for(&store, &key).await.unwrap();
+        store
+            .outbox_mark_done(&rows[0].id, rows[0].version)
+            .await
+            .unwrap();
+        store
+            .transition_routine(&routine.id, RoutineStatus::Retired)
+            .await
+            .unwrap();
+        let delete_row = test_hooks::outbox_rows_for(&store, &key)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.status == "pending")
+            .unwrap();
+        store
+            .outbox_mark_done(&delete_row.id, delete_row.version)
+            .await
+            .unwrap();
+
+        store
+            .outbox_enqueue_delete_for_orphan(&routine.id, &format!("routine.{}", routine.id))
+            .await
+            .unwrap();
+        let rows = test_hooks::outbox_rows_for(&store, &key).await.unwrap();
+        assert_eq!(
+            rows.iter().filter(|r| r.status == "pending").count(),
+            1,
+            "retired Routine: the orphan delete must be written"
+        );
+
+        // An id with no Routine row at all is the same case.
+        store
+            .outbox_enqueue_delete_for_orphan("does-not-exist", "routine.does-not-exist")
+            .await
+            .unwrap();
+        let unknown_rows = test_hooks::outbox_rows_for(&store, "routine:does-not-exist")
+            .await
+            .unwrap();
+        assert_eq!(unknown_rows.len(), 1);
+        assert_eq!(unknown_rows[0].kind, "scheduler.delete");
+    }
+
+    /// Both guards: an ACTIVE Routine is no longer an orphan (no-op), and an
+    /// already-`pending` row is never clobbered.
+    #[tokio::test]
+    async fn outbox_enqueue_delete_for_orphan_no_op_when_routine_active_or_already_pending() {
+        let store = new_store().await;
+        let routine = create_ok(&store).await;
+        let key = dedup_key(&routine.id);
+        let original = test_hooks::outbox_rows_for(&store, &key).await.unwrap();
+        assert_eq!(original.len(), 1);
+
+        // Still active — never an orphan, regardless of what the caller saw
+        // in some earlier `list()` snapshot.
+        store
+            .outbox_enqueue_delete_for_orphan(&routine.id, &format!("routine.{}", routine.id))
+            .await
+            .unwrap();
+        let rows = test_hooks::outbox_rows_for(&store, &key).await.unwrap();
+        assert_eq!(rows.len(), 1, "must not have touched the row at all");
+        assert_eq!(rows[0].version, original[0].version);
+        assert_eq!(rows[0].kind, "scheduler.upsert");
+    }
+
+    // ----- C1: the version guard on outbox_mark_{done,retry,failed} ---------
+
+    /// C1, at the store layer directly (no wire simulation needed): a
+    /// `mark_done` call carrying a version the row has since moved past must
+    /// affect ZERO rows — the row stays `pending`, holding whatever newer
+    /// desired state it was collapsed onto.
+    #[tokio::test]
+    async fn outbox_mark_done_with_stale_version_is_a_noop() {
+        let store = new_store().await;
+        let routine = create_ok(&store).await;
+        let key = dedup_key(&routine.id);
+        let stale = test_hooks::outbox_rows_for(&store, &key).await.unwrap()[0].clone();
+
+        // Collapse the row onto a new version.
+        store
+            .update_routine(
+                &routine.id,
+                &RoutinePatch {
+                    cron: Some("0 9 * * TUE,THU".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .outbox_mark_done(&stale.id, stale.version)
+            .await
+            .unwrap();
+
+        let rows = test_hooks::outbox_rows_for(&store, &key).await.unwrap();
+        assert_eq!(rows.len(), 1, "still the same physical row");
+        assert_eq!(
+            rows[0].status, "pending",
+            "a stale-version mark_done must affect 0 rows, not flip status to done"
+        );
+        assert!(rows[0].version > stale.version);
+    }
+
+    /// Same guard on `outbox_mark_retry`.
+    #[tokio::test]
+    async fn outbox_mark_retry_with_stale_version_is_a_noop() {
+        let store = new_store().await;
+        let routine = create_ok(&store).await;
+        let key = dedup_key(&routine.id);
+        let stale = test_hooks::outbox_rows_for(&store, &key).await.unwrap()[0].clone();
+
+        store
+            .update_routine(
+                &routine.id,
+                &RoutinePatch {
+                    cron: Some("0 9 * * TUE,THU".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .outbox_mark_retry(
+                &stale.id,
+                stale.version,
+                "test-injected",
+                "2099-01-01T00:00:00Z",
+                true,
+            )
+            .await
+            .unwrap();
+
+        let rows = test_hooks::outbox_rows_for(&store, &key).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].attempts, 0,
+            "a stale-version mark_retry must affect 0 rows"
+        );
+        assert_eq!(rows[0].other_bucket_attempts, 0);
+        assert!(rows[0].last_error.is_none());
+        assert!(rows[0].version > stale.version);
+    }
+
+    /// Same guard on `outbox_mark_failed`.
+    #[tokio::test]
+    async fn outbox_mark_failed_with_stale_version_is_a_noop() {
+        let store = new_store().await;
+        let routine = create_ok(&store).await;
+        let key = dedup_key(&routine.id);
+        let stale = test_hooks::outbox_rows_for(&store, &key).await.unwrap()[0].clone();
+
+        store
+            .update_routine(
+                &routine.id,
+                &RoutinePatch {
+                    cron: Some("0 9 * * TUE,THU".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .outbox_mark_failed(&stale.id, stale.version, "quota_exceeded", "test-injected")
+            .await
+            .unwrap();
+
+        let rows = test_hooks::outbox_rows_for(&store, &key).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].status, "pending",
+            "a stale-version mark_failed must affect 0 rows, not flip status to failed"
+        );
+        assert!(rows[0].failure_kind.is_none());
+        assert!(rows[0].version > stale.version);
+    }
+
+    // ----- M3: re-confirming a row is still current --------------------------
+
+    #[tokio::test]
+    async fn outbox_row_is_current_true_when_pending_and_version_matches() {
+        let store = new_store().await;
+        let routine = create_ok(&store).await;
+        let key = dedup_key(&routine.id);
+        let row = test_hooks::outbox_rows_for(&store, &key).await.unwrap()[0].clone();
+
+        assert!(store
+            .outbox_row_is_current(&row.id, row.version)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn outbox_row_is_current_false_when_version_or_status_differs() {
+        let store = new_store().await;
+        let routine = create_ok(&store).await;
+        let key = dedup_key(&routine.id);
+        let row = test_hooks::outbox_rows_for(&store, &key).await.unwrap()[0].clone();
+
+        // Wrong version.
+        assert!(!store
+            .outbox_row_is_current(&row.id, row.version + 1)
+            .await
+            .unwrap());
+
+        // Right version, but no longer `pending`.
+        store.outbox_mark_done(&row.id, row.version).await.unwrap();
+        assert!(!store
+            .outbox_row_is_current(&row.id, row.version)
+            .await
+            .unwrap());
+    }
+
+    // ----- outbox_due_pending: status + backoff filtering --------------------
+
+    #[tokio::test]
+    async fn outbox_due_pending_filters_pending_and_respects_next_attempt_at() {
+        let store = new_store().await;
+        let routine = create_ok(&store).await;
+        let key = dedup_key(&routine.id);
+        let row = test_hooks::outbox_rows_for(&store, &key).await.unwrap()[0].clone();
+
+        // Not yet due — `next_attempt_at` in the future.
+        store
+            .outbox_mark_retry(&row.id, row.version, "test", "2099-01-01T00:00:00Z", false)
+            .await
+            .unwrap();
+        let due = store
+            .outbox_due_pending("2026-01-01T00:00:00Z")
+            .await
+            .unwrap();
+        assert!(
+            due.is_empty(),
+            "a row backed off into the future must not be due yet"
+        );
+
+        // Due now.
+        let due = store
+            .outbox_due_pending("2099-06-01T00:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, row.id);
+
+        // `done` rows are never due, however far `now` is pushed.
+        store
+            .outbox_mark_done(&row.id, due[0].version)
+            .await
+            .unwrap();
+        let due = store
+            .outbox_due_pending("2099-06-01T00:00:00Z")
+            .await
+            .unwrap();
+        assert!(due.is_empty(), "a done row must never be picked up again");
+    }
+
+    // ----- M1 (design §2 #29): kernel_suspended_at whole-column rebuild ------
+
+    #[tokio::test]
+    async fn sync_kernel_suspended_routines_sets_and_clears_kernel_suspended_at() {
+        let store = new_store().await;
+        let suspended = create_ok(&store).await;
+        let other = store
+            .create_routine(&nr("Read", RoutineKind::Read, "0 8 * * TUE,THU"))
+            .await
+            .unwrap();
+
+        store
+            .sync_kernel_suspended_routines(std::slice::from_ref(&suspended.id))
+            .await
+            .unwrap();
+        let today = store.today_view().await.unwrap();
+        let ids: Vec<&str> = today
+            .kernel_suspended_routines
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect();
+        assert_eq!(ids, vec![suspended.id.as_str()]);
+
+        // A later pass with an EMPTY set clears everything — whole-column
+        // rebuild, not an incremental toggle.
+        store.sync_kernel_suspended_routines(&[]).await.unwrap();
+        let today = store.today_view().await.unwrap();
+        assert!(today.kernel_suspended_routines.is_empty());
+
+        let _ = other; // only needed to prove the OTHER Routine was never touched.
+    }
+
+    /// Writing `kernel_suspended_at` must not look like a Routine edit: no
+    /// `updated_at` bump, no `sin90_events` row.
+    #[tokio::test]
+    async fn sync_kernel_suspended_routines_does_not_bump_updated_at_or_write_an_event() {
+        let store = new_store().await;
+        let routine = create_ok(&store).await;
+        let events_before = test_hooks::event_count(&store, "routine", &routine.id)
+            .await
+            .unwrap();
+
+        store
+            .sync_kernel_suspended_routines(std::slice::from_ref(&routine.id))
+            .await
+            .unwrap();
+
+        let events_after = test_hooks::event_count(&store, "routine", &routine.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            events_before, events_after,
+            "must not append a sin90_events row"
+        );
+
+        let reread = store.get_routine(&routine.id).await.unwrap();
+        assert_eq!(
+            reread.updated_at, routine.updated_at,
+            "must not bump updated_at"
+        );
+    }
+
+    // ----- L3: outbox_notify wakes a waiter -----------------------------------
+
+    #[tokio::test]
+    async fn create_routine_wakes_the_outbox_notify_waiter() {
+        let store = new_store().await;
+        let notify = store.outbox_notify();
+
+        let waiter = tokio::spawn(async move {
+            notify.notified().await;
+        });
+
+        store
+            .create_routine(&nr(
+                "Morning run",
+                RoutineKind::Exercise,
+                "0 7 * * MON,WED,FRI",
+            ))
+            .await
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_millis(200), waiter)
+            .await
+            .expect("create_routine must wake the outbox_notify waiter promptly")
+            .unwrap();
     }
 }
 
