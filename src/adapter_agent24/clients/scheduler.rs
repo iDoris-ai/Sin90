@@ -134,6 +134,14 @@ pub struct ListResponse {
 /// Typed `_a24/scheduler/*` client. Only [`SchedulerClient::new`] ever
 /// constructs one — a `Some` return is the only proof `Offer.provides`
 /// covered [`PREFIX`] (architecture.md 不可破边界 #7).
+///
+/// `Clone` (T4.4.1 review M1): cheap — just an `Arc` bump, same posture
+/// `adapter_agent24::clients::Clients::build`'s own doc already takes
+/// toward cloning a client "fresh per call." Lets
+/// `adapter_agent24::reconciler::ReconcilerClients` be held by both the
+/// long-lived pump task and, in tests, whichever call site needs it next
+/// without an awkward move-then-hand-back dance.
+#[derive(Clone)]
 pub struct SchedulerClient {
     clients: Arc<KernelClients>,
 }
