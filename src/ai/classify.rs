@@ -234,6 +234,14 @@ pub struct ClassifyDecision {
     /// to tag the run item's `reason` as `"low_confidence"` specifically,
     /// distinct from every other cause of a bare `nothing`.
     pub low_confidence: bool,
+    /// T5.2.3 review (M2): the model's raw self-reported `confidence`,
+    /// carried only so `classify_one` can `tracing::info!` it (not persisted
+    /// anywhere yet — see that log site's own doc). `None` for a
+    /// reflex-produced decision (R1/R2 have no confidence concept).
+    pub confidence: Option<&'static str>,
+    /// T5.2.3 review (M2): the model's raw `choice` string (a candidate key
+    /// or `"none"`), same purpose as `confidence` above. `None` for reflex.
+    pub choice: Option<String>,
 }
 
 /// `response_format`'s JSON schema (§11.4.1): `choice` is a closed enum over
@@ -320,16 +328,28 @@ enum Confidence {
 }
 
 impl Confidence {
-    /// `None` for anything outside the three known levels — the caller
-    /// (`parse_classify_reply`) already rejected that case as `bad_output`
-    /// before this is ever called, so this is only reached with one of the
-    /// three literal strings the schema's `enum` allows.
+    /// T5.2.3 review (L1, was backwards): `None` for anything outside the
+    /// three known levels — THIS function is what makes the caller
+    /// (`parse_classify_reply`) reject that case as `bad_output`; nothing
+    /// upstream has already filtered it out before this runs.
     fn parse(s: &str) -> Option<Self> {
         match s {
             "low" => Some(Confidence::Low),
             "medium" => Some(Confidence::Medium),
             "high" => Some(Confidence::High),
             _ => None,
+        }
+    }
+
+    /// T5.2.3 review (M2): the inverse of [`Self::parse`], used only so
+    /// `classify_one` can log the raw level string alongside `run_id`/
+    /// `task_id`/`choice` (see that log site's own doc) without keeping a
+    /// second copy of the original `String` around.
+    fn as_str(self) -> &'static str {
+        match self {
+            Confidence::Low => "low",
+            Confidence::Medium => "medium",
+            Confidence::High => "high",
         }
     }
 }
@@ -404,6 +424,8 @@ pub fn parse_classify_reply(
             direction_id: None,
             reason: parsed.reason,
             low_confidence: false,
+            confidence: Some(confidence.as_str()),
+            choice: Some(parsed.choice.clone()),
         });
     }
     // T5.2.3: checked AFTER the invented-key check above — a bogus key paired
@@ -414,6 +436,8 @@ pub fn parse_classify_reply(
             direction_id: None,
             reason: parsed.reason,
             low_confidence: true,
+            confidence: Some(confidence.as_str()),
+            choice: Some(parsed.choice.clone()),
         });
     }
     // `.expect`: the membership check above already proved this key exists.
@@ -427,6 +451,8 @@ pub fn parse_classify_reply(
         direction_id: Some(direction_id),
         reason: parsed.reason,
         low_confidence: false,
+        confidence: Some(confidence.as_str()),
+        choice: Some(parsed.choice.clone()),
     })
 }
 
@@ -567,6 +593,8 @@ where
                 direction_id: Some(d),
                 reason: "a same-titled task is already classified into it".to_string(),
                 low_confidence: false,
+                confidence: None,
+                choice: None,
             })
         },
         || {
@@ -574,6 +602,8 @@ where
                 direction_id: Some(d),
                 reason: "its title overlaps this Direction/Area the most".to_string(),
                 low_confidence: false,
+                confidence: None,
+                choice: None,
             })
         },
         crate::core::now_iso8601,
@@ -589,7 +619,9 @@ where
             // but reading it up front keeps the arms below from having to
             // care about field-move ordering at all.
             let low_confidence = value.low_confidence;
-            match value.direction_id {
+            let confidence = value.confidence;
+            let choice = value.choice.clone();
+            let (result, reason) = match value.direction_id {
                 Some(direction_id) => {
                     let draft = ProposalDraft {
                         id: format!("ai-classify-{}", crate::core::ulid()),
@@ -644,7 +676,27 @@ where
                     let reason = low_confidence.then_some("low_confidence");
                     (ItemResult::Nothing, reason)
                 }
+            };
+            // T5.2.3 review M2: confidence isn't persisted anywhere yet — log
+            // it so the data exists at all (run_id/task_id/confidence/choice/
+            // whether a proposal came out of it). Only for an actual MODEL
+            // step (`engine != Reflex`): reflex has no confidence concept, so
+            // logging it there would just be noise. The eventual home for
+            // this is a `confidence` column on `sin90_ai_calls` (once T5.5.1
+            // needs real per-level hit-rate stats to pick
+            // `CLASSIFY_CONFIDENCE_THRESHOLD` for real) — tracked as a
+            // followup by the coordinator, not implemented here.
+            if engine != Engine::Reflex {
+                tracing::info!(
+                    run_id = %run_id,
+                    task_id = %task.id,
+                    confidence = confidence.unwrap_or("n/a"),
+                    choice = choice.as_deref().unwrap_or("n/a"),
+                    proposed = matches!(result, ItemResult::Proposed(_)),
+                    "classify: model step confidence (not persisted, see followup)"
+                );
             }
+            (result, reason)
         }
         Outcome::Nothing => (ItemResult::Nothing, None),
         Outcome::Deferred => (ItemResult::Deferred, None),

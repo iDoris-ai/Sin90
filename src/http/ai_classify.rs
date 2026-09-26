@@ -18,7 +18,7 @@ use serde_json::json;
 
 use std::sync::Arc;
 
-use crate::ai::classify::{self, ClassifyInputError, ItemResult};
+use crate::ai::classify::{self, ClassifyInputError, ClassifyItem, ItemResult};
 use crate::ai::{
     AiCallRecord, AiSink, Capability, ModelAccess, NoModelPort, ProposalDraft, SinkError,
 };
@@ -200,24 +200,7 @@ pub async fn trigger_classify(
         .await;
 
         let aborted = outcomes.iter().any(|o| o.result == ItemResult::Aborted);
-        let mut items: Vec<AiRunItem> = skipped
-            .into_iter()
-            .map(|task_id| AiRunItem {
-                target: task_id,
-                result: "skipped".to_string(),
-                // M2 (2026-09-26 review): this run never even tried — a
-                // still-valid pending proposal already covers it.
-                reason: Some("dedup"),
-            })
-            .collect();
-        items.extend(outcomes.into_iter().map(|o| AiRunItem {
-            target: o.task_id,
-            result: item_result_str(&o.result).to_string(),
-            // T5.2.3: `o.reason` is `Some("low_confidence")` for a model
-            // step that landed below the confidence threshold, `None` for
-            // every other cause of this item's result.
-            reason: o.reason,
-        }));
+        let items = build_classify_run_items(skipped, outcomes);
 
         let final_state = if aborted { "aborted" } else { "done" };
         guard.finish(final_state, items);
@@ -228,6 +211,40 @@ pub async fn trigger_classify(
         Json(json!({"run_id": run_id, "capability": "classify"})),
     )
         .into_response()
+}
+
+/// T5.2.3 review (M1): extracted out of `trigger_classify`'s background task
+/// so this wire mapping — including `reason: o.reason`, the line the
+/// low-confidence tag actually travels through onto `AiRunItem` — is directly
+/// testable without needing a real `ModelPort` wired into the trigger route
+/// itself (T5.1.2 hasn't landed yet; production still hardcodes
+/// `model: None` above, so there is no way to drive a low-confidence outcome
+/// through an actual `POST /ai/classify` round trip today). `http::tests`
+/// calls this directly with hand-built `ClassifyItem`s (from a REAL
+/// `run_classify` call against a stub `ModelPort`) to pin the wire shape.
+pub(crate) fn build_classify_run_items(
+    skipped: Vec<TaskId>,
+    outcomes: Vec<ClassifyItem>,
+) -> Vec<AiRunItem> {
+    let mut items: Vec<AiRunItem> = skipped
+        .into_iter()
+        .map(|task_id| AiRunItem {
+            target: task_id,
+            result: "skipped".to_string(),
+            // M2 (2026-09-26 review): this run never even tried — a
+            // still-valid pending proposal already covers it.
+            reason: Some("dedup"),
+        })
+        .collect();
+    items.extend(outcomes.into_iter().map(|o| AiRunItem {
+        target: o.task_id,
+        result: item_result_str(&o.result).to_string(),
+        // T5.2.3: `o.reason` is `Some("low_confidence")` for a model
+        // step that landed below the confidence threshold, `None` for
+        // every other cause of this item's result.
+        reason: o.reason,
+    }));
+    items
 }
 
 fn item_result_str(r: &ItemResult) -> &'static str {

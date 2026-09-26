@@ -5362,6 +5362,189 @@ mod ai_classify {
             .collect();
         assert!(inbox_ids.contains(&task.id.as_str()));
     }
+
+    // ---- T5.2.3 review M1: items[].reason on the real wire -----------------
+
+    /// A `ModelPort` that always answers with a real candidate key and
+    /// `confidence: "low"` — standing in for a real T5.1.2 adapter, which
+    /// `trigger_classify` doesn't have yet (it hardcodes `model: None`
+    /// below), so there is no way to drive this outcome through an actual
+    /// `POST /ai/classify` round trip today.
+    struct LowConfidenceModel;
+    impl crate::ai::ModelPort for LowConfidenceModel {
+        async fn complete(
+            &self,
+            _req: crate::ai::ModelRequest,
+        ) -> Result<crate::ai::ModelReply, crate::ai::ModelFailure> {
+            Ok(crate::ai::ModelReply {
+                text: r#"{"choice":"d1","confidence":"low","reason":"not sure"}"#.to_string(),
+                model_id: Some("test-model".into()),
+                tier: crate::ai::ServedTier::Local,
+                prompt_tokens: None,
+                completion_tokens: None,
+            })
+        }
+    }
+
+    /// Same shape, but the model explicitly says `"none"` (at HIGH
+    /// confidence) — the negative control for the test below: this must NOT
+    /// carry the `"low_confidence"` reason.
+    struct ExplicitNoneModel;
+    impl crate::ai::ModelPort for ExplicitNoneModel {
+        async fn complete(
+            &self,
+            _req: crate::ai::ModelRequest,
+        ) -> Result<crate::ai::ModelReply, crate::ai::ModelFailure> {
+            Ok(crate::ai::ModelReply {
+                text: r#"{"choice":"none","confidence":"high","reason":"nothing fits"}"#
+                    .to_string(),
+                model_id: Some("test-model".into()),
+                tier: crate::ai::ServedTier::Local,
+                prompt_tokens: None,
+                completion_tokens: None,
+            })
+        }
+    }
+
+    /// T5.2.3 review (M1): `AiRunItem.reason` never had a test exercising
+    /// the actual wire shape `GET /ai/runs/{run_id}` returns. Since
+    /// `trigger_classify` cannot be driven through a real `POST
+    /// /ai/classify` with a stub model (T5.1.2 not wired — production
+    /// hardcodes `model: None`), this runs `run_classify` directly against
+    /// [`LowConfidenceModel`], feeds the result through the SAME production
+    /// mapping `trigger_classify` itself calls
+    /// (`crate::http::ai_classify::build_classify_run_items`), inserts it
+    /// into the run registry the way `BusyGuard::finish` would, and reads it
+    /// back through the real `GET /ai/runs/{run_id}` HTTP handler — so the
+    /// serde wire shape (including `#[serde(skip_serializing_if)]`) is
+    /// exercised for real, not just the Rust struct. Mutation target: change
+    /// `build_classify_run_items`'s `reason: o.reason` to `reason: None` —
+    /// this test goes red (`items[0]["reason"]` disappears).
+    #[tokio::test]
+    async fn get_ai_run_reports_low_confidence_reason_on_the_wire() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let sink = RecordingSink::default();
+        let state = Sin90State::new(
+            store.clone(),
+            Arc::new(sink),
+            ActorKeys {
+                human: HUMAN.into(),
+                automation: AUTOMATION.into(),
+            },
+        );
+        let app = crate::http::router(state.clone(), false);
+
+        let _direction = store
+            .create_direction("Work", "2026-Q4", None)
+            .await
+            .unwrap();
+        let task = store
+            .create_task(
+                "Something unrelated to any candidate",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+        let reader = store.ai_reader();
+
+        let outcomes = crate::ai::classify::run_classify(
+            "run-wire-reason-low",
+            std::slice::from_ref(&task),
+            crate::ai::ModelAccess::LocalOnly,
+            Some(&LowConfidenceModel),
+            &store,
+            &reader,
+        )
+        .await;
+        let items = crate::http::ai_classify::build_classify_run_items(Vec::new(), outcomes);
+        {
+            let mut reg = state.ai_runs.lock().unwrap();
+            reg.start(Capability::Classify, "run-wire-reason-low");
+            reg.finish(Capability::Classify, "run-wire-reason-low", "done", items);
+        }
+
+        let body = body_json(
+            app.oneshot(get_req("/ai/runs/run-wire-reason-low"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let items = body["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["result"], "nothing");
+        assert_eq!(items[0]["reason"], "low_confidence");
+    }
+
+    /// T5.2.3 review (M1) positive control: an explicit `choice == "none"`
+    /// (at high confidence) must end `Nothing` WITHOUT the `reason` field on
+    /// the wire at all — not `null`, the key must be absent entirely
+    /// (`#[serde(skip_serializing_if = "Option::is_none")]`). Same harness as
+    /// the test above, swapping in [`ExplicitNoneModel`].
+    #[tokio::test]
+    async fn get_ai_run_has_no_reason_key_for_explicit_none() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let sink = RecordingSink::default();
+        let state = Sin90State::new(
+            store.clone(),
+            Arc::new(sink),
+            ActorKeys {
+                human: HUMAN.into(),
+                automation: AUTOMATION.into(),
+            },
+        );
+        let app = crate::http::router(state.clone(), false);
+
+        let _direction = store
+            .create_direction("Work", "2026-Q4", None)
+            .await
+            .unwrap();
+        let task = store
+            .create_task(
+                "Something unrelated to any candidate",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+        let reader = store.ai_reader();
+
+        let outcomes = crate::ai::classify::run_classify(
+            "run-wire-reason-none",
+            std::slice::from_ref(&task),
+            crate::ai::ModelAccess::LocalOnly,
+            Some(&ExplicitNoneModel),
+            &store,
+            &reader,
+        )
+        .await;
+        let items = crate::http::ai_classify::build_classify_run_items(Vec::new(), outcomes);
+        {
+            let mut reg = state.ai_runs.lock().unwrap();
+            reg.start(Capability::Classify, "run-wire-reason-none");
+            reg.finish(Capability::Classify, "run-wire-reason-none", "done", items);
+        }
+
+        let body = body_json(
+            app.oneshot(get_req("/ai/runs/run-wire-reason-none"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let items = body["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["result"], "nothing");
+        assert!(
+            !items[0].as_object().unwrap().contains_key("reason"),
+            "an explicit choice==\"none\" must not carry a reason key at all: {items:?}"
+        );
+    }
 }
 
 // ---- POST /ai/propose (T5.4.1, design §11.4 公共 + §11.4.3) ----------------
