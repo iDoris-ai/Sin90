@@ -180,6 +180,12 @@ async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
              in sin90_outbox as pending until a future generation is granted it"
         );
     }
+    // T3.5.1, `test-hooks` only: clone the store BEFORE it moves into
+    // `Sin90State::new` below — `adapter_agent24::reconciler_debug`'s debug
+    // route needs its own handle, same reasoning as `reconciler::spawn_pump_loop`'s
+    // own `store.clone()` just above.
+    #[cfg(feature = "test-hooks")]
+    let debug_store = store.clone();
     let mut state = Sin90State::new(store, sink, keys);
     // T5.1.2: `Some` only when the kernel granted `_a24/model/` at
     // handshake — `Sin90State::model`'s own doc.
@@ -216,10 +222,18 @@ async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
     // is `Arc::clone`d, not moved — the callback connection this generation
     // owns must still outlive this whole function regardless (N-H1, above).
     #[cfg(feature = "test-hooks")]
-    let inner_router = inner_router.merge(sin90::adapter_agent24::kernel_roundtrip::router(
-        std::sync::Arc::clone(&clients_handle),
-        debug_actor_keys,
-    ));
+    let inner_router = inner_router
+        .merge(sin90::adapter_agent24::kernel_roundtrip::router(
+            std::sync::Arc::clone(&clients_handle),
+            std::sync::Arc::clone(&debug_actor_keys),
+        ))
+        // T3.5.1: same posture as `kernel_roundtrip` above — its own tiny
+        // router/state, merged at the HTTP level, never touching `Sin90State`.
+        .merge(sin90::adapter_agent24::reconciler_debug::router(
+            std::sync::Arc::clone(&clients_handle),
+            debug_store,
+            debug_actor_keys,
+        ));
     let mounted_router = axum::Router::new().nest("/api/v1/sin90", inner_router);
     axum::serve(listener, mounted_router).await?;
     Ok(())

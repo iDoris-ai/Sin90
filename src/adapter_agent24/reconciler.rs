@@ -97,15 +97,16 @@ const PUMP_TICK: Duration = Duration::from_secs(5);
 /// schedule directly on the kernel side — not the primary mechanism.
 const FULL_RECONCILE_INTERVAL: Duration = Duration::from_secs(3600);
 
-/// The kernel schedule key for a Routine's id — the ONE place this module
-/// mints that shape, mirroring `store::repo`'s own private
-/// `routine_dedup_key`/`routine_outbox_upsert_desired` (this crate's
-/// `adapter_agent24` layer cannot reach those — they are private to `store`
-/// — so the `routine.<id>` convention is re-derived here from the SAME
-/// `desired.key` field every outbox row already carries, never invented
-/// independently).
+/// The kernel schedule key for a Routine's id — delegates to
+/// [`crate::store::repo::routine_kernel_key`] (`pub(crate)`, `lib.rs`'s own
+/// layering: `adapter_agent24` already depends on `store`) rather than
+/// re-deriving the `routine.<id>` shape independently, so the lower-casing
+/// that function's own doc explains (T3.5.1: the kernel's key charset is
+/// `[a-z0-9._-]`, `ulid()` is uppercase) can never drift out of step between
+/// the two call sites again — the bug T3.5.1's real-mount test found was
+/// exactly that kind of drift.
 fn kernel_key(routine_id: &str) -> String {
-    format!("routine.{routine_id}")
+    crate::store::repo::routine_kernel_key(routine_id)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -609,9 +610,18 @@ pub async fn reconcile_full(
             continue;
         }
         match key.strip_prefix("routine.") {
-            Some(routine_id) => {
+            Some(routine_id_lower) => {
+                // T3.5.1: `key` is the kernel's own (lower-cased,
+                // `routine_kernel_key`'s doc) form — `sin90_routines.id` is
+                // the original uppercase `ulid()`, so
+                // `outbox_enqueue_delete_for_orphan`'s own `SELECT ...
+                // WHERE id = ?` needs the recovered uppercase id, not the
+                // lower-cased key fragment. `key` itself (passed through
+                // unchanged below) is what actually gets sent back to the
+                // kernel on `scheduler.delete` and must stay byte-exact.
+                let routine_id = routine_id_lower.to_uppercase();
                 store
-                    .outbox_enqueue_delete_for_orphan(routine_id, key)
+                    .outbox_enqueue_delete_for_orphan(&routine_id, key)
                     .await?;
             }
             None => {
@@ -1090,7 +1100,16 @@ mod tests {
         let store = run.await.unwrap();
 
         assert!(!fake.schedules.contains_key("routine.orphan1"));
-        let rows = test_hooks::outbox_rows_for(&store, "routine:orphan1")
+        // T3.5.1: the orphan loop recovers `routine_id` from the kernel key
+        // via `.to_uppercase()` (this function's own doc — the kernel key
+        // is always lower-cased, a real `sin90_routines.id` is always an
+        // uppercase `ulid()`) BEFORE computing the internal dedup key, so a
+        // lower-case fixture key like `"routine.orphan1"` here produces the
+        // dedup key `"routine:ORPHAN1"`, not `"routine:orphan1"` — this
+        // fixture's `routine_id` is synthetic (no real `sin90_routines` row
+        // for it either way), but the case transform still applies exactly
+        // as it would for a genuinely retired Routine's real ULID.
+        let rows = test_hooks::outbox_rows_for(&store, "routine:ORPHAN1")
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);

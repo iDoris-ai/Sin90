@@ -659,6 +659,31 @@ fn routine_dedup_key(id: &str) -> String {
     format!("routine:{id}")
 }
 
+/// The kernel-facing schedule key for a Routine (spec.md M3; Agent24 design
+/// §6.3/`agent24d::scheduler_callback`'s own validator: `_a24/scheduler/*`'s
+/// `key` is byte-exact `[a-z0-9._-]{1,128}`, no case folding — T3.5.1's
+/// real-mount acceptance test is what actually found this: every
+/// `sin90_routines.id` is a [`crate::core::util::ulid`], which is Crockford
+/// Base32 and therefore UPPERCASE, so a naive `format!("routine.{id}")`
+/// fails every real kernel upsert with `invalid_params`). `id` is
+/// lower-cased here — the ONE place this crate turns a Routine id into the
+/// string actually sent to the kernel.
+///
+/// [`Sin90Store::record_routine_fire`]'s `.to_uppercase()` on the way back
+/// is this transform's lossless inverse (plain ASCII case folding —
+/// Crockford's own alphabet has no upper/lower ambiguity), recovering the
+/// EXACT id `sin90_routines.id` stores. `pub(crate)` (not private): the
+/// SAME transform is also needed to compare a kernel `list()` key against a
+/// local Routine (`adapter_agent24::reconciler::kernel_key` calls this
+/// function directly, per `lib.rs`'s own layering — `adapter_agent24`
+/// already depends on `store`) — duplicating this specific `format!` a
+/// second time is exactly the kind of drift that produced this bug in the
+/// first place (one call site lower-cased, the others didn't), so this
+/// fix makes it ONE function, not two identical ones.
+pub(crate) fn routine_kernel_key(id: &str) -> String {
+    format!("routine.{}", id.to_lowercase())
+}
+
 /// The `desired` payload for a `scheduler.upsert` outbox row mirroring a
 /// Routine's active/paused state into the kernel scheduler (spec.md M3):
 /// `{key: "routine.<id>", spec: {cron, tz}, enabled}`. `enabled` is `true`
@@ -671,7 +696,7 @@ fn routine_outbox_upsert_desired(
     enabled: bool,
 ) -> serde_json::Value {
     json!({
-        "key": format!("routine.{id}"),
+        "key": routine_kernel_key(id),
         "spec": {"cron": cron, "tz": tz},
         "enabled": enabled,
     })
@@ -681,7 +706,7 @@ fn routine_outbox_upsert_desired(
 /// reached `retired`, spec.md M3): just the kernel key, nothing left to
 /// describe.
 fn routine_outbox_delete_desired(id: &str) -> serde_json::Value {
-    json!({"key": format!("routine.{id}")})
+    json!({"key": routine_kernel_key(id)})
 }
 
 /// One `sin90_outbox` row, as the reconciler (T3.3.2,
@@ -2516,14 +2541,32 @@ impl Sin90Store {
         scheduled_for: &str,
         trigger: FireTrigger,
     ) -> Result<RoutineFireOutcome> {
-        let Some(routine_id) = key.strip_prefix("routine.").filter(|rest| !rest.is_empty()) else {
+        // T3.5.1 (real-mount acceptance found this): the kernel's schedule
+        // key is restricted to `[a-z0-9._-]{1,128}` byte-exact, no case
+        // folding (Agent24 design §6.3, `agent24d::scheduler_callback`'s own
+        // validator) — but `core::util::ulid` (every `sin90_routines.id`)
+        // is Crockford Base32 and therefore UPPERCASE. `record_routine_fire`
+        // is the receiving half of that same convention
+        // (`store::repo::routine_outbox_upsert_desired`/
+        // `routine_outbox_delete_desired` lower-case the id when building
+        // the key sent TO the kernel) — `.to_uppercase()` here is the
+        // lossless inverse of that `.to_lowercase()` (Crockford's alphabet
+        // is plain ASCII digits/letters, so the round trip never loses
+        // information), recovering the EXACT id `sin90_routines.id` stores.
+        // A no-op for the many existing tests in this file/`http::tests`
+        // that build this key directly from an already-uppercase id.
+        let Some(routine_id) = key
+            .strip_prefix("routine.")
+            .filter(|rest| !rest.is_empty())
+            .map(str::to_uppercase)
+        else {
             return Ok(RoutineFireOutcome::UnknownKey);
         };
 
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
 
         let row = sqlx::query("SELECT status, kind FROM sin90_routines WHERE id = ?")
-            .bind(routine_id)
+            .bind(&routine_id)
             .fetch_optional(&mut *tx)
             .await?;
         let Some(row) = row else {
@@ -2533,9 +2576,7 @@ impl Sin90Store {
         let kind: String = row.get("kind");
 
         if status == "retired" {
-            return Ok(RoutineFireOutcome::RoutineRetired {
-                routine_id: routine_id.to_string(),
-            });
+            return Ok(RoutineFireOutcome::RoutineRetired { routine_id });
         }
 
         let now = now_iso8601();
@@ -2554,7 +2595,7 @@ impl Sin90Store {
              RETURNING fire_id",
         )
         .bind(fire_id)
-        .bind(routine_id)
+        .bind(&routine_id)
         .bind(scheduled_for)
         .bind(&trigger_str)
         .bind(&now)
@@ -2564,20 +2605,18 @@ impl Sin90Store {
 
         if inserted.is_none() {
             tx.commit().await?;
-            return Ok(RoutineFireOutcome::Duplicate {
-                routine_id: routine_id.to_string(),
-            });
+            return Ok(RoutineFireOutcome::Duplicate { routine_id });
         }
 
         append_event(
             &mut tx,
             "routine",
-            routine_id,
+            &routine_id,
             "fired",
             None,
             None,
             &json!({
-                "routine_id": routine_id, "fire_id": fire_id,
+                "routine_id": &routine_id, "fire_id": fire_id,
                 "scheduled_for": scheduled_for, "trigger": trigger_str,
             }),
             &now,
@@ -2605,7 +2644,7 @@ impl Sin90Store {
 
         tx.commit().await?;
         Ok(RoutineFireOutcome::Recorded {
-            routine_id: routine_id.to_string(),
+            routine_id,
             auto_review,
         })
     }
@@ -5473,7 +5512,10 @@ mod outbox_tests {
         let row = &rows[0];
         assert_eq!(row.status, "pending");
         assert_eq!(row.kind, "scheduler.upsert");
-        assert_eq!(row.desired["key"], json!(format!("routine.{}", routine.id)));
+        // T3.5.1: the kernel key is lower-cased (`routine_kernel_key`'s own
+        // doc — the kernel's key charset is `[a-z0-9._-]`, `routine.id` is
+        // an uppercase `ulid()`).
+        assert_eq!(row.desired["key"], json!(routine_kernel_key(&routine.id)));
         assert_eq!(row.desired["spec"]["cron"], json!("0 8 * * MON,WED,FRI"));
         assert_eq!(row.desired["enabled"], json!(false));
     }
@@ -5499,10 +5541,9 @@ mod outbox_tests {
         let row = &rows[0];
         assert_eq!(row.status, "pending");
         assert_eq!(row.kind, "scheduler.delete");
-        assert_eq!(
-            row.desired,
-            json!({"key": format!("routine.{}", routine.id)})
-        );
+        // T3.5.1: lower-cased kernel key, same reasoning as the upsert test
+        // above.
+        assert_eq!(row.desired, json!({"key": routine_kernel_key(&routine.id)}));
     }
 
     // ----- title doesn't write outbox; cron does (positive control) --------
