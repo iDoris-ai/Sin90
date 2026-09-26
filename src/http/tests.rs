@@ -9785,13 +9785,22 @@ mod ai_summarize {
     /// `cargo test suppress_`'s summarize half: a REJECTED `DraftReviewBody`
     /// keeps `dedup_summarize` reporting `"suppressed_rejected"` for the SAME
     /// review while the body is untouched, and stops (`dedup_summarize`
-    /// returns `None` — dedup no longer blocks this review; whether the NEXT
-    /// `/ai/summarize` run actually PRODUCES a fresh rewrite is a separate
-    /// question the ladder itself decides, not something this dedup-only
-    /// check claims) the moment the body is edited out from under it (the
-    /// fingerprint's own "situation changed" leg — §2 #31's summarize-
-    /// specific reuse of `DraftReviewBody`'s D6 hash comparison; no "新
-    /// Direction" leg here, by design).
+    /// returns `None`) the moment the body is edited out from under it — leg
+    /// 1 of the fingerprint's "situation changed" check (§2 #31's summarize-
+    /// specific reuse of `DraftReviewBody`'s D6 hash comparison; the "新
+    /// Direction" leg classify/propose have does not apply here, by design —
+    /// see `dedup_summarize`'s own doc for the SEPARATE week-activity leg
+    /// that DOES, `week_activity_since`, exercised by its own test below).
+    ///
+    /// IMPORTANT caveat this test does NOT prove: `dedup_summarize` returning
+    /// `None` here only means the DEDUP LAYER stops blocking this review — it
+    /// does not mean a real `/ai/summarize` trigger would go on to produce a
+    /// fresh AI rewrite. In the real end-to-end path, the edited body is now
+    /// human-written text, so `is_program_only` (Q7) would refuse to
+    /// overwrite it and the run would report `"skipped"`/`"human_text"`
+    /// instead — a DIFFERENT skip reason than the one this test is about.
+    /// `trigger_summarize_human_text_is_skipped` covers that Q7 path
+    /// directly; this test is scoped to the dedup layer alone.
     #[tokio::test]
     async fn suppress_rejected_summarize_blocks_until_body_edited() {
         let (_app, _sink, store) = test_app_with_store().await;
@@ -9966,6 +9975,249 @@ mod ai_summarize {
             reason,
             Some("suppressed_rejected"),
             "must compare against the MOST RECENT rejection's base hash, not the first one"
+        );
+    }
+
+    /// 2026-09-26 external review (blocking): leg 2 of "situation changed" —
+    /// [`Sin90Store::week_activity_since`] — exercised END TO END through the
+    /// real `POST /ai/summarize` route, not `dedup_summarize` called
+    /// directly. Before this leg existed, an empty-body weekly review whose
+    /// AI draft got rejected was suppressed FOREVER: the body never moves on
+    /// its own (leg 1, the SHA-256 compare, can only fire on a HUMAN edit),
+    /// and Q7 (`is_program_only`) blocks AI from ever overwriting a body a
+    /// human DID edit — so the only body state this review can ever be in
+    /// (empty) forever re-matches the rejected snapshot's hash. This test
+    /// asserts the fix: a task belonging to the review's own week finishing
+    /// AFTER the rejection lifts the suppression, with the body never having
+    /// changed at all. Must go RED on the code before `week_activity_since`
+    /// existed (the third trigger below would still report
+    /// `"skipped"`/`"suppressed_rejected"`) — confirmed by running it against
+    /// that code before writing the fix.
+    #[tokio::test]
+    async fn trigger_summarize_rejected_suppression_lifts_once_the_weeks_data_changes() {
+        let (app, _sink, store) = test_app_with_store().await;
+        let review = store
+            .create_review(&NewReview {
+                kind: ReviewKind::Weekly,
+                period: "2026-W39".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(review.body, "", "a freshly created review's body is empty");
+
+        // Round 1: trigger -> a fresh proposal.
+        let resp1 = app
+            .clone()
+            .oneshot(automation_req(
+                "POST",
+                "/ai/summarize",
+                json!({"review_id": review.id}),
+            ))
+            .await
+            .unwrap();
+        let run1 = body_json(resp1).await["run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (state1, items1) = poll_run_to_done(&app, &run1).await;
+        assert_eq!(state1, "done", "items={items1:?}");
+        assert_eq!(items1.as_array().unwrap()[0]["result"], "proposed");
+
+        let pending = store.list_pending_proposals().await.unwrap();
+        let proposal = pending
+            .iter()
+            .find(|p| {
+                matches!(
+                    p.ops.as_slice(),
+                    [crate::core::Sin90Op::DraftReviewBody { review_id, .. }]
+                        if review_id == &review.id
+                )
+            })
+            .cloned()
+            .unwrap();
+
+        // Backdate the proposal's own `created_at` (its `proposed_at` once
+        // rejected) to a fixed instant inside `2026-W39` but strictly BEFORE
+        // the task completion stamped below — `now_iso8601()`'s second
+        // resolution would otherwise risk a tie between the two.
+        crate::store::test_hooks::set_proposal_created_at(
+            &store,
+            &proposal.id,
+            "2026-09-22T00:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        let reject = app
+            .clone()
+            .oneshot(reject_req(&proposal.id, HUMAN, None))
+            .await
+            .unwrap();
+        assert_eq!(reject.status(), StatusCode::OK);
+
+        // Negative control: nothing about the week's data has changed yet —
+        // still suppressed.
+        let resp2 = app
+            .clone()
+            .oneshot(automation_req(
+                "POST",
+                "/ai/summarize",
+                json!({"review_id": review.id}),
+            ))
+            .await
+            .unwrap();
+        let run2 = body_json(resp2).await["run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (state2, items2) = poll_run_to_done(&app, &run2).await;
+        assert_eq!(state2, "done", "items={items2:?}");
+        assert_eq!(items2.as_array().unwrap()[0]["result"], "skipped");
+        assert_eq!(
+            items2.as_array().unwrap()[0]["reason"],
+            "suppressed_rejected"
+        );
+        assert_eq!(
+            store.get_review(&review.id).await.unwrap().body,
+            "",
+            "still suppressed: the body must not have moved"
+        );
+
+        // Complete a task, its "done" transition stamped strictly AFTER the
+        // rejected proposal's `proposed_at` and inside `2026-W39`'s own
+        // `[start, end)` window (`2026-09-21T00:00:00Z ..
+        // 2026-09-28T00:00:00Z`).
+        let task = store
+            .create_task(
+                "Ship it",
+                None,
+                None,
+                crate::core::TaskKind::Other,
+                crate::core::Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+        for to in [
+            crate::core::TaskStatus::Planned,
+            crate::core::TaskStatus::InProgress,
+            crate::core::TaskStatus::Done,
+        ] {
+            store.transition_task(&task.id, to).await.unwrap();
+        }
+        crate::store::test_hooks::set_last_event_at(
+            &store,
+            "task",
+            &task.id,
+            "2026-09-23T00:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        // Positive control: the week's data changed — suppression must
+        // lift, producing a fresh proposal even though the body itself
+        // never moved away from the rejected snapshot.
+        let resp3 = app
+            .clone()
+            .oneshot(automation_req(
+                "POST",
+                "/ai/summarize",
+                json!({"review_id": review.id}),
+            ))
+            .await
+            .unwrap();
+        let run3 = body_json(resp3).await["run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (state3, items3) = poll_run_to_done(&app, &run3).await;
+        assert_eq!(state3, "done", "items={items3:?}");
+        assert_eq!(
+            items3.as_array().unwrap()[0]["result"],
+            "proposed",
+            "a completed task inside this week must lift the rejection-based suppression: {items3:?}"
+        );
+        assert!(items3.as_array().unwrap()[0].get("reason").is_none());
+    }
+
+    /// Low (2026-09-26 external review): the rejection fingerprint is
+    /// `review_id == review_id`, an EXACT match — rejecting review A's
+    /// `DraftReviewBody` proposal must never suppress a DIFFERENT review B.
+    /// Mutation target: loosen `dedup_summarize`'s `rid == review_id` compare
+    /// to anything less exact (e.g. a prefix/contains match) and this goes
+    /// red — review B's own `dedup_summarize` call would wrongly start
+    /// reporting `Some("suppressed_rejected")`.
+    #[tokio::test]
+    async fn suppress_rejected_summarize_fingerprint_does_not_cross_reviews() {
+        let (_app, _sink, store) = test_app_with_store().await;
+        let review_a = store
+            .create_review(&NewReview {
+                kind: ReviewKind::Weekly,
+                period: "2026-W42".into(),
+            })
+            .await
+            .unwrap();
+        let review_b = store
+            .create_review(&NewReview {
+                kind: ReviewKind::Weekly,
+                period: "2026-W43".into(),
+            })
+            .await
+            .unwrap();
+
+        let base_hash_a = crate::core::body_sha256(&review_a.body);
+        let draft_a = crate::ai::ProposalDraft {
+            id: "p-suppress-summarize-fp-a".into(),
+            ops: vec![crate::core::Sin90Op::DraftReviewBody {
+                review_id: review_a.id.clone(),
+                base_body_sha256: base_hash_a,
+                body: "a draft for A".into(),
+            }],
+            rationale: None,
+        };
+        let rec_a = crate::ai::AiCallRecord {
+            id: "c-suppress-summarize-fp-a".into(),
+            run_id: "run-suppress-summarize-fp".into(),
+            task_kind: Capability::Summarize,
+            engine: crate::ai::Engine::Reflex,
+            fallback_from: None,
+            served_tier: None,
+            model_id: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            latency_ms: 0,
+            ok: true,
+            error_kind: None,
+            proposal_id: None,
+            at: "2026-09-24T00:00:00Z".into(),
+        };
+        crate::ai::AiSink::submit(&store, Capability::Summarize, draft_a, rec_a)
+            .await
+            .unwrap();
+        store
+            .reject_proposal("p-suppress-summarize-fp-a", None)
+            .await
+            .unwrap();
+
+        // Negative control: A itself is still suppressed (same fixture
+        // `suppress_rejected_summarize_blocks_until_body_edited` already
+        // exercises — pinned again here as the exact-match test's own
+        // baseline).
+        let reason_a = crate::http::ai_summarize::dedup_summarize(&store, &review_a.id)
+            .await
+            .unwrap();
+        assert_eq!(reason_a, Some("suppressed_rejected"));
+
+        // The actual assertion: review B, an entirely different review with
+        // its own untouched (equally "unchanged since a rejection" if the
+        // fingerprint were loose) empty body, must NOT be suppressed by A's
+        // rejection.
+        let reason_b = crate::http::ai_summarize::dedup_summarize(&store, &review_b.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            reason_b, None,
+            "review B must not be suppressed by a rejection recorded against review A"
         );
     }
 }

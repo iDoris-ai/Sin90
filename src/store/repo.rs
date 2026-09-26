@@ -3345,6 +3345,47 @@ impl Sin90Store {
         Ok(row.is_some())
     }
 
+    /// T5.7.2 (2026-09-26 external review, blocking): `dedup_summarize`'s
+    /// second "situation changed" leg — mirrors [`Self::task_modified_since`]
+    /// but at the WEEK's granularity, since a weekly Review's numbers have no
+    /// single task to compare against. "该周报所属那一周" is read the SAME way
+    /// `weekly_draft_on` (`store/weekly_draft.rs`) already reads it: `at`
+    /// falling inside `iso_week_bounds(iso_week)`'s `[start, end)` window,
+    /// never a join through `sin90_tasks.week_id`/`sin90_routines` — that
+    /// window is the one and only place this crate draws the line between
+    /// "this week's data" and everything else, and `weekly_draft_on`'s own
+    /// `tasks_done` (`entity = 'task', kind = 'transitioned', to_state =
+    /// 'done'`) / `routines[].fired` (`entity = 'routine', kind = 'fired'`)
+    /// queries are exactly the events this one is meant to react to — so
+    /// `entity IN ('task', 'routine')` (no `kind` filter: any task/Routine
+    /// event in that window counts, not only the two kinds the draft happens
+    /// to total today) is the query, not a bespoke one per fact. Deliberately
+    /// excludes `entity = 'block'`/`'direction'` (attention/schedule-block
+    /// replay, which feeds `by_area`/`by_direction`) and `entity = 'proposal'`
+    /// — a rejected summarize proposal itself must never be read as "the
+    /// situation changed" (that would un-suppress ITSELF on the very rejection
+    /// that created the row).
+    pub(crate) async fn week_activity_since(&self, iso_week: &str, since: &str) -> Result<bool> {
+        let (start, end) = crate::core::iso_week_bounds(iso_week).ok_or_else(|| {
+            StoreError::Invalid(format!(
+                "week must be an ISO-8601 week like 2026-W39, got {iso_week:?}"
+            ))
+        })?;
+        let row: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM sin90_events
+             WHERE entity IN ('task', 'routine')
+               AND at >= ? AND at < ?
+               AND at > ?
+             LIMIT 1",
+        )
+        .bind(&start)
+        .bind(&end)
+        .bind(since)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row.is_some())
+    }
+
     // ----- Review (M4, T4.1.1, design §2/§3.2/§4.1) -------------------------
     //
     // Direct writes, human-gated at the HTTP layer (same convention as
