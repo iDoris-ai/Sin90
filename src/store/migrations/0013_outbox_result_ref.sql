@@ -1,0 +1,30 @@
+-- 0013 (T4.4.1 Opus 评审 L5): `sin90_outbox.result_ref TEXT NULL` — a
+-- generic slot for "the kernel's own identifier for whatever this row's
+-- successful call produced," written by `Sin90Store::outbox_mark_done`'s
+-- new optional `result_ref` parameter at the moment a row lands `done`.
+--
+-- Concrete motivating case: `memory.remember` (T4.4.1) calls
+-- `_a24/memory/private/remember`, which mints a fresh `osmem:<ULID>` id on
+-- every successful call (`MemoryClient::remember`'s own doc) — before this
+-- column, that id was discarded the instant `adapter_agent24::reconciler`
+-- read it off the wire, leaving no local record of WHICH kernel memory a
+-- given outbox row actually produced (useful for debugging/audit: "did this
+-- Review's summary actually land, and under what id"). `scheduler.upsert`/
+-- `.delete` rows have no comparable "the kernel handed back a fresh
+-- identity" moment — their own `outbox_mark_done` call sites simply pass
+-- `None`, and `result_ref` stays `NULL` for them, same as every existing
+-- row before this migration.
+--
+-- Plain `ALTER TABLE ... ADD COLUMN ... NULL`, no CHECK, no backfill needed:
+-- every pre-existing row correctly reads back `NULL` ("no known result id"),
+-- exactly what a `scheduler.*` row already means and what a `memory.
+-- remember` row landed before this column existed also means (its id was
+-- real but never recorded — this migration does not retroactively invent
+-- one).
+--
+-- Takes migration slot 0013, the next free one after 0012
+-- (`outbox_migrations_are_contiguous_no_gaps`, src/store/repo.rs). Lands as
+-- its OWN commit, separate from the Rust code that reads/writes it, per
+-- pre-pr-check SZ-4 ("a migration must not mix with other changes in one
+-- PR") — same posture 0011/0012 already took.
+ALTER TABLE sin90_outbox ADD COLUMN result_ref TEXT NULL;
