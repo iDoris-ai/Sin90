@@ -185,6 +185,22 @@ fn permanent_failure_kind(err: &ClientError) -> &'static str {
 /// nobody is ever told about.
 const OTHER_BUCKET_EXHAUSTION_THRESHOLD: i64 = 20;
 
+/// PR-Daemon REQUEST_CHANGES on #62 (merge-order forward compatibility, see
+/// the `other =>` arm of [`apply_one`]'s dispatch): how long a row whose
+/// `kind` this reconciler build does not recognize at all waits before being
+/// reconsidered. A fixed hour, not [`backoff_after`]'s exponential schedule
+/// — that schedule assumes a transient kernel/connection condition that
+/// clears in seconds to minutes; an unrecognized `kind` only clears once
+/// this binary is upgraded to a build that knows it, which is on the order
+/// of a deploy, not a retry. Long enough that a stacked-PR window (store
+/// layer merged before the reconciler layer that dispatches its new kind)
+/// does not spin the pump uselessly every few seconds; short enough that a
+/// row is not stuck for an unreasonable time once the upgrade does land
+/// (the very next `outbox_notify` after a Routine/Review mutation would
+/// still land any OTHER pending row immediately — this constant only
+/// bounds how long the SAME unrecognized row waits between its own checks).
+const UNKNOWN_KIND_RETRY_SECS: u64 = 3600;
+
 /// What [`apply_one`] tells its caller to do with the REST of the current
 /// batch — M2 review: some kernel-reported conditions (rate limited, busy,
 /// not ready, draining, or the connection/generation itself dying) are
@@ -258,6 +274,11 @@ enum RowOutcome {
 ///   [`RowOutcome::Continue`] — UNLESS `row.other_bucket_attempts` has now
 ///   reached [`OTHER_BUCKET_EXHAUSTION_THRESHOLD`], in which case it is
 ///   marked `failed(kind = "exhausted")` with a `warn!` instead.
+///
+/// A row whose `kind` this DISPATCH does not recognize at all (never reaches
+/// the kernel-call table above) is a SEPARATE case from a bad payload for a
+/// kind it DOES recognize — see the `other =>` arm's own doc below for why
+/// the two must not be conflated.
 async fn apply_one(
     store: &Sin90Store,
     scheduler: &SchedulerClient,
@@ -312,12 +333,57 @@ async fn apply_one(
             }
         },
         other => {
+            // PR-Daemon REQUEST_CHANGES on #62: an unrecognized `kind` is
+            // NOT the same failure as `bad_desired` above (a kind this
+            // build DOES know, whose payload failed to parse — that one
+            // correctly stays a permanent `failed`, since no future
+            // build of THIS SAME binary will ever parse that payload
+            // differently). An unrecognized kind is a forward-compatibility
+            // situation across a stacked-PR merge order: the store layer
+            // that WRITES a new outbox `kind` (e.g. `memory.remember`) can
+            // land and start running in production before the reconciler
+            // layer that knows how to DISPATCH that kind has also merged
+            // and deployed — `finalize_review` enqueueing such a row is
+            // then a fact this OLDER reconciler build must not treat as
+            // "broken forever." `failed` is a terminal state
+            // `outbox_due_pending` never revisits (that method's own
+            // `WHERE status = 'pending'` filter), so marking it `failed`
+            // here would permanently discard a row a LATER reconciler
+            // build — once deployed — could still land correctly; nothing
+            // re-triggers an arbitrary future kind's row the way a Routine
+            // mutation re-triggers its own `scheduler.*` rows via
+            // `upsert_outbox`'s collapse. Instead: stay `pending`, back off
+            // a long FIXED interval ([`UNKNOWN_KIND_RETRY_SECS`] — not
+            // [`backoff_after`]'s exponential schedule, which assumes a
+            // transient condition clearing in seconds, not "wait for a
+            // deploy"), log once so it is visible, and `Continue` — H3's
+            // own guarantee ("a bad row must not stall the batch") still
+            // holds; this is simply a different KIND of "not fatal to the
+            // batch" than `bad_desired`.
+            tracing::warn!(
+                kind = %other,
+                dedup_key = %row.dedup_key,
+                retry_in_secs = UNKNOWN_KIND_RETRY_SECS,
+                "sin90: outbox row has a kind this reconciler build does not recognize; leaving \
+                 it pending (NOT failed) in case an older store layer outran a newer reconciler \
+                 across a stacked-PR merge order — will look at it again later"
+            );
             store
-                .outbox_mark_failed(
+                .outbox_mark_retry(
                     &row.id,
                     row.version,
-                    "bad_desired",
-                    &format!("unrecognized outbox kind {other:?}"),
+                    &format!(
+                        "unrecognized outbox kind {other:?} — forward-compat wait, not a failure"
+                    ),
+                    &iso8601_after_secs(UNKNOWN_KIND_RETRY_SECS),
+                    // L1 posture (T3.3.2 review round 2): never counts toward
+                    // OTHER_BUCKET_EXHAUSTION_THRESHOLD — this is not an
+                    // unclassified KERNEL-side failure, and must never
+                    // eventually flip to failed(exhausted) either; an
+                    // upgrade that never lands would then leave the row
+                    // waiting forever, which is the correct behavior here
+                    // (still strictly better than discarding it).
+                    false,
                 )
                 .await?;
             return Ok(RowOutcome::Continue);
@@ -326,13 +392,13 @@ async fn apply_one(
 
     match result {
         Ok(()) => {
-            store.outbox_mark_done(&row.id, row.version).await?;
+            store.outbox_mark_done(&row.id, row.version, None).await?;
             Ok(RowOutcome::Continue)
         }
         // `delete` + `NotFound` = the kernel already agrees this key is
         // gone — success, not a failure to classify further.
         Err(ClientError::NotFound(_)) if is_delete => {
-            store.outbox_mark_done(&row.id, row.version).await?;
+            store.outbox_mark_done(&row.id, row.version, None).await?;
             Ok(RowOutcome::Continue)
         }
         Err(e @ ClientError::Revoked(_)) => {
@@ -1099,7 +1165,7 @@ mod tests {
         // SAME dedup_key `store::repo`'s own writers always use.
         let auto_row = test_hooks::outbox_rows_for(&store, &dedup).await.unwrap()[0].clone();
         store
-            .outbox_mark_done(&auto_row.id, auto_row.version)
+            .outbox_mark_done(&auto_row.id, auto_row.version, None)
             .await
             .unwrap();
         test_hooks::insert_raw_outbox_row(
@@ -1373,7 +1439,10 @@ mod tests {
         // that delivery had genuinely been lost.
         for row in test_hooks::outbox_rows_for(&store, &dedup).await.unwrap() {
             if row.status == "pending" {
-                store.outbox_mark_done(&row.id, row.version).await.unwrap();
+                store
+                    .outbox_mark_done(&row.id, row.version, None)
+                    .await
+                    .unwrap();
             }
         }
 
@@ -2044,9 +2113,25 @@ mod tests {
         );
     }
 
-    /// Same shape, but the `kind` column itself is unrecognized.
+    /// T4.4.1a review (PR-Daemon REQUEST_CHANGES on #62): a row whose `kind`
+    /// this reconciler build does not recognize AT ALL — as opposed to a
+    /// `bad_desired` row above, whose `kind` IS recognized but whose payload
+    /// failed to parse — must stay `pending` with `next_attempt_at` pushed
+    /// forward, NEVER `failed`. `failed` is a terminal state
+    /// `outbox_due_pending` never revisits, which would permanently discard
+    /// a row a LATER, upgraded reconciler build could still land correctly
+    /// (the forward-compatibility gap a stacked-PR merge order can open: the
+    /// store layer that WRITES a new `kind` can merge/deploy before the
+    /// reconciler layer that knows how to DISPATCH it). The row AFTER it in
+    /// the same batch must still be processed normally — H3's own "does not
+    /// block the batch" guarantee, now proven for this second kind of "not
+    /// fatal." Mutation target: reverting to `outbox_mark_failed(...,
+    /// "bad_desired", ...)` turns this red (`status` reads `failed`, not
+    /// `pending`, and `other_bucket_attempts` stays untouched instead of
+    /// this test's own assertion on it becoming meaningless).
     #[tokio::test]
-    async fn reconcile_h3_unknown_kind_row_is_marked_failed_and_does_not_block_the_batch() {
+    async fn reconcile_h3_unknown_kind_row_stays_pending_with_backoff_and_does_not_block_the_batch()
+    {
         let store = Sin90Store::open_memory().await.unwrap();
         let (scheduler, mut peer) = scheduler_and_peer().await;
         let good = store
@@ -2065,6 +2150,13 @@ mod tests {
         )
         .await
         .unwrap();
+        let before = test_hooks::outbox_rows_for(&store, "routine:does-not-exist-2")
+            .await
+            .unwrap();
+        assert!(
+            before[0].next_attempt_at.is_none(),
+            "not pushed back yet — sanity check on the raw insert"
+        );
 
         let run = tokio::spawn(async move {
             drain_pending_before(&store, &scheduler, "2099-01-01T00:00:00Z")
@@ -2075,12 +2167,34 @@ mod tests {
         let _fake = FakeKernel::default().drive(&mut peer, 1).await;
         let store = run.await.unwrap();
 
-        let bad_rows = test_hooks::outbox_rows_for(&store, "routine:does-not-exist-2")
+        let unknown_rows = test_hooks::outbox_rows_for(&store, "routine:does-not-exist-2")
             .await
             .unwrap();
-        assert_eq!(bad_rows[0].status, "failed");
-        assert_eq!(bad_rows[0].failure_kind.as_deref(), Some("bad_desired"));
+        assert_eq!(
+            unknown_rows[0].status, "pending",
+            "unrecognized kind must stay pending, never failed"
+        );
+        assert!(
+            unknown_rows[0].failure_kind.is_none(),
+            "must not carry a failure_kind at all — it was never marked failed"
+        );
+        assert_eq!(
+            unknown_rows[0].other_bucket_attempts, 0,
+            "must never count toward OTHER_BUCKET_EXHAUSTION_THRESHOLD"
+        );
+        let next_attempt_at = unknown_rows[0]
+            .next_attempt_at
+            .as_deref()
+            .expect("must have been pushed back");
+        let thirty_minutes_from_now = crate::core::iso8601_after_secs(1800);
+        assert!(
+            next_attempt_at > thirty_minutes_from_now.as_str(),
+            "pushed back by roughly UNKNOWN_KIND_RETRY_SECS (1h), not left alone: \
+             {next_attempt_at} vs a 30-minute floor {thirty_minutes_from_now}"
+        );
 
+        // The row AFTER it in the same batch (`created_at ASC`) must still
+        // have been processed normally.
         let good_rows = test_hooks::outbox_rows_for(&store, &good_dedup)
             .await
             .unwrap();
