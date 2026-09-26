@@ -213,7 +213,10 @@ pub async fn trigger_classify(
         items.extend(outcomes.into_iter().map(|o| AiRunItem {
             target: o.task_id,
             result: item_result_str(&o.result).to_string(),
-            reason: None,
+            // T5.2.3: `o.reason` is `Some("low_confidence")` for a model
+            // step that landed below the confidence threshold, `None` for
+            // every other cause of this item's result.
+            reason: o.reason,
         }));
 
         let final_state = if aborted { "aborted" } else { "done" };

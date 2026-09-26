@@ -225,6 +225,15 @@ const MAX_REASON_CHARS: usize = 200;
 pub struct ClassifyDecision {
     pub direction_id: Option<DirectionId>,
     pub reason: String,
+    /// T5.2.3 (用户拍板 Q8「没把握就不要提」): `true` only when THIS `None`
+    /// came from the model's self-reported `confidence` falling below
+    /// [`CLASSIFY_CONFIDENCE_THRESHOLD`] — NOT when the model explicitly
+    /// chose `"none"` (that is a decisive non-match on its own terms, not a
+    /// confidence problem), and never `true` for a reflex decision (R1/R2
+    /// always produce `Some`, see their own docs). `classify_one` uses this
+    /// to tag the run item's `reason` as `"low_confidence"` specifically,
+    /// distinct from every other cause of a bare `nothing`.
+    pub low_confidence: bool,
 }
 
 /// `response_format`'s JSON schema (§11.4.1): `choice` is a closed enum over
@@ -298,6 +307,59 @@ struct ModelChoice {
     reason: String,
 }
 
+/// Ordinal reading of the model's self-reported `confidence` (§11.4.1's
+/// schema `confidence: enum[low, medium, high]`) — deriving `Ord` turns the
+/// threshold check into a plain integer compare instead of a hand-rolled
+/// string match, and makes "below the threshold" well-defined regardless of
+/// which of the three levels the threshold itself sits at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Confidence {
+    Low,
+    Medium,
+    High,
+}
+
+impl Confidence {
+    /// `None` for anything outside the three known levels — the caller
+    /// (`parse_classify_reply`) already rejected that case as `bad_output`
+    /// before this is ever called, so this is only reached with one of the
+    /// three literal strings the schema's `enum` allows.
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "low" => Some(Confidence::Low),
+            "medium" => Some(Confidence::Medium),
+            "high" => Some(Confidence::High),
+            _ => None,
+        }
+    }
+}
+
+/// T5.2.3 (用户拍板 Q8「没把握就不要提」): the model step's self-reported
+/// `confidence` must be AT LEAST this ordinal level for its `choice` to
+/// become a proposal — strictly below it is a decisive non-match instead
+/// (`nothing`, `ok = 1` — the model did its job, the call is recorded, only
+/// the proposal is withheld; `AiRunItem.reason = "low_confidence"`, see
+/// `classify_one`).
+///
+/// 🟡 占位默认值 (T5.2.3): kept as a named constant, not wired into
+/// `sin90_settings`/`/settings/ai` yet — doing so would mean extending
+/// `AiSettings`, `read_ai_settings`, the `PUT /settings/ai` body/route and
+/// their own tests for a value nobody can tune sensibly today (see the note
+/// below); that plumbing is exactly what `ai.executive_enabled` already
+/// looks like, so the shape to copy is known whenever T5.5.1 supplies a real
+/// number and a human-facing default is worth exposing.
+///
+/// `Confidence::Medium` — i.e. reject only `"low"` — is the CONSERVATIVE
+/// placeholder called for here, not a tuned value: design §11.4.1's own Q8
+/// note says small local models self-report confidence with poor
+/// calibration (`low`/`medium`/`high` may not track real hit rate at all),
+/// and the real threshold should come from T5.5.1's smoke-test hit rate per
+/// level (J26), not a prior guess. It also happens to match this ladder's
+/// behavior before this constant existed (`choice == "none" || confidence ==
+/// "low"` was the old check) — no behavior regression, just a named,
+/// reassignable threshold in place of an inline string comparison.
+const CLASSIFY_CONFIDENCE_THRESHOLD: Confidence = Confidence::Medium;
+
 /// Tolerates ONE layer of a ```` ```json ```` (or bare ```` ``` ````) fence
 /// (§11.4.1) — models very commonly wrap JSON output in one even when told
 /// not to.
@@ -316,28 +378,42 @@ fn strip_json_fence(s: &str) -> &str {
 /// `choice` that names neither `"none"` nor one of THIS run's candidate keys
 /// (an invented key, or a real ULID the model tried to guess/copy) all map to
 /// the SAME `Err("bad_output")` — `run_item` records that as a degrade, not a
-/// crash. `choice == "none"` or `confidence == "low"` is a decisive
-/// non-match (`Ok` with `direction_id: None`) — the model looked and said
-/// "no", which is a successful call, not a failure (§11.4.1's "记 ok = 1").
+/// crash. `choice == "none"` or `confidence` below
+/// [`CLASSIFY_CONFIDENCE_THRESHOLD`] (T5.2.3) is a decisive non-match (`Ok`
+/// with `direction_id: None`) — the model looked and either said "no" or
+/// wasn't sure enough, which is a successful call, not a failure (§11.4.1's
+/// "记 ok = 1"). The two causes are kept distinguishable via
+/// `ClassifyDecision::low_confidence` even though both produce `None` here.
 pub fn parse_classify_reply(
     text: &str,
     candidates: &[KeyedCandidate],
 ) -> Result<ClassifyDecision, &'static str> {
     let parsed: ModelChoice =
         serde_json::from_str(strip_json_fence(text)).map_err(|_| "bad_output")?;
-    if !matches!(parsed.confidence.as_str(), "low" | "medium" | "high") {
+    let Some(confidence) = Confidence::parse(&parsed.confidence) else {
         return Err("bad_output");
-    }
+    };
     if parsed.reason.chars().count() > MAX_REASON_CHARS {
         return Err("bad_output");
     }
     if parsed.choice != "none" && !candidates.iter().any(|c| c.key == parsed.choice) {
         return Err("bad_output");
     }
-    if parsed.choice == "none" || parsed.confidence == "low" {
+    if parsed.choice == "none" {
         return Ok(ClassifyDecision {
             direction_id: None,
             reason: parsed.reason,
+            low_confidence: false,
+        });
+    }
+    // T5.2.3: checked AFTER the invented-key check above — a bogus key paired
+    // with low confidence must still be `bad_output`, not quietly downgraded
+    // to a low-confidence `nothing`.
+    if confidence < CLASSIFY_CONFIDENCE_THRESHOLD {
+        return Ok(ClassifyDecision {
+            direction_id: None,
+            reason: parsed.reason,
+            low_confidence: true,
         });
     }
     // `.expect`: the membership check above already proved this key exists.
@@ -350,6 +426,7 @@ pub fn parse_classify_reply(
     Ok(ClassifyDecision {
         direction_id: Some(direction_id),
         reason: parsed.reason,
+        low_confidence: false,
     })
 }
 
@@ -407,8 +484,9 @@ pub fn is_cf_format_char(c: char) -> bool {
 // ---------------------------------------------------------------- run driver
 
 /// Outcome of one item after the whole ladder ran, as this driver reports it
-/// (§11.4 公共's `items: [{target, result}]` shape — the HTTP layer maps this
-/// to that wire vocabulary).
+/// (§11.4 公共's `items: [{target, result, reason?}]` shape — the HTTP layer
+/// maps this to that wire vocabulary; `reason` comes from [`ClassifyItem`],
+/// not this enum, see T5.2.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ItemResult {
     /// A proposal was submitted; the id is `sin90_proposals.id`.
@@ -430,6 +508,13 @@ pub enum ItemResult {
 pub struct ClassifyItem {
     pub task_id: TaskId,
     pub result: ItemResult,
+    /// T5.2.3: why `result` is `Nothing`, when that needs to be
+    /// distinguishable on the wire (design §11.4 公共's `items[].reason`).
+    /// Currently only ever `Some("low_confidence")`; every other cause of a
+    /// bare `Nothing` (no candidates, R1/R2 undecided, model said `"none"`,
+    /// a `bad_output` degrade with nothing left to fall back to, …) leaves
+    /// this `None`, same as before this field existed.
+    pub reason: Option<&'static str>,
 }
 
 /// One task through the full classify ladder (§11.4.1): §11.4's public
@@ -447,14 +532,14 @@ async fn classify_one<M, S, R>(
     model: Option<&M>,
     sink: &S,
     read: &R,
-) -> ItemResult
+) -> (ItemResult, Option<&'static str>)
 where
     M: ModelPort,
     S: AiSink,
     R: AiReadModel,
 {
     if candidates.is_empty() {
-        return ItemResult::Nothing;
+        return (ItemResult::Nothing, None);
     }
     let normalized = normalize_title(&task.title);
     let history = match read.title_history(&normalized).await {
@@ -481,12 +566,14 @@ where
             r1.clone().map(|d| ClassifyDecision {
                 direction_id: Some(d),
                 reason: "a same-titled task is already classified into it".to_string(),
+                low_confidence: false,
             })
         },
         || {
             r2.clone().map(|d| ClassifyDecision {
                 direction_id: Some(d),
                 reason: "its title overlaps this Direction/Area the most".to_string(),
+                low_confidence: false,
             })
         },
         crate::core::now_iso8601,
@@ -495,60 +582,73 @@ where
     .await;
 
     match outcome {
-        Outcome::Produced { value, engine, rec } => match value.direction_id {
-            Some(direction_id) => {
-                let draft = ProposalDraft {
-                    id: format!("ai-classify-{}", crate::core::ulid()),
-                    ops: vec![Sin90Op::AssignTaskDirection {
-                        task_id: task.id.clone(),
-                        direction_id,
-                    }],
-                    rationale: Some(build_rationale(engine, &value.reason)),
-                };
-                let draft_id = draft.id.clone();
-                // 2026-09-24 review (M1): a decision that fails `submit`'s
-                // dry run (state moved between planning and submit — e.g. the
-                // task got classified by something else in the same run's
-                // window) is not a dropped call — it still gets a row, via
-                // `record_call`, since `submit` never wrote one. `rec` is
-                // cloned BEFORE `submit` consumes it so there is something
-                // left to record on the error path (§11.3.5: the model/rule
-                // did its job; the STATE changed, not the call).
-                let rec_on_failure = rec.clone();
-                match sink.submit(Capability::Classify, draft, rec).await {
-                    Ok(()) => ItemResult::Proposed(draft_id),
-                    Err(e) => {
-                        tracing::warn!(error = %e, task_id = %task.id, "classify: a decision failed submit's dry run (state moved)");
-                        let mut failed = rec_on_failure;
-                        failed.ok = false;
-                        failed.proposal_id = None;
-                        failed.error_kind = Some(match &e {
-                            // §11.3.5's own name for this case.
-                            SinkError::Invalid(_) => "rejected_by_precheck",
-                            // An infra failure says nothing about the
-                            // decision's validity — a distinct kind so it is
-                            // never confused with a real precheck rejection.
-                            SinkError::Store(_) => "submit_store_error",
-                        });
-                        if let Err(record_err) = sink.record_call(failed).await {
-                            tracing::warn!(error = %record_err, task_id = %task.id, "classify: failed to record a rejected-at-submit call (R6, not fatal)");
+        Outcome::Produced { value, engine, rec } => {
+            // T5.2.3: read BEFORE `value.direction_id` is matched on below —
+            // that match only moves the `direction_id` field out of `value`
+            // (a partial move), so `value.low_confidence` stays reachable,
+            // but reading it up front keeps the arms below from having to
+            // care about field-move ordering at all.
+            let low_confidence = value.low_confidence;
+            match value.direction_id {
+                Some(direction_id) => {
+                    let draft = ProposalDraft {
+                        id: format!("ai-classify-{}", crate::core::ulid()),
+                        ops: vec![Sin90Op::AssignTaskDirection {
+                            task_id: task.id.clone(),
+                            direction_id,
+                        }],
+                        rationale: Some(build_rationale(engine, &value.reason)),
+                    };
+                    let draft_id = draft.id.clone();
+                    // 2026-09-24 review (M1): a decision that fails `submit`'s
+                    // dry run (state moved between planning and submit — e.g. the
+                    // task got classified by something else in the same run's
+                    // window) is not a dropped call — it still gets a row, via
+                    // `record_call`, since `submit` never wrote one. `rec` is
+                    // cloned BEFORE `submit` consumes it so there is something
+                    // left to record on the error path (§11.3.5: the model/rule
+                    // did its job; the STATE changed, not the call).
+                    let rec_on_failure = rec.clone();
+                    match sink.submit(Capability::Classify, draft, rec).await {
+                        Ok(()) => (ItemResult::Proposed(draft_id), None),
+                        Err(e) => {
+                            tracing::warn!(error = %e, task_id = %task.id, "classify: a decision failed submit's dry run (state moved)");
+                            let mut failed = rec_on_failure;
+                            failed.ok = false;
+                            failed.proposal_id = None;
+                            failed.error_kind = Some(match &e {
+                                // §11.3.5's own name for this case.
+                                SinkError::Invalid(_) => "rejected_by_precheck",
+                                // An infra failure says nothing about the
+                                // decision's validity — a distinct kind so it is
+                                // never confused with a real precheck rejection.
+                                SinkError::Store(_) => "submit_store_error",
+                            });
+                            if let Err(record_err) = sink.record_call(failed).await {
+                                tracing::warn!(error = %record_err, task_id = %task.id, "classify: failed to record a rejected-at-submit call (R6, not fatal)");
+                            }
+                            (ItemResult::Rejected, None)
                         }
-                        ItemResult::Rejected
                     }
                 }
-            }
-            None => {
-                // A decisive non-match is still `ok = 1` (§11.4.1) — record
-                // it as a plain call, not a proposal.
-                if let Err(e) = sink.record_call(rec).await {
-                    tracing::warn!(error = %e, task_id = %task.id, "classify: failed to record a decisive no-match call (R6, not fatal)");
+                None => {
+                    // A decisive non-match is still `ok = 1` (§11.4.1) — record
+                    // it as a plain call, not a proposal.
+                    if let Err(e) = sink.record_call(rec).await {
+                        tracing::warn!(error = %e, task_id = %task.id, "classify: failed to record a decisive no-match call (R6, not fatal)");
+                    }
+                    // T5.2.3: tag WHY this is `Nothing` only when it was the
+                    // confidence check that produced it — `choice == "none"`
+                    // (or R1/R2/no-candidates/bad_output-with-nothing-left)
+                    // all still fold into a bare `Nothing` with no reason.
+                    let reason = low_confidence.then_some("low_confidence");
+                    (ItemResult::Nothing, reason)
                 }
-                ItemResult::Nothing
             }
-        },
-        Outcome::Nothing => ItemResult::Nothing,
-        Outcome::Deferred => ItemResult::Deferred,
-        Outcome::Aborted => ItemResult::Aborted,
+        }
+        Outcome::Nothing => (ItemResult::Nothing, None),
+        Outcome::Deferred => (ItemResult::Deferred, None),
+        Outcome::Aborted => (ItemResult::Aborted, None),
     }
 }
 
@@ -583,8 +683,8 @@ where
     let mut st = RunState::new(std::time::Instant::now());
     let mut out = Vec::with_capacity(tasks.len());
     for task in tasks {
-        let result = if st.aborted {
-            ItemResult::Aborted
+        let (result, reason) = if st.aborted {
+            (ItemResult::Aborted, None)
         } else {
             classify_one(
                 run_id,
@@ -601,6 +701,7 @@ where
         out.push(ClassifyItem {
             task_id: task.id.clone(),
             result,
+            reason,
         });
     }
     out
@@ -1148,6 +1249,264 @@ mod tests {
         )
         .await;
         assert!(matches!(items2[0].result, ItemResult::Proposed(_)));
+    }
+
+    // ---- T5.2.3: classify 低置信度不出提议 (J27) --------------------------
+
+    /// J27 (negative half): the model picks a REAL candidate key but reports
+    /// `confidence: "low"` — below [`CLASSIFY_CONFIDENCE_THRESHOLD`]
+    /// (`Medium`) — so the item ends `Nothing` with NO proposal, exactly
+    /// like an invented key or an explicit `"none"` would, but the call is
+    /// still recorded as a normal `ok = 1` step (the model did its job; it
+    /// just wasn't confident enough) and the run item is tagged
+    /// `reason = "low_confidence"` so a caller can tell this apart from every
+    /// other cause of `Nothing`. Mutation target: delete the `confidence <
+    /// CLASSIFY_CONFIDENCE_THRESHOLD` branch in `parse_classify_reply` (or
+    /// widen the threshold to `Low`) and this test goes red — a proposal
+    /// appears instead.
+    #[tokio::test]
+    async fn classify_low_confidence_below_threshold_is_nothing_and_records_ok1_call() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let _direction = store
+            .create_direction("Work", "2026-Q4", None)
+            .await
+            .unwrap();
+        let task = inbox_task(&store, "Something unrelated to any candidate").await;
+        let reader = store.ai_reader();
+
+        let model = StubModel::always(Ok(reply(
+            r#"{"choice":"d1","confidence":"low","reason":"maybe, not sure"}"#,
+        )));
+        let items = run_classify(
+            "run-low-confidence-1",
+            std::slice::from_ref(&task),
+            ModelAccess::LocalOnly,
+            Some(&model),
+            &store,
+            &reader,
+        )
+        .await;
+        assert_eq!(items[0].result, ItemResult::Nothing);
+        assert_eq!(items[0].reason, Some("low_confidence"));
+
+        let calls: Vec<(String, bool, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT engine, ok, error_kind, proposal_id FROM sin90_ai_calls \
+             WHERE run_id = 'run-low-confidence-1'",
+        )
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        let (_, ok, error_kind, proposal_id) = calls
+            .iter()
+            .find(|(engine, ..)| engine == "local")
+            .expect("the model step's own call row must exist");
+        assert!(
+            ok,
+            "a low-confidence call is a successful call (§11.4.1 ok=1)"
+        );
+        assert_eq!(*error_kind, None);
+        assert_eq!(*proposal_id, None);
+
+        let proposal_count: i64 = sqlx::query_scalar("SELECT count(*) FROM sin90_proposals")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(proposal_count, 0, "no proposal must be submitted at all");
+    }
+
+    /// J27 (positive control, exact boundary): the SAME fixture, but
+    /// `confidence: "medium"` — AT the threshold, not below it — still
+    /// proposes; `reason` is `None` (not tagged `low_confidence`) since the
+    /// item didn't end `Nothing` at all. Proves the comparison is `<`
+    /// (exclusive), not `<=`. Mutation target: change `parse_classify_reply`'s
+    /// `confidence < CLASSIFY_CONFIDENCE_THRESHOLD` to `<=` and this goes red
+    /// (the proposal disappears).
+    #[tokio::test]
+    async fn classify_low_confidence_medium_confidence_at_threshold_still_proposes() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let _direction = store
+            .create_direction("Work", "2026-Q4", None)
+            .await
+            .unwrap();
+        let task = inbox_task(&store, "Something unrelated to any candidate").await;
+        let reader = store.ai_reader();
+
+        let model = StubModel::always(Ok(reply(
+            r#"{"choice":"d1","confidence":"medium","reason":"good enough"}"#,
+        )));
+        let items = run_classify(
+            "run-low-confidence-2",
+            std::slice::from_ref(&task),
+            ModelAccess::LocalOnly,
+            Some(&model),
+            &store,
+            &reader,
+        )
+        .await;
+        assert!(matches!(items[0].result, ItemResult::Proposed(_)));
+        assert_eq!(items[0].reason, None);
+    }
+
+    /// J27 (positive control, high confidence): same shape one level up —
+    /// included alongside the `medium` boundary test so both non-rejected
+    /// levels are exercised under this judgement's own filter name, not just
+    /// inherited from J11/J12's fixtures (which predate the threshold
+    /// existing as a named, comparable value).
+    #[tokio::test]
+    async fn classify_low_confidence_high_confidence_still_proposes() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let _direction = store
+            .create_direction("Work", "2026-Q4", None)
+            .await
+            .unwrap();
+        let task = inbox_task(&store, "Something unrelated to any candidate").await;
+        let reader = store.ai_reader();
+
+        let model = StubModel::always(Ok(reply(
+            r#"{"choice":"d1","confidence":"high","reason":"fits well"}"#,
+        )));
+        let items = run_classify(
+            "run-low-confidence-3",
+            std::slice::from_ref(&task),
+            ModelAccess::LocalOnly,
+            Some(&model),
+            &store,
+            &reader,
+        )
+        .await;
+        assert!(matches!(items[0].result, ItemResult::Proposed(_)));
+        assert_eq!(items[0].reason, None);
+    }
+
+    /// J27: an explicit `choice == "none"` (the model confidently says
+    /// nothing fits) must NOT be tagged `"low_confidence"` even though it
+    /// also ends `Nothing` — the two causes are different (§11.4.1: "none"
+    /// is a decisive non-match on its own; low confidence is "wasn't sure
+    /// enough about a real pick") and only one of them should carry the new
+    /// reason. Mutation target: make `classify_one` tag `Nothing` as
+    /// `Some("low_confidence")` whenever `direction_id` is `None`, regardless
+    /// of `ClassifyDecision::low_confidence` — this test goes red (the
+    /// `"none"` case would wrongly get the reason too).
+    #[tokio::test]
+    async fn classify_low_confidence_explicit_none_is_not_tagged_low_confidence() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let _direction = store
+            .create_direction("Work", "2026-Q4", None)
+            .await
+            .unwrap();
+        let task = inbox_task(&store, "Something unrelated to any candidate").await;
+        let reader = store.ai_reader();
+
+        let model = StubModel::always(Ok(reply(
+            r#"{"choice":"none","confidence":"high","reason":"nothing fits"}"#,
+        )));
+        let items = run_classify(
+            "run-low-confidence-4",
+            std::slice::from_ref(&task),
+            ModelAccess::LocalOnly,
+            Some(&model),
+            &store,
+            &reader,
+        )
+        .await;
+        assert_eq!(items[0].result, ItemResult::Nothing);
+        assert_eq!(items[0].reason, None);
+    }
+
+    /// J27: the confidence threshold is a MODEL-step concern only — reflex
+    /// (R1, decisive) still proposes exactly as before, and the model is
+    /// never even reached to report a confidence at all. Mirrors
+    /// `classify_reflex_history_short_circuits_the_model` (J13) under this
+    /// judgement's own filter name, framed around the new threshold rather
+    /// than the ladder's step order. Mutation target: any change that routes
+    /// R1's decision through the same "is this below threshold" check as the
+    /// model step would panic here (`PanicModel` is never allowed to run),
+    /// which is itself already a stronger signal than a red assertion.
+    #[tokio::test]
+    async fn classify_low_confidence_reflex_r1_unaffected_by_threshold() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let direction = store
+            .create_direction("Work", "2026-Q4", None)
+            .await
+            .unwrap();
+        store
+            .create_task(
+                "Write the report",
+                Some(&direction.id),
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+        let new_task = inbox_task(&store, "  Write   the Report  ").await; // same normalized title
+        let reader = store.ai_reader();
+
+        let items = run_classify(
+            "run-low-confidence-5",
+            std::slice::from_ref(&new_task),
+            ModelAccess::LocalOnly,
+            Some(&PanicModel),
+            &store,
+            &reader,
+        )
+        .await;
+        assert!(matches!(items[0].result, ItemResult::Proposed(_)));
+        assert_eq!(items[0].reason, None);
+        let stored = match &items[0].result {
+            ItemResult::Proposed(id) => store.get_proposal(id).await.unwrap(),
+            _ => unreachable!(),
+        };
+        assert_eq!(stored.source, ProposalSource::Rule);
+    }
+
+    /// J27: an INVENTED key paired with `confidence: "low"` must still be
+    /// `bad_output` (a real parsing/validity failure), NOT quietly reclassified
+    /// as a low-confidence `nothing` — the invented-key check in
+    /// `parse_classify_reply` runs BEFORE the confidence check specifically so
+    /// this combination is never misdiagnosed as "the model looked and wasn't
+    /// sure" when it actually named a key that does not exist. Mutation
+    /// target: reorder `parse_classify_reply` to check `confidence` before the
+    /// candidate-membership check — the `bad_output` row disappears and
+    /// `items[0].reason` would (wrongly) become `Some("low_confidence")`.
+    #[tokio::test]
+    async fn classify_low_confidence_invented_key_with_low_confidence_is_still_bad_output() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let _direction = store
+            .create_direction("Work", "2026-Q4", None)
+            .await
+            .unwrap();
+        let task = inbox_task(&store, "Totally unrelated errand").await;
+        let reader = store.ai_reader();
+
+        let model = StubModel::always(Ok(reply(
+            r#"{"choice":"d9","confidence":"low","reason":"guessed and unsure"}"#,
+        )));
+        let items = run_classify(
+            "run-low-confidence-6",
+            std::slice::from_ref(&task),
+            ModelAccess::LocalOnly,
+            Some(&model),
+            &store,
+            &reader,
+        )
+        .await;
+        assert_eq!(items[0].result, ItemResult::Nothing);
+        assert_eq!(
+            items[0].reason, None,
+            "an invented key degrades via bad_output, not the low-confidence path"
+        );
+
+        let calls: Vec<(String, bool, Option<String>)> = sqlx::query_as(
+            "SELECT engine, ok, error_kind FROM sin90_ai_calls WHERE run_id = 'run-low-confidence-6'",
+        )
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        assert!(calls.iter().any(|(engine, ok, kind)| engine == "local"
+            && !ok
+            && kind.as_deref() == Some("bad_output")));
     }
 
     /// J16 (design §11.7's own name for this judgement): with

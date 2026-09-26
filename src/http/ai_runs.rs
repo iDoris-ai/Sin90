@@ -36,6 +36,12 @@ pub struct AiRunItem {
     /// compute their own dedup-skip without going through this field yet).
     /// Serialized only when present — `GET /ai/runs/{id}`'s existing
     /// consumers see no new field on an item this doesn't apply to.
+    ///
+    /// T5.2.3 adds a THIRD value, `"low_confidence"` — the one case where
+    /// this field appears on a result OTHER than `"skipped"`: classify's
+    /// model step landed below `classify::CLASSIFY_CONFIDENCE_THRESHOLD`, so
+    /// `result == "nothing"` (a decisive non-match, `ok = 1`), not a skip —
+    /// the ladder DID try, it just wasn't confident enough to propose.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
 }
