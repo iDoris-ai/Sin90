@@ -257,9 +257,13 @@ pub(super) async fn dedup_propose(
         .week_tasks(&week.id)
         .await
         .map_err(|e| StoreError::Internal(e.to_string()))?;
-    let current_non_terminal_ids: HashSet<TaskId> = week_tasks_all
+    let week_tasks_non_terminal: Vec<Task> = week_tasks_all
         .iter()
         .filter(|t| !crate::core::task_is_terminal(t.status))
+        .cloned()
+        .collect();
+    let current_non_terminal_ids: HashSet<TaskId> = week_tasks_non_terminal
+        .iter()
         .map(|t| t.id.clone())
         .collect();
 
@@ -341,9 +345,12 @@ pub(super) async fn dedup_propose(
         }
     }
 
-    if carry_drafts.is_empty() && reorder_drafts.is_empty() && create_drafts.is_empty() {
-        return Ok(ProposeDedup::default());
-    }
+    // T5.7.2 (design §2 #31): this used to `return Ok(ProposeDedup::default())`
+    // here when no PENDING draft matched — but the REJECTED half below must
+    // still run even when there is no pending proposal at all (the common
+    // case once something gets rejected rather than left pending), so this
+    // early exit is gone; every set below simply stays empty and every loop
+    // over an empty `Vec`/precheck over an empty batch is a cheap no-op.
 
     // One batch precheck across everything found — one write-lock
     // acquisition, not one per draft (§11.4 公共's own "去重" wording: "由
@@ -361,7 +368,15 @@ pub(super) async fn dedup_propose(
     // precheck call: a transient lock contention degrades to "produce a
     // possibly-redundant proposal this run", never to "silently skip
     // producing anything at all".
-    let valid = AiSink::precheck(store, Capability::Propose, &all_drafts).await;
+    // T5.7.2: skip the write-lock acquisition entirely when there is
+    // nothing PENDING to precheck (the common case, now that the early
+    // `return` above is gone) — `precheck` on an empty batch would still
+    // take `BEGIN IMMEDIATE` just to iterate zero times.
+    let valid = if all_drafts.is_empty() {
+        Vec::new()
+    } else {
+        AiSink::precheck(store, Capability::Propose, &all_drafts).await
+    };
     let mut valid = valid.into_iter();
 
     let mut excluded_carry_task_ids = HashSet::new();
@@ -381,10 +396,24 @@ pub(super) async fn dedup_propose(
     // without leaving the non-terminal set does not by itself invalidate a
     // pending reorder that still names it; that is intentionally accepted
     // (§11.4.3), not a gap.
+    // Low (2026-09-26 review): once `skip_reorder` is already decided,
+    // further reorder_drafts can't change it back — but `valid` is a SINGLE
+    // shared iterator, positionally aligned with `all_drafts` (carry, THEN
+    // reorder, THEN create); a bare `break` here would leave any remaining
+    // reorder_drafts' precheck results undrained and misalign every create
+    // draft's `valid.next()` below. So `valid.next()` is drained for EVERY
+    // reorder draft unconditionally first (`reorder_valid`, order preserved),
+    // and only the decision loop over the now-decoupled results gets to
+    // `break` early.
+    let reorder_valid: Vec<bool> = reorder_drafts
+        .iter()
+        .map(|_| valid.next().unwrap_or(false))
+        .collect();
     let mut skip_reorder = false;
-    for (_, order_set) in &reorder_drafts {
-        if valid.next().unwrap_or(false) && order_set == &current_non_terminal_ids {
+    for (ok, (_, order_set)) in reorder_valid.iter().zip(&reorder_drafts) {
+        if *ok && order_set == &current_non_terminal_ids {
             skip_reorder = true;
+            break;
         }
     }
     // M-b (2026-09-24 review round 4): create's dedup is PER-DIRECTION, like
@@ -437,6 +466,154 @@ pub(super) async fn dedup_propose(
             && current_gap_ids
                 .iter()
                 .all(|g| excluded_create_direction_ids.contains(g));
+    }
+
+    // T5.7.2 (design §2 #31): fold REJECTED propose proposals into the SAME
+    // exclusion sets the PENDING half above just built — same per-item
+    // granularity (`(task_id, to_week)` for carry, `(week_id, order)` for
+    // reorder, `(week_id, direction_id)` for create), gated by whether a new
+    // non-terminal Direction has appeared since that rejection (§2 #31: the
+    // ONLY leg propose's own suppression uses — no single "target task" to
+    // compare `updated_at` against for reorder/create, and carry shares the
+    // same check for consistency; see the design entry for the full
+    // reasoning). A rejected suggestion that's STILL suppressed simply
+    // reduces the candidate set this run considers, same as an
+    // already-covered-by-a-pending-proposal one does — it does not get its
+    // own distinct wire `reason` (§2 #31's own documented scope limit).
+    let rejected = store
+        .list_rejected_ops(Capability::Propose.as_str())
+        .await?;
+    if !rejected.is_empty() {
+        let max_new_direction = reader
+            .max_eligible_direction_created_at()
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        // T5.7.2 review round 2 (M2): the time basis is the rejected
+        // proposal's OWN `proposed_at`, not `rejected_at` — same reasoning
+        // `http::ai_classify::dedup_targets`'s own M2 fix gives: a proposal
+        // a human sat on for a while before rejecting can have a genuinely
+        // new Direction appear DURING that gap, which must already count as
+        // "changed" rather than waiting for the (later) rejection moment.
+        let situation_unchanged = |proposed_at: &str| {
+            max_new_direction
+                .as_deref()
+                .is_none_or(|c| c <= proposed_at)
+        };
+        // Re-derive `current_gap_ids` only if some rejected `CreateTasks`
+        // actually needs it — avoids the extra `gap_directions` read on a
+        // propose run with no create-shaped rejection at all.
+        let mut current_gap_ids: Option<HashSet<crate::core::DirectionId>> = None;
+        // Same lazy-cache posture for reorder's own `rhythm_alloc` read
+        // (below) — avoids the read entirely on a propose run with no
+        // reorder-shaped rejection at all, and re-reading it once covers
+        // every rejected reorder this loop happens to see.
+        let mut current_alloc: Option<Vec<crate::core::Alloc>> = None;
+        for r in &rejected {
+            if r.ops.is_empty() || !situation_unchanged(&r.proposed_at) {
+                continue;
+            }
+            // Mirrors the PENDING half's own `is_carry_batch_for_week`
+            // shape (`submit_one`/`run_propose` submit every `CarryOverTask`
+            // this run decided on as ONE proposal, not one op each) — a
+            // batch counts only if EVERY op in it is a carry into THIS week.
+            let is_carry_batch_for_week = r.ops.iter().all(
+                |op| matches!(op, Sin90Op::CarryOverTask { to_week, .. } if to_week == &week.id),
+            );
+            if is_carry_batch_for_week {
+                for op in &r.ops {
+                    if let Sin90Op::CarryOverTask { task_id, .. } = op {
+                        excluded_carry_task_ids.insert(task_id.clone());
+                    }
+                }
+            }
+            if let [Sin90Op::ReorderTasks { week_id, order }] = r.ops.as_slice() {
+                if week_id == &week.id {
+                    // 2026-09-26 external review (blocking): the OLD
+                    // judgement here was "task set unchanged" + `task_
+                    // modified_since` (M3) — but `reorder_reflex` (`ai::
+                    // propose`) ranks by `status_tier` THEN by the task's
+                    // Direction's rhythm-alloc `pct`, and `task_modified_
+                    // since` deliberately EXCLUDES `direction_assigned`
+                    // events (correct for its OTHER caller — see that
+                    // method's own doc — but blind here): reassigning a
+                    // task's Direction, or a quota change on `sin90_
+                    // rhythms`, changes reflex's ranking WITHOUT tripping
+                    // either the set-coverage check or `task_modified_
+                    // since`. Fixed by asking reflex itself, right now:
+                    // recompute `reorder_reflex` over the CURRENT
+                    // non-terminal set and the CURRENT quota, and only keep
+                    // suppressing if that recomputed order is IDENTICAL to
+                    // the rejected `order`. This subsumes the old set-
+                    // coverage check for free — `reorder_reflex` only ever
+                    // returns a full permutation of `week_tasks_non_
+                    // terminal`, so a task added to/removed from the
+                    // current non-terminal set already makes the two
+                    // `Vec<TaskId>` different lengths, let alone content —
+                    // and a plain status change (M3's own `transitioned`
+                    // leg) still lifts it too, since `status_tier` is
+                    // reflex's OWN primary sort key. The `task_modified_
+                    // since` leg is gone: content edits that leave both
+                    // status and Direction (hence `pct`) untouched cannot
+                    // change reflex's output either, so there is nothing
+                    // left for that leg to catch that this one doesn't
+                    // already subsume.
+                    let alloc = match &current_alloc {
+                        Some(a) => a,
+                        None => {
+                            let a = reader.rhythm_alloc().await.unwrap_or_else(|e| {
+                                tracing::warn!(error = %e, "propose: dedup (rejected reorder) rhythm_alloc read failed, treating as empty");
+                                Vec::new()
+                            });
+                            current_alloc = Some(a);
+                            current_alloc.as_ref().unwrap()
+                        }
+                    };
+                    let recomputed_order =
+                        crate::ai::propose::reorder_reflex(&week_tasks_non_terminal, alloc);
+                    if &recomputed_order == order {
+                        skip_reorder = true;
+                    }
+                }
+            }
+            if let [Sin90Op::CreateTasks { week_id, tasks }] = r.ops.as_slice() {
+                if week_id == &week.id {
+                    let gaps = match &current_gap_ids {
+                        Some(g) => g,
+                        None => {
+                            let alloc = reader.rhythm_alloc().await.unwrap_or_else(|e| {
+                                tracing::warn!(error = %e, "propose: dedup (rejected) rhythm_alloc read failed, treating as empty");
+                                Vec::new()
+                            });
+                            let g: HashSet<crate::core::DirectionId> =
+                                crate::ai::propose::gap_directions(&reader, &alloc, &week_tasks_all)
+                                    .await
+                                    .unwrap_or_else(|e| {
+                                        tracing::warn!(error = %e, "propose: dedup (rejected) gap_directions read failed, treating as empty");
+                                        Vec::new()
+                                    })
+                                    .into_iter()
+                                    .map(|g| g.direction_id)
+                                    .collect();
+                            current_gap_ids = Some(g);
+                            current_gap_ids.as_ref().unwrap()
+                        }
+                    };
+                    for t in tasks {
+                        if let Some(d) = &t.direction_id {
+                            if gaps.contains(d) {
+                                excluded_create_direction_ids.insert(d.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(gaps) = &current_gap_ids {
+            skip_create = !gaps.is_empty()
+                && gaps
+                    .iter()
+                    .all(|g| excluded_create_direction_ids.contains(g));
+        }
     }
 
     Ok(ProposeDedup {
