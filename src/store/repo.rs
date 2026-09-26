@@ -462,11 +462,14 @@ fn truncate_review_summary(body: &str) -> String {
 /// source of truth; this is a courtesy copy for M5's future kernel-side AI
 /// context, not read back by v1 — see design §2 #24's own "v1 不用" entry).
 /// `dedup_key` is embedded in the payload itself (not just the outbox row's
-/// own `dedup_key` column) because `adapter_agent24::reconciler`'s
-/// idempotency check needs it inside the memory's OWN `body` too — see
-/// `reconciler::remember_review_summary`'s doc for why `_a24/memory/private/
-/// remember` cannot be trusted to dedup on Sin90's behalf the way
-/// `_a24/scheduler/upsert` does.
+/// own `dedup_key` column) because `_a24/memory/private/remember` mints a
+/// brand-new kernel id on EVERY successful call — unlike `_a24/scheduler/
+/// upsert`, which dedups by `key` on the kernel side, there is nothing on
+/// the wire to make a blind retry converge. The reconciler-side consumer of
+/// this row (a stacked branch on top of this one) needs `dedup_key` inside
+/// the memory's OWN `body` too, so it can ask the kernel itself ("does a
+/// memory with this marker already exist?") before ever calling `remember`
+/// again.
 fn review_remember_desired(review: &Review, finalized_at: &str) -> serde_json::Value {
     json!({
         "dedup_key": review_remember_dedup_key(&review.id),
@@ -2391,11 +2394,11 @@ impl Sin90Store {
     ///
     /// `result_ref` (T4.4.1 review L5, migration `0013_outbox_result_ref.sql`):
     /// an optional kernel-minted identifier this row's successful call
-    /// produced — e.g. `memory.remember`'s `Remembered::id`
-    /// (`adapter_agent24::reconciler::remember_review_summary`).
-    /// `scheduler.upsert`/`.delete` have no comparable "fresh identity" to
-    /// record and pass `None`, same as every row from before this column
-    /// existed.
+    /// produced — e.g. a `memory.remember` row's own kernel-minted memory
+    /// id (a stacked branch on top of this one is what actually calls
+    /// `remember` and passes that id through here). `scheduler.upsert`/
+    /// `.delete` have no comparable "fresh identity" to record and pass
+    /// `None`, same as every row from before this column existed.
     pub async fn outbox_mark_done(
         &self,
         id: &str,
