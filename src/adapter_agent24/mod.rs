@@ -48,6 +48,11 @@ mod frame;
 #[cfg(feature = "test-hooks")]
 pub mod kernel_roundtrip;
 pub mod reconciler;
+/// T3.5.1, `test-hooks` only — see that module's own doc for why it lives
+/// here rather than in `http`, and why it exists alongside `kernel_roundtrip`
+/// rather than extending it.
+#[cfg(feature = "test-hooks")]
+pub mod reconciler_debug;
 mod transport;
 
 // L-1: only `FatalHook` is re-exported — `main.rs` needs to name it to

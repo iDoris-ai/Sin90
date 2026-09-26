@@ -97,15 +97,16 @@ const PUMP_TICK: Duration = Duration::from_secs(5);
 /// schedule directly on the kernel side — not the primary mechanism.
 const FULL_RECONCILE_INTERVAL: Duration = Duration::from_secs(3600);
 
-/// The kernel schedule key for a Routine's id — the ONE place this module
-/// mints that shape, mirroring `store::repo`'s own private
-/// `routine_dedup_key`/`routine_outbox_upsert_desired` (this crate's
-/// `adapter_agent24` layer cannot reach those — they are private to `store`
-/// — so the `routine.<id>` convention is re-derived here from the SAME
-/// `desired.key` field every outbox row already carries, never invented
-/// independently).
+/// The kernel schedule key for a Routine's id — delegates to
+/// [`crate::store::repo::routine_kernel_key`] (`pub(crate)`, `lib.rs`'s own
+/// layering: `adapter_agent24` already depends on `store`) rather than
+/// re-deriving the `routine.<id>` shape independently, so the lower-casing
+/// that function's own doc explains (T3.5.1: the kernel's key charset is
+/// `[a-z0-9._-]`, `ulid()` is uppercase) can never drift out of step between
+/// the two call sites again — the bug T3.5.1's real-mount test found was
+/// exactly that kind of drift.
 fn kernel_key(routine_id: &str) -> String {
-    format!("routine.{routine_id}")
+    crate::store::repo::routine_kernel_key(routine_id)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -609,9 +610,21 @@ pub async fn reconcile_full(
             continue;
         }
         match key.strip_prefix("routine.") {
-            Some(routine_id) => {
+            Some(routine_id_lower) => {
+                // T3.5.1: `key` is the kernel's own (lower-cased,
+                // `routine_kernel_key`'s doc) form — `sin90_routines.id` is
+                // the original uppercase `ulid()`, so
+                // `outbox_enqueue_delete_for_orphan`'s own `SELECT ...
+                // WHERE id = ?` needs the recovered uppercase id, not the
+                // lower-cased key fragment. `key` itself (passed through
+                // unchanged below) is what actually gets sent back to the
+                // kernel on `scheduler.delete` and must stay byte-exact.
+                // `to_ascii_uppercase`, not `to_uppercase` (T3.5.1 review,
+                // L) — same reasoning as `Sin90Store::record_routine_fire`'s
+                // own identical transform.
+                let routine_id = routine_id_lower.to_ascii_uppercase();
                 store
-                    .outbox_enqueue_delete_for_orphan(routine_id, key)
+                    .outbox_enqueue_delete_for_orphan(&routine_id, key)
                     .await?;
             }
             None => {
@@ -910,6 +923,24 @@ mod tests {
                     }
                     "_a24/scheduler/upsert" => {
                         let key = req["params"]["key"].as_str().unwrap().to_string();
+                        // T3.5.1 review (M2): mirror the REAL kernel's own
+                        // key validator (`is_valid_kernel_key`'s own doc) —
+                        // this is what makes a regression in
+                        // `store::repo::routine_kernel_key`'s `.to_ascii_lowercase()`
+                        // (the exact bug T3.5.1's real-mount test found)
+                        // show up in THIS crate's own fast unit tests too,
+                        // not only in the slow `--ignored` real-mount one.
+                        if !is_valid_kernel_key(&key) {
+                            respond_error(
+                                peer,
+                                &req,
+                                -32602,
+                                "invalid_params",
+                                "key must match [a-z0-9._-]{1,128}",
+                            )
+                            .await;
+                            continue;
+                        }
                         if let Some((code, kind)) = self.next_error(&key) {
                             respond_error(peer, &req, code, kind, "test-injected").await;
                             continue;
@@ -943,6 +974,18 @@ mod tests {
                     }
                     "_a24/scheduler/delete" => {
                         let key = req["params"]["key"].as_str().unwrap().to_string();
+                        // Same key-format validation as the upsert arm above.
+                        if !is_valid_kernel_key(&key) {
+                            respond_error(
+                                peer,
+                                &req,
+                                -32602,
+                                "invalid_params",
+                                "key must match [a-z0-9._-]{1,128}",
+                            )
+                            .await;
+                            continue;
+                        }
                         if let Some((code, kind)) = self.next_error(&key) {
                             respond_error(peer, &req, code, kind, "test-injected").await;
                             continue;
@@ -963,6 +1006,167 @@ mod tests {
         fn next_error(&mut self, key: &str) -> Option<(i64, &'static str)> {
             self.errors.get_mut(key).and_then(|q| q.pop_front())
         }
+    }
+
+    /// Mirrors the REAL kernel's own key validator byte-for-byte (Agent24
+    /// design §6.3 / `agent24d::scheduler_callback`'s own validator, quoted
+    /// verbatim in `store::repo::routine_kernel_key`'s doc):
+    /// `[a-z0-9._-]{1,128}`, no case folding. `FakeKernel` enforcing this too
+    /// (T3.5.1 review, M2) is what makes a naive, uppercase-bearing kernel
+    /// key something a FAST unit test catches, not only the slow
+    /// `--ignored` real-mount one.
+    fn is_valid_kernel_key(key: &str) -> bool {
+        !key.is_empty()
+            && key.len() <= 128
+            && key.bytes().all(|b| {
+                b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+            })
+    }
+
+    /// T3.5.1 review (M2), negative control: `FakeKernel` now rejects a key
+    /// outside `[a-z0-9._-]{1,128}` exactly like the real kernel does — this
+    /// is the exact shape of the bug T3.5.1's real-mount test found
+    /// (`core::util::ulid()` is uppercase Crockford Base32; a naive
+    /// `format!("routine.{id}")` sends the kernel an invalid key). Mutation
+    /// check (T3.5.1 task report): removing `.to_ascii_lowercase()` from
+    /// `store::repo::routine_kernel_key` turns EVERY existing reconciler
+    /// test that drives a real, `ulid()`-derived Routine through
+    /// `apply_one`/`FakeKernel` red via this exact same validation — this
+    /// test just names the failure mode directly, on a minimal fixture.
+    #[tokio::test]
+    async fn fake_kernel_rejects_an_uppercase_key() {
+        let (scheduler, mut peer) = scheduler_and_peer().await;
+        let call = tokio::spawn(async move {
+            scheduler
+                .upsert(
+                    "routine.UPPER01",
+                    &ModuleSpec::Cron {
+                        expr: "0 7 * * MON,WED,FRI".to_string(),
+                        tz: Some("UTC".to_string()),
+                    },
+                    true,
+                    None,
+                    None,
+                )
+                .await
+        });
+        let fake = FakeKernel::default().drive(&mut peer, 1).await;
+        let err = call
+            .await
+            .unwrap()
+            .expect_err("an uppercase key must be rejected, not silently accepted");
+        assert!(
+            matches!(err, ClientError::InvalidParams(_)),
+            "expected InvalidParams for key \"routine.UPPER01\", got {err:?}"
+        );
+        assert!(
+            fake.schedules.is_empty(),
+            "a rejected upsert must not create a row: {:?}",
+            fake.schedules
+        );
+    }
+
+    /// T3.5.1 review (L): self-healing, without a process restart, from a
+    /// stale `sin90_outbox` row shaped exactly like the bug T3.5.1's
+    /// real-mount test found — a `pending` `scheduler.upsert` row whose
+    /// `desired.key` is the OLD, uppercase-bearing form a pre-fix version of
+    /// `store::repo::routine_kernel_key` would have written. Tick 1 drains
+    /// it (rejected — `FakeKernel` now validates the key charset, `failed`),
+    /// then that SAME tick's startup full reconcile calls
+    /// `outbox_enqueue_upsert_for_routine`, which finds no OTHER `pending`
+    /// row blocking it (`store::repo`'s own doc) and re-asserts the CORRECT,
+    /// lower-cased desired state — `upsert_outbox`'s own dedup-key lookup
+    /// (`status IN ('pending', 'failed')`) means this REUSES the very same
+    /// row (same `id`, `version` bumped), not a second one. Tick 2 drains
+    /// that corrected row and it succeeds. No restart, no manual
+    /// intervention — this is `spawn_pump_loop`'s own ordinary tick cadence
+    /// (`pump_tick`'s doc: drain first, then full-reconcile-if-due), driven
+    /// here twice directly.
+    #[tokio::test]
+    async fn reconciler_recovers_a_stale_uppercase_pending_row_within_two_ticks() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let routine = store
+            .create_routine(&new_routine("0 7 * * MON,WED,FRI"))
+            .await
+            .unwrap();
+        let dedup = outbox_dedup_key(&routine.id);
+        let correct_key = kernel_key(&routine.id); // the FIXED, lower-cased form.
+        let stale_key = format!("routine.{}", routine.id); // pre-fix, uppercase.
+
+        // Retire the auto-created (already-correct) pending row as
+        // irrelevant leftover bookkeeping, then inject the STALE row a
+        // pre-fix version of this crate would have left behind, under the
+        // SAME dedup_key `store::repo`'s own writers always use.
+        let auto_row = test_hooks::outbox_rows_for(&store, &dedup).await.unwrap()[0].clone();
+        store
+            .outbox_mark_done(&auto_row.id, auto_row.version)
+            .await
+            .unwrap();
+        test_hooks::insert_raw_outbox_row(
+            &store,
+            "stale-uppercase-row",
+            "scheduler.upsert",
+            &dedup,
+            &json!({
+                "key": stale_key,
+                "spec": {"cron": routine.cron, "tz": routine.tz},
+                "enabled": true,
+            })
+            .to_string(),
+            &crate::core::now_iso8601(),
+        )
+        .await
+        .unwrap();
+
+        let (scheduler, mut peer) = scheduler_and_peer().await;
+        let run = tokio::spawn(async move {
+            let state = PumpState::new(); // `next_full_attempt` due immediately.
+                                          // Tick 1: drain (the stale row — rejected), then the startup
+                                          // full reconcile (enqueues the correct correction).
+            let (_, state) = pump_tick(&store, &scheduler, state, FULL_RECONCILE_INTERVAL).await;
+            // Tick 2: drain (the freshly-corrected row — accepted). Too soon
+            // for `FULL_RECONCILE_INTERVAL` to make a second full reconcile
+            // due, so this tick is drain-only.
+            pump_tick(&store, &scheduler, state, FULL_RECONCILE_INTERVAL).await;
+            store
+        });
+
+        // Tick 1: the stale row's upsert (rejected), then `list` (empty —
+        // nothing has ever actually landed on the kernel).
+        let fake = FakeKernel::default().drive(&mut peer, 2).await;
+        // Tick 2: the corrected row's upsert (accepted).
+        let fake = fake.drive(&mut peer, 1).await;
+        let store = run.await.unwrap();
+
+        assert!(
+            fake.schedules.contains_key(&correct_key),
+            "the corrected, lower-cased key must have landed: {:?}",
+            fake.schedules
+        );
+        assert!(
+            !fake.schedules.contains_key(&stale_key),
+            "the stale uppercase key must never have landed: {:?}",
+            fake.schedules
+        );
+
+        // `upsert_outbox`'s own `status IN ('pending', 'failed')` lookup
+        // (this function's own doc) reuses "stale-uppercase-row" IN PLACE
+        // for the correction — its already-`done` predecessor (the
+        // auto-created row this test retired at setup) is untouched and
+        // still present, so this looks specifically for the stale row by
+        // id rather than asserting a total row count.
+        let rows = test_hooks::outbox_rows_for(&store, &dedup).await.unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.id == "stale-uppercase-row")
+            .unwrap_or_else(|| panic!("stale-uppercase-row missing: {rows:?}"));
+        assert_eq!(row.status, "done", "{row:?}");
+        assert_eq!(row.desired["key"], json!(correct_key), "{row:?}");
+        assert!(
+            row.version > 1,
+            "expected the STALE row to have been corrected in place (version bumped), not \
+             replaced by a fresh one: {row:?}"
+        );
     }
 
     // ----- M4: "本地有、内核缺 → 补上" (direct case) --------------------------
@@ -1090,7 +1294,16 @@ mod tests {
         let store = run.await.unwrap();
 
         assert!(!fake.schedules.contains_key("routine.orphan1"));
-        let rows = test_hooks::outbox_rows_for(&store, "routine:orphan1")
+        // T3.5.1: the orphan loop recovers `routine_id` from the kernel key
+        // via `.to_ascii_uppercase()` (this function's own doc — the kernel key
+        // is always lower-cased, a real `sin90_routines.id` is always an
+        // uppercase `ulid()`) BEFORE computing the internal dedup key, so a
+        // lower-case fixture key like `"routine.orphan1"` here produces the
+        // dedup key `"routine:ORPHAN1"`, not `"routine:orphan1"` — this
+        // fixture's `routine_id` is synthetic (no real `sin90_routines` row
+        // for it either way), but the case transform still applies exactly
+        // as it would for a genuinely retired Routine's real ULID.
+        let rows = test_hooks::outbox_rows_for(&store, "routine:ORPHAN1")
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
@@ -1126,6 +1339,65 @@ mod tests {
         assert!(
             fake.schedules.contains_key("other-module.xyz"),
             "a key outside Sin90's own convention must never be deleted"
+        );
+    }
+
+    /// T3.5.1 review (M3): `reconcile_orphan_kernel_key_is_deleted` above
+    /// uses a synthetic, already-lower-case fake key ("routine.orphan1")
+    /// that never corresponds to any real `sin90_routines` row either way —
+    /// it does not exercise the specific case T3.5.1's own fix is about. A
+    /// REAL, uppercase `ulid()`-shaped Routine that reached `retired` (whose
+    /// own `scheduler.delete` outbox row, for whatever reason, never
+    /// landed — module doc) must still be found and deleted, via this
+    /// orphan loop's `.to_ascii_uppercase()` recovery correctly mapping the
+    /// kernel's lower-cased key back onto the real, uppercase local Routine
+    /// id.
+    #[tokio::test]
+    async fn reconcile_orphan_real_uppercase_ulid_retired_routine_is_deleted() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let routine = store
+            .create_routine(&new_routine("0 7 * * MON,WED,FRI"))
+            .await
+            .unwrap();
+        let key = kernel_key(&routine.id); // the REAL, lower-cased wire form.
+        let dedup = outbox_dedup_key(&routine.id);
+
+        store
+            .transition_routine(&routine.id, RoutineStatus::Retired)
+            .await
+            .unwrap();
+        // Simulate "the retire's own scheduler.delete outbox row never
+        // landed" (module doc) by marking every pending row for this
+        // dedup_key done WITHOUT ever draining it to a kernel — the fake
+        // kernel seeded below still has the key registered, exactly as if
+        // that delivery had genuinely been lost.
+        for row in test_hooks::outbox_rows_for(&store, &dedup).await.unwrap() {
+            if row.status == "pending" {
+                store.outbox_mark_done(&row.id, row.version).await.unwrap();
+            }
+        }
+
+        let (scheduler, mut peer) = scheduler_and_peer().await;
+        let run = tokio::spawn(async move {
+            reconcile_once(&store, &scheduler).await.unwrap();
+            store
+        });
+        let fake = FakeKernel::default()
+            .with(&key, FakeSchedule::new("0 7 * * MON,WED,FRI", "UTC", true))
+            .drive(&mut peer, 2) // list + delete
+            .await;
+        let store = run.await.unwrap();
+
+        assert!(
+            !fake.schedules.contains_key(&key),
+            "the real retired Routine's real (lower-cased) kernel key must be deleted: {:?}",
+            fake.schedules
+        );
+        let rows = test_hooks::outbox_rows_for(&store, &dedup).await.unwrap();
+        assert!(
+            rows.iter()
+                .any(|r| r.kind == "scheduler.delete" && r.status == "done"),
+            "{rows:?}"
         );
     }
 
