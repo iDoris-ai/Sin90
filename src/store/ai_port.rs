@@ -629,7 +629,19 @@ async fn dry_run(
     id: &str,
     ops: &[Sin90Op],
     rationale: &Option<String>,
+    cap: Capability,
 ) -> Result<(), SinkError> {
+    // M-a (T5.7.2 review round 2): this dry run's own `capability_source` is
+    // simply `cap.as_str()` — `dry_run` only ever runs INSIDE `AiSink::
+    // submit`/`precheck`, i.e. this proposal IS an AI capability's own
+    // output, never a human/automation `POST /proposals` submission (that
+    // path is `Sin90Store::submit_proposal`, which never calls this
+    // function). `allowed_ops` (checked by every caller before this) already
+    // guarantees only `Capability::Classify` can ever produce an
+    // `AssignTaskDirection` op, so this is also exactly the `"classify"`
+    // string `reject_proposal`'s own resolution would derive once the row
+    // this call is about to insert exists.
+    let capability_source = cap.as_str();
     let snapshot = build_snapshot(tx, ops)
         .await
         .map_err(|e| SinkError::Store(e.to_string()))?;
@@ -642,7 +654,8 @@ async fn dry_run(
         ops: ops.to_vec(),
         rationale: rationale.clone(),
     };
-    validate(&proposal, &snapshot).map_err(|e| SinkError::Invalid(e.to_string()))?;
+    validate(&proposal, &snapshot, capability_source)
+        .map_err(|e| SinkError::Invalid(e.to_string()))?;
 
     let mut sp = tx
         .begin()
@@ -651,7 +664,7 @@ async fn dry_run(
     let mut event_ids = Vec::new();
     let mut dry: Result<(), SinkError> = Ok(());
     for op in ops {
-        if let Err(e) = apply_op(&mut sp, op, &mut event_ids).await {
+        if let Err(e) = apply_op(&mut sp, op, &mut event_ids, capability_source).await {
             dry = Err(classify_apply_err(e));
             break;
         }
@@ -687,6 +700,22 @@ impl AiSink for Sin90Store {
                 "a reflex call record cannot carry a served_tier".into(),
             ));
         }
+        // L2 (T5.7.2 review round 3): `rec.task_kind` is `sin90_ai_calls.
+        // task_kind`'s own value — it must be the SAME capability `submit`
+        // is being called for, not merely a record that happens to carry
+        // valid ops for `cap` (`allowed_ops` above only checks the OPS, not
+        // where the call record itself claims to have come from). Every
+        // real caller already constructs `rec` via `run_item(cap, ...)`
+        // (`ladder.rs`), so `rec.task_kind == cap` holds by construction
+        // today — this is defense in depth against a future caller
+        // assembling `rec` by hand and mismatching it, which would silently
+        // mislabel `sin90_ai_calls.task_kind` for the row this call inserts.
+        if rec.task_kind != cap {
+            return Err(SinkError::Invalid(format!(
+                "call record task_kind {:?} does not match capability {cap:?} being submitted",
+                rec.task_kind
+            )));
+        }
 
         let mut tx = self
             .pool()
@@ -694,7 +723,7 @@ impl AiSink for Sin90Store {
             .await
             .map_err(|e| SinkError::Store(e.to_string()))?;
 
-        dry_run(&mut tx, &draft.id, &draft.ops, &draft.rationale).await?;
+        dry_run(&mut tx, &draft.id, &draft.ops, &draft.rationale, cap).await?;
         rec.ok = true;
         rec.error_kind = None;
 
@@ -759,7 +788,9 @@ impl AiSink for Sin90Store {
         let mut out = Vec::with_capacity(drafts.len());
         for d in drafts {
             let ok = allowed_ops(cap, &d.ops).is_ok()
-                && dry_run(&mut tx, &d.id, &d.ops, &d.rationale).await.is_ok();
+                && dry_run(&mut tx, &d.id, &d.ops, &d.rationale, cap)
+                    .await
+                    .is_ok();
             out.push(ok);
         }
         // Never commits: this is a read (§11.4 公共's "去重" — one write-lock
@@ -1405,6 +1436,50 @@ mod tests {
         );
         let n: i64 =
             sqlx::query_scalar("SELECT count(*) FROM sin90_proposals WHERE id = 'p-bad-combo'")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            n, 0,
+            "the rejected submit must not have written a proposal row"
+        );
+    }
+
+    /// L2 (T5.7.2 review round 3): `rec.task_kind` disagreeing with the
+    /// `cap` `submit` is called for is rejected before even opening a
+    /// transaction, same posture as the reflex/served_tier contradiction
+    /// just above. Mutation target: remove the `rec.task_kind != cap` guard
+    /// in `submit` and this goes from `is_err()` to succeeding (silently
+    /// mislabeling `sin90_ai_calls.task_kind` for the inserted row).
+    #[tokio::test]
+    async fn ai_sink_submit_rejects_task_kind_mismatch() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let (_week_id, t1, _t2) = seed_week_with_tasks(&store).await;
+        let direction = store
+            .create_direction("Kind mismatch target", "2026-Q4", None)
+            .await
+            .unwrap();
+        // `Sin90Op::AssignTaskDirection` — allowed for `Capability::Classify`
+        // by `allowed_ops`, so this isolates the `task_kind` check itself
+        // rather than tripping the OPS-vs-capability check first.
+        let draft = ProposalDraft {
+            id: "p-kind-mismatch".into(),
+            ops: vec![Sin90Op::AssignTaskDirection {
+                task_id: t1,
+                direction_id: direction.id,
+            }],
+            rationale: None,
+        };
+        // `rec()`'s default `task_kind` is `Capability::Propose`; submitting
+        // it under `Capability::Classify` is the mismatch.
+        let mismatched = rec("call-kind-mismatch", "run-kind-mismatch", true, None);
+        let err = AiSink::submit(&store, Capability::Classify, draft, mismatched).await;
+        assert!(
+            err.is_err(),
+            "a call record's task_kind must match the capability submit is called for"
+        );
+        let n: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM sin90_proposals WHERE id = 'p-kind-mismatch'")
                 .fetch_one(store.pool())
                 .await
                 .unwrap();

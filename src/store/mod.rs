@@ -23,7 +23,7 @@ pub use attention::{AttentionRow, WeekAttention};
 pub use packs::{five_life_systems, SeedArea};
 pub use repo::{
     AppliedProposal, ApplyOutcome, AutoReviewCreated, EventRow, OutboxRow, RejectOutcome,
-    ReviewUpdate, RoutineFireOutcome, RoutineUpdate, StoredProposal, TodayView,
+    RejectedOpsRow, ReviewUpdate, RoutineFireOutcome, RoutineUpdate, StoredProposal, TodayView,
 };
 pub use weekly_draft::{
     render_weekly_draft_markdown, AreaMinutes, DirectionMinutes, RoutineDraftRow, WeeklyDraft,
@@ -308,6 +308,27 @@ pub mod test_hooks {
             .execute(store.pool())
             .await?;
         Ok(())
+    }
+
+    /// N-H1 (T5.7.2 review round 2 follow-up): peek a task's `triage_via`/
+    /// `triage_entered_at` columns directly — pins that `CarryOverTask`'s
+    /// apply actually COPIED them onto the new row (as opposed to merely
+    /// producing a task that BEHAVES the same by coincidence, e.g. `NULL`
+    /// happening to also block an AI reclassify the same way `'direct'`
+    /// does) — a mutation that drops the copy would still fail a purely
+    /// behavioral assertion in some cases, but never this one.
+    pub async fn task_triage_state(
+        store: &Sin90Store,
+        task_id: &str,
+    ) -> Result<(Option<String>, Option<String>)> {
+        let row = sqlx::query("SELECT triage_via, triage_entered_at FROM sin90_tasks WHERE id = ?")
+            .bind(task_id)
+            .fetch_one(store.pool())
+            .await?;
+        Ok((
+            row.get::<Option<String>, _>("triage_via"),
+            row.get::<Option<String>, _>("triage_entered_at"),
+        ))
     }
 
     /// Backdate when a task last moved into `in_progress` (its transition

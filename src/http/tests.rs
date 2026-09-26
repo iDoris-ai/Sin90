@@ -5061,6 +5061,259 @@ mod ai_classify {
         assert_eq!(rows[0].capability_source, "classify");
     }
 
+    /// L3 (T5.7.2 review round 3): `POST /tasks` (`Sin90Store::create_task`)
+    /// is a path INTO 待定 that never goes through `AssignTaskDirection` at
+    /// all — a task filed straight in with `direction_id = "sin90-triage"`
+    /// must still stamp `triage_via = 'direct'` and a `triage_entered_at`,
+    /// or it would sit at `direction_id = 'sin90-triage'` with BOTH columns
+    /// `NULL`, contradicting migration 0015's own "`NULL` = never
+    /// 待定-parked" invariant for a task manifestly parked there right now.
+    /// Mutation target: drop the `triage_via`/`triage_entered_at` binds from
+    /// `create_task`'s INSERT and the first assertion below goes red.
+    #[tokio::test]
+    async fn create_task_directly_into_triage_stamps_direct_provenance() {
+        let (_app, _sink, store) = test_app_with_store().await;
+        let task = store
+            .create_task(
+                "Filed straight into 待定",
+                Some(crate::core::TRIAGE_DIRECTION_ID),
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+        let (via, entered_at) = crate::store::test_hooks::task_triage_state(&store, &task.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            via.as_deref(),
+            Some("direct"),
+            "a task filed straight into 待定 must backfill/stamp as direct-sourced, not NULL"
+        );
+        assert!(
+            entered_at.is_some(),
+            "a task filed straight into 待定 must get a triage_entered_at"
+        );
+
+        // Positive control: an ordinary Direction, and the inbox
+        // (`direction_id = None`), get neither column — the common case
+        // the migration's own invariant describes.
+        let direction = store
+            .create_direction("Real home", "2026-Q4", None)
+            .await
+            .unwrap();
+        let real_task = store
+            .create_task(
+                "Ordinary task",
+                Some(&direction.id),
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+        let (via, entered_at) = crate::store::test_hooks::task_triage_state(&store, &real_task.id)
+            .await
+            .unwrap();
+        assert_eq!(via, None);
+        assert_eq!(entered_at, None);
+
+        let inbox_task = store
+            .create_task("Inbox task", None, None, TaskKind::Other, Energy::Mid, None)
+            .await
+            .unwrap();
+        let (via, entered_at) = crate::store::test_hooks::task_triage_state(&store, &inbox_task.id)
+            .await
+            .unwrap();
+        assert_eq!(via, None);
+        assert_eq!(entered_at, None);
+    }
+
+    /// L3, the proposal-apply path: `Sin90Op::CreateTask`/`CreateTasks`
+    /// (used by a human/automation `POST /proposals`, and by `propose`'s own
+    /// AI path — though `propose` itself never targets 待定) get the SAME
+    /// stamp when either targets 待定 directly. Mutation target: drop either
+    /// arm's `triage_via`/`triage_entered_at` binds in `apply_op` and the
+    /// matching assertion below goes red.
+    #[tokio::test]
+    async fn create_task_ops_directly_into_triage_stamp_direct_provenance() {
+        let (_app, _sink, store) = test_app_with_store().await;
+
+        let single = crate::core::Sin90Proposal {
+            id: "p-l3-create-task".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![crate::core::Sin90Op::CreateTask {
+                title: "Filed via CreateTask".into(),
+                direction_id: Some(crate::core::TRIAGE_DIRECTION_ID.to_string()),
+                parent_task_id: None,
+                kind: None,
+                energy: None,
+                est_minutes: None,
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&single).await.unwrap();
+        store.apply_proposal(&single.id).await.unwrap();
+        let single_task = store
+            .list_tasks(Some(crate::core::TRIAGE_DIRECTION_ID), None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.title == "Filed via CreateTask")
+            .expect("CreateTask must have created the task in 待定");
+        let (via, entered_at) =
+            crate::store::test_hooks::task_triage_state(&store, &single_task.id)
+                .await
+                .unwrap();
+        assert_eq!(via.as_deref(), Some("direct"));
+        assert!(entered_at.is_some());
+
+        let week = store.create_week("2026-W24").await.unwrap();
+        let batch = crate::core::Sin90Proposal {
+            id: "p-l3-create-tasks".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![crate::core::Sin90Op::CreateTasks {
+                week_id: week.id.clone(),
+                tasks: vec![crate::core::NewTask {
+                    title: "Filed via CreateTasks".into(),
+                    direction_id: Some(crate::core::TRIAGE_DIRECTION_ID.to_string()),
+                }],
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&batch).await.unwrap();
+        store.apply_proposal(&batch.id).await.unwrap();
+        let batch_task = store
+            .list_tasks(Some(crate::core::TRIAGE_DIRECTION_ID), None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.title == "Filed via CreateTasks")
+            .expect("CreateTasks must have created the task in 待定");
+        let (via, entered_at) = crate::store::test_hooks::task_triage_state(&store, &batch_task.id)
+            .await
+            .unwrap();
+        assert_eq!(via.as_deref(), Some("direct"));
+        assert!(entered_at.is_some());
+    }
+
+    /// L1 (T5.7.2 review round 3): `CarryOverTask`'s apply already copies
+    /// `triage_via`/`triage_entered_at` (N-H1) to the new id — this pins the
+    /// OTHER H2 floor, `sin90_classify_evals.evaluated_at`, gets the SAME
+    /// treatment. Without it, a task classify had JUST re-evaluated (and
+    /// found nothing new, advancing the retry gate's floor) loses that
+    /// advance the instant it carries over: the OLD id's eval row is
+    /// orphaned and the NEW id starts with none, silently re-opening the H2
+    /// gate for something already resolved this cycle. Mutation target:
+    /// remove the `INSERT INTO sin90_classify_evals ... SELECT` from
+    /// `CarryOverTask`'s apply (`store/repo.rs`) and the assertion below
+    /// goes red.
+    #[tokio::test]
+    async fn carry_over_task_copies_classify_eval_row_to_new_id() {
+        let (_app, _sink, store) = test_app_with_store().await;
+        let prev = store.create_week("2026-W22").await.unwrap();
+        store
+            .transition_week(&prev.id, crate::core::WeekStatus::Active)
+            .await
+            .unwrap();
+        let seed = crate::core::Sin90Proposal {
+            id: "seed-l1-task".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![crate::core::Sin90Op::CreateTasks {
+                week_id: prev.id.clone(),
+                tasks: vec![crate::core::NewTask {
+                    title: "Ambiguous errand".into(),
+                    direction_id: None,
+                }],
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&seed).await.unwrap();
+        store.apply_proposal(&seed.id).await.unwrap();
+        let task = crate::ai::AiReadModel::week_tasks(&store.ai_reader(), &prev.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.title == "Ambiguous errand")
+            .expect("seeded task must exist");
+
+        // Classify fallback-parks it into 待定.
+        let draft = crate::ai::ProposalDraft {
+            id: "p-l1-triage".into(),
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task.id.clone(),
+                direction_id: crate::core::TRIAGE_DIRECTION_ID.to_string(),
+            }],
+            rationale: None,
+        };
+        crate::ai::AiSink::submit(&store, Capability::Classify, draft, call_rec("c-l1-triage"))
+            .await
+            .unwrap();
+        store.apply_proposal("p-l1-triage").await.unwrap();
+
+        // Classify re-evaluates the SAME (now-in-待定) task and finds
+        // nothing new again — writes a real `sin90_classify_evals` row
+        // under the task's CURRENT (pre-carry) id. ① (T5.7.2 review round 3,
+        // stacked-PR split): seeded via raw SQL rather than `AiSink::
+        // record_classify_eval` — that trait method (H2's own write path)
+        // is a LATER branch's addition (`triage-reclassify`); this branch
+        // only needs the ROW to exist, the same upsert shape that method
+        // itself uses, to pin `CarryOverTask`'s own copy of it.
+        sqlx::query(
+            "INSERT INTO sin90_classify_evals (task_id, evaluated_at) VALUES (?, ?)
+             ON CONFLICT(task_id) DO UPDATE SET evaluated_at = excluded.evaluated_at",
+        )
+        .bind(&task.id)
+        .bind(crate::core::now_iso8601())
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let old_evaluated_at: String =
+            sqlx::query_scalar("SELECT evaluated_at FROM sin90_classify_evals WHERE task_id = ?")
+                .bind(&task.id)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+
+        let target = store.create_week("2026-W23").await.unwrap();
+        let carry = crate::core::Sin90Proposal {
+            id: "p-l1-carry".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![crate::core::Sin90Op::CarryOverTask {
+                task_id: task.id.clone(),
+                to_week: target.id.clone(),
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&carry).await.unwrap();
+        store.apply_proposal(&carry.id).await.unwrap();
+        let carried = crate::ai::AiReadModel::week_tasks(&store.ai_reader(), &target.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.carried_from.as_deref() == Some(task.id.as_str()))
+            .expect("carried-over task must exist under a new id");
+
+        let new_evaluated_at: Option<String> =
+            sqlx::query_scalar("SELECT evaluated_at FROM sin90_classify_evals WHERE task_id = ?")
+                .bind(&carried.id)
+                .fetch_optional(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            new_evaluated_at,
+            Some(old_evaluated_at),
+            "CarryOverTask must copy the classify eval row to the carried task's new id"
+        );
+    }
+
     // ---- M4: a panicking run releases the single-flight slot --------------
 
     #[tokio::test]

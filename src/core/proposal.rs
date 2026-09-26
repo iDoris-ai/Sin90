@@ -395,18 +395,48 @@ impl<'c> Working<'c> {
 /// (store snapshot overlaid with earlier ops). Returns on the FIRST offending
 /// op; the store rejects the whole proposal — apply is all-or-nothing.
 /// Relational invariants are the store's job (see [`ValidationCtx`]).
-pub fn validate(p: &Sin90Proposal, ctx: &dyn ValidationCtx) -> Result<(), ProposalError> {
+///
+/// `capability_source` (T5.7.2 review round 2, M-a): THIS proposal's own
+/// `"classify"`/`"direct"` provenance — the same vocabulary
+/// `Sin90Store::reject_proposal` already resolves (a matching `ok=1`
+/// `sin90_ai_calls` row ⇒ `"classify"`, none ⇒ `"direct"`, since
+/// `AssignTaskDirection` is the only op `Capability::Classify` ever
+/// produces). Not a per-entity fact `ValidationCtx` could answer (it is
+/// scoped to THIS call's proposal, not to any task/direction), so it is
+/// passed alongside `ctx` instead of widening that trait.
+///
+/// ① (T5.7.2 review round 3, stacked-PR split): this branch carries ONLY the
+/// mechanical signature change (every caller now threads `capability_source`
+/// through) — `validate_op` does not read it yet (see its own doc), so A3's
+/// `AssignTaskDirection` carve-out below is UNCHANGED from before this
+/// branch: a task currently parked in any Direction (待定 included) still
+/// unconditionally refuses reassignment (`NotInInbox`). The M6/M-a carve-out
+/// that DOES read `capability_source` (§2 #31/#32) lands in the next branch
+/// up the stack, once `ValidationCtx::task_triage_via_classify` exists for
+/// it to consult.
+pub fn validate(
+    p: &Sin90Proposal,
+    ctx: &dyn ValidationCtx,
+    capability_source: &str,
+) -> Result<(), ProposalError> {
     if p.ops.is_empty() {
         return Err(ProposalError::Empty);
     }
     let mut w = Working::new(ctx);
     for op in &p.ops {
-        validate_op(op, &mut w)?;
+        validate_op(op, &mut w, capability_source)?;
     }
     Ok(())
 }
 
-fn validate_op(op: &Sin90Op, w: &mut Working<'_>) -> Result<(), ProposalError> {
+fn validate_op(
+    op: &Sin90Op,
+    w: &mut Working<'_>,
+    // ① (T5.7.2 review round 3): not read yet in this branch — see
+    // `validate`'s own doc for why the parameter exists here at all before
+    // any arm consults it.
+    _capability_source: &str,
+) -> Result<(), ProposalError> {
     match op {
         Sin90Op::CreateArea { title } => {
             non_blank("title", title)?;
@@ -532,6 +562,14 @@ fn validate_op(op: &Sin90Op, w: &mut Working<'_>) -> Result<(), ProposalError> {
             // TARGET one this op was trying to assign — the error is "you
             // can't assign, it's already assigned to X", and X is
             // `current_direction`, not `direction_id`.
+            //
+            // ① (T5.7.2 review round 3, stacked-PR split): the T5.2.2
+            // followup ②/M6/M-a carve-out that loosens this for a 待定-
+            // parked task (§2 #31/#32) is NOT in this branch yet — see
+            // `validate_op`'s own doc. Every task already assigned to ANY
+            // Direction, 待定 included, still unconditionally refuses
+            // reassignment here, unchanged from before this whole review
+            // round.
             if let Some(existing_direction_id) = current_direction {
                 return Err(ProposalError::NotInInbox {
                     task_id: task_id.clone(),
@@ -759,7 +797,10 @@ mod tests {
     #[test]
     fn empty_proposal_rejected() {
         let ctx = MockCtx::default();
-        assert_eq!(validate(&proposal(vec![]), &ctx), Err(ProposalError::Empty));
+        assert_eq!(
+            validate(&proposal(vec![]), &ctx, "direct"),
+            Err(ProposalError::Empty)
+        );
     }
 
     #[test]
@@ -768,11 +809,11 @@ mod tests {
         let ok = proposal(vec![Sin90Op::CreateArea {
             title: "Work".into(),
         }]);
-        assert!(validate(&ok, &ctx).is_ok());
+        assert!(validate(&ok, &ctx, "direct").is_ok());
 
         let bad = proposal(vec![Sin90Op::CreateArea { title: "  ".into() }]);
         assert_eq!(
-            validate(&bad, &ctx),
+            validate(&bad, &ctx, "direct"),
             Err(ProposalError::BlankField { field: "title" })
         );
     }
@@ -791,7 +832,7 @@ mod tests {
             energy: None,
             est_minutes: None,
         }]);
-        assert!(validate(&ok, &ctx).is_ok());
+        assert!(validate(&ok, &ctx, "direct").is_ok());
 
         // "child" already has a parent ("root") — nesting under it is rejected.
         let bad = proposal(vec![Sin90Op::CreateTask {
@@ -803,7 +844,7 @@ mod tests {
             est_minutes: None,
         }]);
         assert_eq!(
-            validate(&bad, &ctx),
+            validate(&bad, &ctx, "direct"),
             Err(ProposalError::NestedProject {
                 parent_id: "child".into()
             })
@@ -822,7 +863,7 @@ mod tests {
             est_minutes: None,
         }]);
         assert_eq!(
-            validate(&p, &ctx),
+            validate(&p, &ctx, "direct"),
             Err(ProposalError::UnknownEntity {
                 entity: "task",
                 id: "ghost".into()
@@ -837,7 +878,7 @@ mod tests {
             title: "iDoris site".into(),
             target_window: "2026-08".into(),
         }]);
-        assert!(validate(&p, &ctx).is_ok());
+        assert!(validate(&p, &ctx, "direct").is_ok());
     }
 
     #[test]
@@ -849,14 +890,14 @@ mod tests {
             task_id: "t1".into(),
             to: TaskStatus::InProgress,
         }]);
-        assert!(validate(&ok, &ctx).is_ok());
+        assert!(validate(&ok, &ctx, "direct").is_ok());
 
         let bad = proposal(vec![Sin90Op::TransitionTask {
             task_id: "t1".into(),
             to: TaskStatus::Done, // planned -> done is illegal (must go through in_progress)
         }]);
         assert!(matches!(
-            validate(&bad, &ctx),
+            validate(&bad, &ctx, "direct"),
             Err(ProposalError::IllegalTransition(
                 TransitionError::Task { .. }
             ))
@@ -871,7 +912,7 @@ mod tests {
             to: TaskStatus::InProgress,
         }]);
         assert_eq!(
-            validate(&p, &ctx),
+            validate(&p, &ctx, "direct"),
             Err(ProposalError::UnknownEntity {
                 entity: "task",
                 id: "ghost".into()
@@ -892,7 +933,7 @@ mod tests {
                 direction_id: None,
             }],
         }]);
-        assert!(validate(&ok, &ctx).is_ok());
+        assert!(validate(&ok, &ctx, "direct").is_ok());
 
         let bad = proposal(vec![Sin90Op::CreateTasks {
             week_id: "w_closed".into(),
@@ -902,7 +943,7 @@ mod tests {
             }],
         }]);
         assert!(matches!(
-            validate(&bad, &ctx),
+            validate(&bad, &ctx, "direct"),
             Err(ProposalError::WeekNotOpen { .. })
         ));
     }
@@ -916,7 +957,7 @@ mod tests {
             order: vec![],
         }]);
         assert!(matches!(
-            validate(&p, &ctx),
+            validate(&p, &ctx, "direct"),
             Err(ProposalError::EmptyList {
                 op: "reorder_tasks",
                 ..
@@ -933,7 +974,7 @@ mod tests {
             order: vec!["t1".into(), "t2".into(), "t1".into()],
         }]);
         assert!(matches!(
-            validate(&p, &ctx),
+            validate(&p, &ctx, "direct"),
             Err(ProposalError::DuplicateRef {
                 op: "reorder_tasks",
                 ..
@@ -950,7 +991,7 @@ mod tests {
             tasks: vec![],
         }]);
         assert!(matches!(
-            validate(&p, &ctx),
+            validate(&p, &ctx, "direct"),
             Err(ProposalError::EmptyList {
                 op: "create_tasks",
                 ..
@@ -966,7 +1007,7 @@ mod tests {
             target_window: "2026-08".into(),
         }]);
         assert_eq!(
-            validate(&p, &ctx),
+            validate(&p, &ctx, "direct"),
             Err(ProposalError::BlankField { field: "title" })
         );
     }
@@ -989,7 +1030,7 @@ mod tests {
             ],
         }]);
         assert!(matches!(
-            validate(&p, &ctx),
+            validate(&p, &ctx, "direct"),
             Err(ProposalError::DuplicateRef {
                 op: "adjust_rhythm",
                 ..
@@ -1013,7 +1054,7 @@ mod tests {
                 to: TaskStatus::Done,
             },
         ]);
-        assert!(validate(&p, &ctx).is_ok());
+        assert!(validate(&p, &ctx, "direct").is_ok());
     }
 
     #[test]
@@ -1031,7 +1072,7 @@ mod tests {
             },
         ]);
         assert!(matches!(
-            validate(&p, &ctx),
+            validate(&p, &ctx, "direct"),
             Err(ProposalError::IllegalTransition(
                 TransitionError::Task { .. }
             ))
@@ -1054,7 +1095,7 @@ mod tests {
             },
         ]);
         assert!(matches!(
-            validate(&p, &ctx),
+            validate(&p, &ctx, "direct"),
             Err(ProposalError::IllegalTransition(
                 TransitionError::Task { .. }
             ))
@@ -1174,7 +1215,7 @@ mod tests {
                 },
             ],
         }]);
-        assert!(validate(&good, &ctx).is_ok());
+        assert!(validate(&good, &ctx, "direct").is_ok());
 
         // Each individual pct is within 1..=100 (so this pins the SUM check,
         // not `PctOutOfRange` below — that's a separate, deliberately
@@ -1193,7 +1234,7 @@ mod tests {
             ],
         }]);
         assert_eq!(
-            validate(&over, &ctx),
+            validate(&over, &ctx, "direct"),
             Err(ProposalError::InvalidAlloc { sum_pct: 110 })
         );
 
@@ -1205,7 +1246,7 @@ mod tests {
             new_alloc: vec![],
         }]);
         assert!(matches!(
-            validate(&dead, &ctx),
+            validate(&dead, &ctx, "direct"),
             Err(ProposalError::RhythmRetired { .. })
         ));
     }
@@ -1223,7 +1264,10 @@ mod tests {
             rhythm_id: "r".into(),
             new_alloc: vec![],
         }]);
-        assert_eq!(validate(&p, &ctx), Err(ProposalError::EmptyAllocations));
+        assert_eq!(
+            validate(&p, &ctx, "direct"),
+            Err(ProposalError::EmptyAllocations)
+        );
 
         // Positive control: a single legal allocation passes.
         let ok = proposal(vec![Sin90Op::AdjustRhythm {
@@ -1233,7 +1277,7 @@ mod tests {
                 pct: 1,
             }],
         }]);
-        assert!(validate(&ok, &ctx).is_ok());
+        assert!(validate(&ok, &ctx, "direct").is_ok());
     }
 
     #[test]
@@ -1249,7 +1293,7 @@ mod tests {
                 }],
             }]);
             assert_eq!(
-                validate(&p, &ctx),
+                validate(&p, &ctx, "direct"),
                 Err(ProposalError::PctOutOfRange {
                     direction_id: "d1".into(),
                     pct: bad_pct,
@@ -1266,7 +1310,7 @@ mod tests {
                     pct: good_pct,
                 }],
             }]);
-            assert!(validate(&p, &ctx).is_ok(), "pct={good_pct}");
+            assert!(validate(&p, &ctx, "direct").is_ok(), "pct={good_pct}");
         }
     }
 
@@ -1281,14 +1325,14 @@ mod tests {
             task_id: "t_prog".into(),
             to_week: "next".into(),
         }]);
-        assert!(validate(&ok, &ctx).is_ok());
+        assert!(validate(&ok, &ctx, "direct").is_ok());
 
         let bad = proposal(vec![Sin90Op::CarryOverTask {
             task_id: "t_done".into(),
             to_week: "next".into(),
         }]);
         assert!(matches!(
-            validate(&bad, &ctx),
+            validate(&bad, &ctx, "direct"),
             Err(ProposalError::IllegalTransition(
                 TransitionError::Task { .. }
             ))
@@ -1310,7 +1354,7 @@ mod tests {
             },
         ]);
         assert!(matches!(
-            validate(&p, &ctx),
+            validate(&p, &ctx, "direct"),
             Err(ProposalError::UnknownEntity { entity: "task", .. })
         ));
     }
@@ -1347,7 +1391,7 @@ mod tests {
     fn assign_task_direction_happy_path() {
         let ctx = inbox_ctx();
         let p = proposal(vec![assign("t1", "d1")]);
-        assert!(validate(&p, &ctx).is_ok());
+        assert!(validate(&p, &ctx, "direct").is_ok());
     }
 
     #[test]
@@ -1356,7 +1400,7 @@ mod tests {
         let ctx = inbox_ctx();
         let p = proposal(vec![assign("ghost", "d1")]);
         assert_eq!(
-            validate(&p, &ctx),
+            validate(&p, &ctx, "direct"),
             Err(ProposalError::UnknownEntity {
                 entity: "task",
                 id: "ghost".into()
@@ -1371,7 +1415,7 @@ mod tests {
         ctx.tasks.insert("t1".into(), TaskStatus::Done);
         let p = proposal(vec![assign("t1", "d1")]);
         assert_eq!(
-            validate(&p, &ctx),
+            validate(&p, &ctx, "direct"),
             Err(ProposalError::TaskClosed {
                 task_id: "t1".into(),
                 status: TaskStatus::Done
@@ -1387,7 +1431,7 @@ mod tests {
             .insert("t1".into(), Some("d-existing".into()));
         let p = proposal(vec![assign("t1", "d1")]);
         assert_eq!(
-            validate(&p, &ctx),
+            validate(&p, &ctx, "direct"),
             Err(ProposalError::NotInInbox {
                 task_id: "t1".into(),
                 // 2026-09-24 review (round 2, M2): the error must name the
@@ -1404,7 +1448,7 @@ mod tests {
         let ctx = inbox_ctx();
         let p = proposal(vec![assign("t1", "ghost-direction")]);
         assert_eq!(
-            validate(&p, &ctx),
+            validate(&p, &ctx, "direct"),
             Err(ProposalError::UnknownEntity {
                 entity: "direction",
                 id: "ghost-direction".into()
@@ -1420,7 +1464,7 @@ mod tests {
             .insert("d1".into(), DirectionStatus::Abandoned);
         let p = proposal(vec![assign("t1", "d1")]);
         assert_eq!(
-            validate(&p, &ctx),
+            validate(&p, &ctx, "direct"),
             Err(ProposalError::DirectionClosed {
                 direction_id: "d1".into(),
                 status: DirectionStatus::Abandoned
@@ -1432,7 +1476,7 @@ mod tests {
         ctx2.directions
             .insert("d1".into(), DirectionStatus::Achieved);
         assert!(matches!(
-            validate(&proposal(vec![assign("t1", "d1")]), &ctx2),
+            validate(&proposal(vec![assign("t1", "d1")]), &ctx2, "direct"),
             Err(ProposalError::DirectionClosed { .. })
         ));
 
@@ -1445,7 +1489,7 @@ mod tests {
             let mut ok_ctx = inbox_ctx();
             ok_ctx.directions.insert("d1".into(), s);
             assert!(
-                validate(&proposal(vec![assign("t1", "d1")]), &ok_ctx).is_ok(),
+                validate(&proposal(vec![assign("t1", "d1")]), &ok_ctx, "direct").is_ok(),
                 "{s:?} should be assignable"
             );
         }
@@ -1460,7 +1504,7 @@ mod tests {
         ctx.directions.insert("d2".into(), DirectionStatus::Active);
         let p = proposal(vec![assign("t1", "d1"), assign("t1", "d2")]);
         assert_eq!(
-            validate(&p, &ctx),
+            validate(&p, &ctx, "direct"),
             Err(ProposalError::NotInInbox {
                 task_id: "t1".into(),
                 // 2026-09-24 review (round 2, M2): the SECOND op's A3 check
@@ -1487,7 +1531,7 @@ mod tests {
             assign("t1", "d1"),
         ]);
         assert_eq!(
-            validate(&p, &ctx),
+            validate(&p, &ctx, "direct"),
             Err(ProposalError::TaskClosed {
                 task_id: "t1".into(),
                 status: TaskStatus::Dropped
@@ -1508,7 +1552,7 @@ mod tests {
                 to: TaskStatus::Planned,
             },
         ]);
-        assert!(validate(&p, &ctx).is_ok());
+        assert!(validate(&p, &ctx, "direct").is_ok());
     }
 
     // NOTE (2026-09-24 review, M6): a stray field on `AssignTaskDirection`
@@ -1559,7 +1603,7 @@ mod tests {
     fn draft_review_body_happy_path() {
         let (ctx, hash) = draft_ctx();
         let p = proposal(vec![draft("r1", &hash, "a whole new body")]);
-        assert!(validate(&p, &ctx).is_ok());
+        assert!(validate(&p, &ctx, "direct").is_ok());
     }
 
     #[test]
@@ -1567,7 +1611,7 @@ mod tests {
         let (ctx, hash) = draft_ctx();
         let p = proposal(vec![draft("r1", &hash, "   ")]);
         assert_eq!(
-            validate(&p, &ctx),
+            validate(&p, &ctx, "direct"),
             Err(ProposalError::BlankField { field: "body" })
         );
     }
@@ -1578,12 +1622,12 @@ mod tests {
         // Positive control: EXACTLY at the limit is fine.
         let at_limit = "x".repeat(MAX_REVIEW_BODY_BYTES);
         let ok = proposal(vec![draft("r1", &hash, &at_limit)]);
-        assert!(validate(&ok, &ctx).is_ok());
+        assert!(validate(&ok, &ctx, "direct").is_ok());
 
         let over = "x".repeat(MAX_REVIEW_BODY_BYTES + 1);
         let bad = proposal(vec![draft("r1", &hash, &over)]);
         assert_eq!(
-            validate(&bad, &ctx),
+            validate(&bad, &ctx, "direct"),
             Err(ProposalError::TooLarge {
                 field: "body",
                 max_bytes: MAX_REVIEW_BODY_BYTES
@@ -1602,7 +1646,7 @@ mod tests {
         ] {
             let p = proposal(vec![draft("r1", bad_hash, "new body")]);
             assert_eq!(
-                validate(&p, &ctx),
+                validate(&p, &ctx, "direct"),
                 Err(ProposalError::BadHash),
                 "{bad_hash}"
             );
@@ -1614,7 +1658,7 @@ mod tests {
         let (ctx, hash) = draft_ctx();
         let p = proposal(vec![draft("ghost", &hash, "new body")]);
         assert_eq!(
-            validate(&p, &ctx),
+            validate(&p, &ctx, "direct"),
             Err(ProposalError::UnknownEntity {
                 entity: "review",
                 id: "ghost".into()
@@ -1628,7 +1672,7 @@ mod tests {
         ctx.reviews.get_mut("r1").unwrap().status = ReviewStatus::Finalized;
         let p = proposal(vec![draft("r1", &hash, "new body")]);
         assert_eq!(
-            validate(&p, &ctx),
+            validate(&p, &ctx, "direct"),
             Err(ProposalError::ReviewNotDraft {
                 review_id: "r1".into()
             })
@@ -1644,7 +1688,7 @@ mod tests {
             "new body",
         )]);
         assert_eq!(
-            validate(&p, &ctx),
+            validate(&p, &ctx, "direct"),
             Err(ProposalError::StaleBase {
                 entity: "review",
                 id: "r1".into()
@@ -1658,7 +1702,7 @@ mod tests {
         // Same body the snapshot already has (see `draft_ctx`).
         let p = proposal(vec![draft("r1", &hash, "line one\nline two")]);
         assert_eq!(
-            validate(&p, &ctx),
+            validate(&p, &ctx, "direct"),
             Err(ProposalError::NoChange {
                 op: "draft_review_body"
             })
@@ -1677,7 +1721,7 @@ mod tests {
             draft("r1", &hash, first_body),
             draft("r1", &body_sha256(first_body), "second rewrite"),
         ]);
-        assert!(validate(&chained, &ctx).is_ok());
+        assert!(validate(&chained, &ctx, "direct").is_ok());
 
         // The second op still uses the ORIGINAL (pre-batch) hash — stale
         // the moment the first op in the SAME batch already moved it.
@@ -1686,7 +1730,7 @@ mod tests {
             draft("r1", &hash, "second rewrite"),
         ]);
         assert_eq!(
-            validate(&stale_second, &ctx),
+            validate(&stale_second, &ctx, "direct"),
             Err(ProposalError::StaleBase {
                 entity: "review",
                 id: "r1".into()

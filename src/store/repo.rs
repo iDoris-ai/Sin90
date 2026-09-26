@@ -177,6 +177,24 @@ pub struct StoredProposal {
     pub result: Option<AppliedProposal>,
 }
 
+/// One `sin90_proposal_rejections` row as [`Sin90Store::list_rejected_ops`]
+/// reconstructs it — `ops` re-inflated from the joined `sin90_proposals` row,
+/// not a second stored copy (design §2 #31).
+#[derive(Debug, Clone)]
+pub struct RejectedOpsRow {
+    pub ops: Vec<Sin90Op>,
+    pub rejected_at: String,
+    /// T5.7.2 review round 2 (M2): the ORIGINAL proposal's `created_at`
+    /// (`sin90_proposals.created_at`, mirrored verbatim as
+    /// `sin90_proposal_rejections.proposed_at`) — the "situation changed"
+    /// judgement's time basis moved from `rejected_at` to this: a new
+    /// eligible Direction that appeared BETWEEN drafting and rejecting (a
+    /// real gap when a human sits on a pending proposal for a while) already
+    /// made that proposal stale by the time it was rejected, so it must not
+    /// count as "no new Direction since" either.
+    pub proposed_at: String,
+}
+
 /// One row of `GET /events` (M0 §6, judgement A10) — the same self-contained
 /// shape `sin90_events` stores, so a reader never has to join a mutable table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1451,11 +1469,26 @@ impl Sin90Store {
         }
         let id = ulid();
         let now = now_iso8601();
+        // L3 (T5.7.2 review round 3): `POST /tasks` (this method) is the
+        // OTHER, non-proposal path that can file a task straight into
+        // 待定 (`direction_id = "sin90-triage"`) — same fix, same
+        // rationale as `Sin90Op::CreateTask`'s apply arm in `apply_op`
+        // above: unconditionally `'direct'` (classify's only route into
+        // 待定 is `AssignTaskDirection`, never a task creation call), so
+        // migration 0015's "`NULL` = never 待定-parked" invariant holds for
+        // a task created here too.
+        let (triage_via, triage_entered_at): (Option<&str>, Option<&str>) =
+            if direction_id == Some(crate::core::TRIAGE_DIRECTION_ID) {
+                (Some("direct"), Some(now.as_str()))
+            } else {
+                (None, None)
+            };
         sqlx::query(
             "INSERT INTO sin90_tasks
                  (id, direction_id, week_id, parent_task_id, title, status, kind, energy,
-                  est_minutes, sort_key, carried_from, created_at, updated_at)
-             VALUES (?, ?, NULL, ?, ?, 'backlog', ?, ?, ?, 0, NULL, ?, ?)",
+                  est_minutes, sort_key, carried_from, created_at, updated_at,
+                  triage_via, triage_entered_at)
+             VALUES (?, ?, NULL, ?, ?, 'backlog', ?, ?, ?, 0, NULL, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(direction_id)
@@ -1466,6 +1499,8 @@ impl Sin90Store {
         .bind(est_minutes.map(|m| m as i64))
         .bind(&now)
         .bind(&now)
+        .bind(triage_via)
+        .bind(triage_entered_at)
         .execute(&mut *tx)
         .await?;
         append_event(
@@ -2956,7 +2991,11 @@ impl Sin90Store {
             }
             None => {
                 let snapshot = build_snapshot(&mut tx, &p.ops).await?;
-                validate(p, &snapshot)?; // Err -> tx drops -> rollback -> nothing written
+                // M-a: `submit_proposal` is `POST /proposals`'s own direct
+                // path — `AiSink::submit`/`dry_run` is the ONLY way an AI
+                // capability's own output reaches a proposal row, and that
+                // path never calls this method. Always `"direct"`.
+                validate(p, &snapshot, "direct")?; // Err -> tx drops -> rollback -> nothing written
             }
         }
 
@@ -3033,6 +3072,30 @@ impl Sin90Store {
         let ops: Vec<Sin90Op> = serde_json::from_str(&claimed.get::<String, _>("ops"))?;
         let source = from_wire(&claimed.get::<String, _>("source"))?;
 
+        // M-a: `apply_proposal` is the SHARED accept path for BOTH a
+        // human/automation `POST /proposals` submission and an AI
+        // capability's own (`AiSink::submit`-produced) proposal — resolve
+        // THIS proposal's own capability_source the same way
+        // `reject_proposal` already does (a matching `ok=1` `sin90_ai_calls`
+        // row ⇒ that capability, e.g. `"classify"`; none ⇒ `"direct"`).
+        // L6 (T5.7.2 review round 3): `"direct"` here means "this proposal
+        // did NOT come out of an AI capability's own submit pipeline" — it
+        // covers a human clicking accept in a UI AND an automation key
+        // calling `POST /proposals` programmatically alike (both reach this
+        // SAME `apply_proposal`, the shared "人工 accept" fallback path for
+        // anything `AiSink::submit` didn't itself already commit) — never
+        // "a person, as opposed to a machine". `unwrap_or_else` fires
+        // exactly when no `ok = 1 sin90_ai_calls` row names this
+        // `proposal_id`, which by construction is every proposal `AiSink::
+        // submit` did NOT produce (it always links one at INSERT time).
+        let capability_source: String = sqlx::query_scalar(
+            "SELECT task_kind FROM sin90_ai_calls WHERE proposal_id = ? AND ok = 1 LIMIT 1",
+        )
+        .bind(proposal_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .unwrap_or_else(|| "direct".to_string());
+
         let snapshot = build_snapshot(&mut tx, &ops).await?;
         let proposal = Sin90Proposal {
             id: proposal_id.to_string(),
@@ -3041,11 +3104,11 @@ impl Sin90Store {
             ops: ops.clone(),
             rationale: None,
         };
-        validate(&proposal, &snapshot)?; // Err → tx drops → rollback → back to pending
+        validate(&proposal, &snapshot, &capability_source)?; // Err → tx drops → rollback → back to pending
 
         let mut event_ids = Vec::new();
         for op in &ops {
-            apply_op(&mut tx, op, &mut event_ids).await?;
+            apply_op(&mut tx, op, &mut event_ids, &capability_source).await?;
         }
 
         let receipt = AppliedProposal {
@@ -3185,6 +3248,66 @@ impl Sin90Store {
             capability_source,
             ops_summary,
         })
+    }
+
+    /// T5.7.2 (design §2 #31): every REJECTED proposal attributed to
+    /// `capability_source` (`"classify"`/`"summarize"`/`"propose"`, the same
+    /// values `reject_proposal` writes — see its own doc for how that's
+    /// resolved), with its ORIGINAL `ops` re-inflated via a JOIN back to
+    /// `sin90_proposals` rather than a second copy stored on the log row
+    /// itself — §2 #28's own precondition (`ops` is never rewritten once a
+    /// proposal exists) is exactly what makes this JOIN safe to rely on
+    /// forever, and §2 #31 is the design entry that spells out why no
+    /// "fingerprint" column was added instead. Ordered oldest-first so a
+    /// caller folding these into a `HashMap<target, latest rejected_at>`
+    /// naturally keeps the MOST RECENT rejection when several exist for the
+    /// same target.
+    pub async fn list_rejected_ops(&self, capability_source: &str) -> Result<Vec<RejectedOpsRow>> {
+        // M5 (review round 2): `(capability_source, rejected_at)` is now
+        // indexed (migration 0015) — this WHERE + ORDER BY shape reads it
+        // directly instead of a full-table scan + sort.
+        let rows = sqlx::query(
+            "SELECT p.ops AS ops, r.rejected_at AS rejected_at, p.created_at AS proposed_at
+             FROM sin90_proposal_rejections r
+             JOIN sin90_proposals p ON p.id = r.proposal_id
+             WHERE r.capability_source = ?
+             ORDER BY r.rejected_at ASC, r.rowid ASC",
+        )
+        .bind(capability_source)
+        .fetch_all(self.pool())
+        .await?;
+        // M5 (review round 2): a single row whose `ops` JSON fails to parse
+        // (a hand-edited/corrupted row — `sin90_proposal_rejections.
+        // proposal_id`'s target `sin90_proposals.ops` is never rewritten
+        // once written, §2 #28's own precondition, so this should never
+        // happen in practice) is logged and SKIPPED, not allowed to fail the
+        // ENTIRE call — every dedup path (`ai_classify::dedup_targets`/
+        // `ai_propose::dedup_propose`/`ai_summarize::dedup_summarize`) reads
+        // this list to decide whether to suppress a candidate; one bad row
+        // used to take every OTHER task/week/review's suppression down with
+        // it via `?`, turning one corrupt audit-log row into a crate-wide
+        // dedup outage.
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                let ops_json: String = r.get("ops");
+                match serde_json::from_str(&ops_json) {
+                    Ok(ops) => Some(RejectedOpsRow {
+                        ops,
+                        rejected_at: r.get("rejected_at"),
+                        proposed_at: r.get("proposed_at"),
+                    }),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            capability_source,
+                            "list_rejected_ops: a row's ops JSON failed to parse; skipping it (M5, not fatal)"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect())
     }
 
     // ----- Review (M4, T4.1.1, design §2/§3.2/§4.1) -------------------------
@@ -3725,6 +3848,7 @@ pub(crate) async fn apply_op(
     tx: &mut Tx<'_>,
     op: &Sin90Op,
     event_ids: &mut Vec<String>,
+    capability_source: &str,
 ) -> Result<()> {
     let now = now_iso8601();
     match op {
@@ -3765,11 +3889,32 @@ pub(crate) async fn apply_op(
             est_minutes,
         } => {
             let id = ulid();
+            // L3 (T5.7.2 review round 3): a task filed straight INTO 待定 by
+            // this op (never through `AssignTaskDirection`, the only other
+            // writer of these two columns) must stamp `triage_via`/
+            // `triage_entered_at` at CREATE time too, same as if it had
+            // arrived via the inbox then been directly assigned — otherwise
+            // it sits at `direction_id = 'sin90-triage'` with BOTH columns
+            // `NULL`, breaking migration 0015's own documented invariant
+            // ("`NULL` for every task that has never been 待定-parked at
+            // all") for a task that manifestly IS 待定-parked right now.
+            // Always `'direct'`, never `capability_source`: classify's own
+            // route into 待定 is exclusively `AssignTaskDirection` (`ai::
+            // classify`'s dedicated fallback arm) — it never mints a task
+            // directly into 待定 via this op — so ANY `CreateTask` targeting
+            // 待定 is, by construction, a human/automation filing.
+            let (triage_via, triage_entered_at): (Option<&str>, Option<&str>) =
+                if direction_id.as_deref() == Some(crate::core::TRIAGE_DIRECTION_ID) {
+                    (Some("direct"), Some(now.as_str()))
+                } else {
+                    (None, None)
+                };
             sqlx::query(
                 "INSERT INTO sin90_tasks
                      (id, direction_id, week_id, parent_task_id, title, status, kind, energy,
-                      est_minutes, sort_key, carried_from, created_at, updated_at)
-                 VALUES (?, ?, NULL, ?, ?, 'backlog', ?, ?, ?, 0, NULL, ?, ?)",
+                      est_minutes, sort_key, carried_from, created_at, updated_at,
+                      triage_via, triage_entered_at)
+                 VALUES (?, ?, NULL, ?, ?, 'backlog', ?, ?, ?, 0, NULL, ?, ?, ?, ?)",
             )
             .bind(&id)
             .bind(direction_id)
@@ -3780,6 +3925,8 @@ pub(crate) async fn apply_op(
             .bind(est_minutes.map(|m| m as i64))
             .bind(&now)
             .bind(&now)
+            .bind(triage_via)
+            .bind(triage_entered_at)
             .execute(&mut **tx)
             .await?;
             let ev = append_event(
@@ -3854,11 +4001,21 @@ pub(crate) async fn apply_op(
         Sin90Op::CreateTasks { week_id, tasks } => {
             for (i, t) in tasks.iter().enumerate() {
                 let id = ulid();
+                // L3 (T5.7.2 review round 3): same stamping as `CreateTask`
+                // above, per-task — see that arm's doc for why this is
+                // unconditionally `'direct'`.
+                let (triage_via, triage_entered_at): (Option<&str>, Option<&str>) =
+                    if t.direction_id.as_deref() == Some(crate::core::TRIAGE_DIRECTION_ID) {
+                        (Some("direct"), Some(now.as_str()))
+                    } else {
+                        (None, None)
+                    };
                 sqlx::query(
                     "INSERT INTO sin90_tasks
                          (id, direction_id, week_id, parent_task_id, title, status, kind, energy,
-                          est_minutes, sort_key, carried_from, created_at, updated_at)
-                     VALUES (?, ?, ?, NULL, ?, 'planned', 'other', 'mid', NULL, ?, NULL, ?, ?)",
+                          est_minutes, sort_key, carried_from, created_at, updated_at,
+                          triage_via, triage_entered_at)
+                     VALUES (?, ?, ?, NULL, ?, 'planned', 'other', 'mid', NULL, ?, NULL, ?, ?, ?, ?)",
                 )
                 .bind(&id)
                 .bind(&t.direction_id)
@@ -3867,6 +4024,8 @@ pub(crate) async fn apply_op(
                 .bind(i as i64)
                 .bind(&now)
                 .bind(&now)
+                .bind(triage_via)
+                .bind(triage_entered_at)
                 .execute(&mut **tx)
                 .await?;
                 let ev = append_event(
@@ -3955,7 +4114,8 @@ pub(crate) async fn apply_op(
         Sin90Op::CarryOverTask { task_id, to_week } => {
             require_task_week_open(tx, task_id).await?;
             let src = sqlx::query(
-                "SELECT title, direction_id, week_id, parent_task_id, kind, energy, est_minutes
+                "SELECT title, direction_id, week_id, parent_task_id, kind, energy, est_minutes,
+                        triage_via, triage_entered_at
                  FROM sin90_tasks WHERE id = ?",
             )
             .bind(task_id)
@@ -3972,6 +4132,19 @@ pub(crate) async fn apply_op(
             let est_minutes: Option<i64> = src.get("est_minutes");
             let direction_id: Option<String> = src.get("direction_id");
             let src_week: Option<String> = src.get("week_id");
+            // N-H1 (T5.7.2 review round 2 follow-up): a 待定-parked task's
+            // provenance travels with it under its NEW id — `CarryOverTask`
+            // mints one (`new_id` below), so without this copy the carried
+            // row would look exactly like a task that was NEVER 待定-parked
+            // at all (`triage_via IS NULL`), permanently defeating both M6's
+            // A3 carve-out and the H2 retry gate for it (this migration's own
+            // motivating bug — see `0015_classify_evals_and_rejection_index.
+            // sql`'s N-H1 doc). Copied verbatim regardless of whether the
+            // source task is currently 待定-parked at all: both columns are
+            // simply `NULL` already for every task that never was, so this
+            // is never a branch, only a straight column carry-over.
+            let triage_via: Option<String> = src.get("triage_via");
+            let triage_entered_at: Option<String> = src.get("triage_entered_at");
             if src_week.as_deref() == Some(to_week.as_str()) {
                 return Err(StoreError::SameWeekCarry(task_id.to_string()));
             }
@@ -4000,8 +4173,9 @@ pub(crate) async fn apply_op(
             sqlx::query(
                 "INSERT INTO sin90_tasks
                      (id, direction_id, week_id, parent_task_id, title, status, kind, energy,
-                      est_minutes, sort_key, carried_from, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, 'planned', ?, ?, ?, 0, ?, ?, ?)",
+                      est_minutes, sort_key, carried_from, created_at, updated_at,
+                      triage_via, triage_entered_at)
+                 VALUES (?, ?, ?, ?, ?, 'planned', ?, ?, ?, 0, ?, ?, ?, ?, ?)",
             )
             .bind(&new_id)
             .bind(&direction_id)
@@ -4014,6 +4188,29 @@ pub(crate) async fn apply_op(
             .bind(task_id)
             .bind(&now)
             .bind(&now)
+            .bind(&triage_via)
+            .bind(&triage_entered_at)
+            .execute(&mut **tx)
+            .await?;
+            // L1 (T5.7.2 review round 3): the H2 retry gate's OTHER floor —
+            // `sin90_classify_evals.evaluated_at` (§2 #32/H2, `store/
+            // ai_port.rs`) — has the exact same "minted a brand-new id" gap
+            // `triage_via`/`triage_entered_at` had before N-H1: it is keyed
+            // on `task_id`, and this op mints a NEW one for the carried row,
+            // so without copying it here a task classify had JUST evaluated
+            // (bumping the gate's floor forward) loses that floor the moment
+            // it carries over — the OLD id's row is orphaned (nothing ever
+            // reads it again; the FK does not cascade a rename) and the NEW
+            // id starts with none, silently re-opening the H2 gate for a
+            // retry classify already resolved. Copied unconditionally: a
+            // `SELECT` against a source with no row simply inserts nothing
+            // (never a branch), same posture as the `triage_via` copy above.
+            sqlx::query(
+                "INSERT INTO sin90_classify_evals (task_id, evaluated_at)
+                 SELECT ?, evaluated_at FROM sin90_classify_evals WHERE task_id = ?",
+            )
+            .bind(&new_id)
+            .bind(task_id)
             .execute(&mut **tx)
             .await?;
             let create_ev = append_event(
@@ -4049,6 +4246,34 @@ pub(crate) async fn apply_op(
                     .fetch_optional(&mut **tx)
                     .await?
                     .and_then(|r| r.get::<Option<String>, _>("area_id"));
+            // Low (T5.7.2 review round 2 follow-up): read BEFORE the CAS
+            // below so the event payload's `from_direction_id` can carry the
+            // REAL prior value (`NULL` from the inbox, or the reserved 待定
+            // id) instead of a hardcoded `null` that was simply wrong
+            // whenever this op fired from 待定 (M6's own carve-out made that
+            // case reachable, but the payload never reflected it).
+            let old_direction_id: Option<String> =
+                sqlx::query("SELECT direction_id FROM sin90_tasks WHERE id = ?")
+                    .bind(task_id)
+                    .fetch_optional(&mut **tx)
+                    .await?
+                    .and_then(|r| r.get::<Option<String>, _>("direction_id"));
+            // N-H1 (T5.7.2 review round 2 follow-up): stamp/clear this
+            // task's 待定 provenance columns in the SAME UPDATE — moving INTO
+            // 待定 (from the inbox) records WHO put it there
+            // (`capability_source`, `"classify"`/`"direct"`) and WHEN;
+            // moving OUT of 待定 to a real Direction (M6's carve-out) clears
+            // both back to `NULL`, same as a task that was never 待定-parked
+            // at all. Keyed on the TARGET, not the source: a 待定 → 待定
+            // re-assign is already refused by `validate`'s A3 before this
+            // ever runs, so the only two shapes that reach here are
+            // inbox → 待定 (stamp) and 待定 → real (clear).
+            let (triage_via, triage_entered_at): (Option<&str>, Option<String>) =
+                if direction_id == crate::core::TRIAGE_DIRECTION_ID {
+                    (Some(capability_source), Some(now.clone()))
+                } else {
+                    (None, None)
+                };
             // Second CAS (design §11.2.1 step 3): `validate`'s A3 already
             // checked "still in the inbox" against the snapshot taken at the
             // start of this transaction; this UPDATE re-checks it against the
@@ -4067,13 +4292,21 @@ pub(crate) async fn apply_op(
             // same validate-then-apply discipline (e.g. a batch/retry path
             // that re-applies an already-decided op) fails safely instead of
             // silently overwriting a task's Direction a second time.
+            //
+            // T5.7.2 (design §2 #31): mirrors A3's own loosening — a task
+            // currently parked in 待定 also CASes through (`validate` already
+            // refused a 待定 → 待定 re-assign before this ever runs).
             let affected = sqlx::query(
-                "UPDATE sin90_tasks SET direction_id = ?, updated_at = ?
-                 WHERE id = ? AND direction_id IS NULL",
+                "UPDATE sin90_tasks
+                 SET direction_id = ?, updated_at = ?, triage_via = ?, triage_entered_at = ?
+                 WHERE id = ? AND (direction_id IS NULL OR direction_id = ?)",
             )
             .bind(direction_id)
             .bind(&now)
+            .bind(triage_via)
+            .bind(&triage_entered_at)
             .bind(task_id)
+            .bind(crate::core::TRIAGE_DIRECTION_ID)
             .execute(&mut **tx)
             .await?
             .rows_affected();
@@ -4091,7 +4324,7 @@ pub(crate) async fn apply_op(
                 None,
                 &json!({
                     "task_id": task_id,
-                    "from_direction_id": null,
+                    "from_direction_id": old_direction_id,
                     "direction_id": direction_id,
                     "area_id": area_id,
                 }),
