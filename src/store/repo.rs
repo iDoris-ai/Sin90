@@ -3310,6 +3310,41 @@ impl Sin90Store {
             .collect())
     }
 
+    /// T5.7.2 review round 2 (M1): "was this task genuinely modified by a
+    /// human after `since`" — the reliable replacement for comparing
+    /// `sin90_tasks.updated_at` directly, which an ACCEPTED, unrelated
+    /// proposal can also bump without any human touching this task at all:
+    /// `ReorderTasks`'s apply (`repo.rs`, `Sin90Op::ReorderTasks` arm) bumps
+    /// EVERY task in the reordered week's `updated_at`, and `AssignTaskDirection`'s
+    /// own CAS `UPDATE` bumps it too (a task classified by something else in
+    /// the same run's window). Neither emits a `sin90_events` row keyed to
+    /// `entity = 'task'` for THIS reason (`ReorderTasks` emits one `week`-
+    /// entity `"reordered"` event for the whole batch, not per task) — the
+    /// only `entity = 'task'` events that exist today are `"created"`
+    /// (before `since` by construction — a task cannot be modified before it
+    /// exists), `"transitioned"` (`TransitionTask`/`CarryOverTask` — a real
+    /// human/automation status change) and `"direction_assigned"`
+    /// (`AssignTaskDirection` — deliberately EXCLUDED here: reassigning a
+    /// task's Direction, including the 待定 fallback itself, is not "the
+    /// user edited this task's content", it is classify's own action, the
+    /// exact trap this method exists to avoid). A future task-content-edit
+    /// endpoint would emit its own new `entity = 'task'` event kind and
+    /// automatically count here too, with zero changes to this query.
+    pub(crate) async fn task_modified_since(&self, task_id: &str, since: &str) -> Result<bool> {
+        let row: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM sin90_events
+             WHERE entity = 'task' AND entity_id = ?
+               AND kind != 'direction_assigned'
+               AND at > ?
+             LIMIT 1",
+        )
+        .bind(task_id)
+        .bind(since)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row.is_some())
+    }
+
     // ----- Review (M4, T4.1.1, design §2/§3.2/§4.1) -------------------------
     //
     // Direct writes, human-gated at the HTTP layer (same convention as

@@ -129,6 +129,33 @@ impl AiReader {
     pub(crate) fn pool(&self) -> &SqlitePool {
         &self.0
     }
+
+    /// T5.7.2 (design §2 #31): the "新 Direction" leg of classify's
+    /// rejection-suppression `situation changed` check — the newest
+    /// `created_at` among Directions that are BOTH non-terminal and not the
+    /// reserved 待定 id, i.e. the exact same eligibility set
+    /// `direction_candidates`/`title_history` already filter on. `None` when
+    /// no such Direction exists at all (a brand-new user, or every one is
+    /// terminal/待定) — the caller then has nothing to compare a `rejected_at`
+    /// against, i.e. this leg never fires. Not part of `AiReadModel` (`ai/`
+    /// never needs it — the suppression check itself lives at the HTTP layer,
+    /// same posture `ai_classify::dedup_targets`'s own `Sin90Store::
+    /// list_pending_proposals` dependency already has, §11.5).
+    pub async fn max_eligible_direction_created_at(&self) -> Result<Option<String>, ReadError> {
+        let terminal = terminal_direction_status_wires();
+        let placeholders = terminal.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT MAX(created_at) AS m FROM sin90_directions
+             WHERE status NOT IN ({placeholders}) AND id != ?"
+        );
+        let mut q = sqlx::query(&sql);
+        for t in &terminal {
+            q = q.bind(t);
+        }
+        q = q.bind(crate::core::TRIAGE_DIRECTION_ID);
+        let row = q.fetch_one(&self.0).await.map_err(rerr)?;
+        Ok(row.get::<Option<String>, _>("m"))
+    }
 }
 
 fn rerr(e: impl std::fmt::Display) -> ReadError {

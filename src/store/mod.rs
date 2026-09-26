@@ -345,6 +345,59 @@ pub mod test_hooks {
         Ok(())
     }
 
+    /// Force a task's `updated_at` forward via raw SQL (T5.7.2) — the only
+    /// way a test can put real clock distance between "this task changed"
+    /// and an EARLIER `rejected_at` without sleeping; `now_iso8601()` is
+    /// second-resolution, so two of those minted in the same test within the
+    /// same wall-clock second would otherwise tie (mirrors
+    /// `set_proposal_created_at`'s own doc for the identical reasoning).
+    pub async fn set_task_updated_at(store: &Sin90Store, id: &str, updated_at: &str) -> Result<()> {
+        sqlx::query("UPDATE sin90_tasks SET updated_at = ? WHERE id = ?")
+            .bind(updated_at)
+            .bind(id)
+            .execute(store.pool())
+            .await?;
+        Ok(())
+    }
+
+    /// Force a Direction's `created_at` forward via raw SQL (T5.7.2) — same
+    /// clock-distance need as [`set_task_updated_at`], for "a NEW Direction
+    /// appeared after `rejected_at`/a task's own `updated_at`" comparisons.
+    pub async fn set_direction_created_at(
+        store: &Sin90Store,
+        id: &str,
+        created_at: &str,
+    ) -> Result<()> {
+        sqlx::query("UPDATE sin90_directions SET created_at = ? WHERE id = ?")
+            .bind(created_at)
+            .bind(id)
+            .execute(store.pool())
+            .await?;
+        Ok(())
+    }
+
+    /// Backdate a task's `"transitioned"` event's `at` (T5.7.2 review
+    /// round 2, M1) — puts real clock distance between "proposed" and "a
+    /// human transitioned this task" without sleeping past
+    /// `now_iso8601()`'s second-resolution boundary (mirrors
+    /// `set_task_started_at`'s identical need, for a different event kind /
+    /// without pinning `to_state` to `in_progress` specifically).
+    pub async fn set_task_transitioned_at(
+        store: &Sin90Store,
+        task_id: &str,
+        at: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE sin90_events SET at = ?
+             WHERE entity = 'task' AND entity_id = ? AND kind = 'transitioned'",
+        )
+        .bind(at)
+        .bind(task_id)
+        .execute(store.pool())
+        .await?;
+        Ok(())
+    }
+
     pub async fn proposal_status(store: &Sin90Store, id: &str) -> Result<Option<String>> {
         Ok(
             sqlx::query("SELECT status FROM sin90_proposals WHERE id = ?")

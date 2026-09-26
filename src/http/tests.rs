@@ -4965,7 +4965,7 @@ mod ai_classify {
             kept.is_empty(),
             "the still-valid pending proposal must skip this task"
         );
-        assert_eq!(skipped, vec![task.id.clone()]);
+        assert_eq!(skipped, vec![(task.id.clone(), "dedup")]);
 
         // Positive control: abandon the target Direction — the pending
         // proposal's dry-run now fails A5, so it no longer blocks anything.
@@ -4986,14 +4986,17 @@ mod ai_classify {
         assert!(skipped2.is_empty());
     }
 
-    /// T5.7.1 / T5.2.1's own dependency: a REJECTED classify
-    /// (`AssignTaskDirection`) proposal must stop blocking `dedup_targets`
-    /// for its target task — mirrors the test above, but invalidates the
-    /// pending proposal via `reject_proposal` instead of abandoning the
-    /// target Direction, pinning that THIS path (not just precheck's own
-    /// dry-run failing) unblocks dedup.
+    // ---- T5.7.2 (design §2 #31): rejected-suggestion suppression ----------
+
+    /// `cargo test suppress_`'s primary judgement: a REJECTED classify
+    /// (`AssignTaskDirection`) proposal keeps blocking `dedup_targets` for
+    /// its target task on the NEXT round — the opposite of what this same
+    /// scenario did before T5.7.2 (a rejection used to unblock dedup
+    /// immediately, letting classify re-propose the exact thing a human just
+    /// turned down). `reason` is `"suppressed_rejected"`, distinct from a
+    /// still-PENDING proposal's `"dedup"`.
     #[tokio::test]
-    async fn proposal_reject_of_classify_proposal_unblocks_dedup_for_same_task() {
+    async fn suppress_rejected_classify_blocks_next_round() {
         let (_app, _sink, store) = test_app_with_store().await;
         let direction = store
             .create_direction("Side quest", "2026-Q4", None)
@@ -5012,37 +5015,346 @@ mod ai_classify {
             .unwrap();
 
         let draft = crate::ai::ProposalDraft {
-            id: "p-dedup-reject-1".into(),
+            id: "p-suppress-1".into(),
             ops: vec![crate::core::Sin90Op::AssignTaskDirection {
                 task_id: task.id.clone(),
                 direction_id: direction.id.clone(),
             }],
             rationale: None,
         };
-        crate::ai::AiSink::submit(&store, Capability::Classify, draft, call_rec("c-reject-1"))
+        crate::ai::AiSink::submit(
+            &store,
+            Capability::Classify,
+            draft,
+            call_rec("c-suppress-1"),
+        )
+        .await
+        .unwrap();
+
+        // Negative control: still pending — blocks dedup under the OLD
+        // reason too.
+        let (kept, skipped) =
+            crate::http::ai_classify::dedup_targets(&store, std::slice::from_ref(&task))
+                .await
+                .unwrap();
+        assert!(kept.is_empty());
+        assert_eq!(skipped, vec![(task.id.clone(), "dedup")]);
+
+        store.reject_proposal("p-suppress-1", None).await.unwrap();
+
+        // The judgement: a rejected proposal now SUPPRESSES, not unblocks.
+        let (kept2, skipped2) =
+            crate::http::ai_classify::dedup_targets(&store, std::slice::from_ref(&task))
+                .await
+                .unwrap();
+        assert!(
+            kept2.is_empty(),
+            "a rejected suggestion must stay suppressed when nothing has changed"
+        );
+        assert_eq!(skipped2, vec![(task.id.clone(), "suppressed_rejected")]);
+
+        let rows = crate::store::test_hooks::proposal_rejection_rows(&store, "p-suppress-1")
+            .await
+            .unwrap();
+        assert_eq!(rows[0].capability_source, "classify");
+    }
+
+    /// Positive control ① (tasks.md T5.7.2's own acceptance line): the task
+    /// itself gets modified after the rejection (a genuine human
+    /// `transition_task` status change, the only "edit an inbox task" route
+    /// this codebase has today) — suppression lifts.
+    #[tokio::test]
+    async fn suppress_rejected_classify_positive_control_task_modified_reproposes() {
+        let (_app, _sink, store) = test_app_with_store().await;
+        let direction = store
+            .create_direction("Side quest", "2026-Q4", None)
+            .await
+            .unwrap();
+        let task = store
+            .create_task(
+                "Ambiguous task",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+        let draft = crate::ai::ProposalDraft {
+            id: "p-suppress-2".into(),
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task.id.clone(),
+                direction_id: direction.id.clone(),
+            }],
+            rationale: None,
+        };
+        crate::ai::AiSink::submit(
+            &store,
+            Capability::Classify,
+            draft,
+            call_rec("c-suppress-2"),
+        )
+        .await
+        .unwrap();
+        store.reject_proposal("p-suppress-2", None).await.unwrap();
+
+        // Negative control (before the edit): still suppressed.
+        let (kept, _) =
+            crate::http::ai_classify::dedup_targets(&store, std::slice::from_ref(&task))
+                .await
+                .unwrap();
+        assert!(kept.is_empty(), "unchanged situation must stay suppressed");
+
+        // The edit: a human moves the task's own status — review round 2
+        // (M1): the "task modified" judgement is now a real,
+        // `sin90_events`-backed check (`Sin90Store::task_modified_since`),
+        // not a raw `updated_at` compare, so what must move forward here is
+        // the `"transitioned"` event's own `at`, not the task row's
+        // `updated_at` column.
+        store
+            .transition_task(&task.id, crate::core::TaskStatus::Planned)
+            .await
+            .unwrap();
+        // `now_iso8601()` is second-resolution, so a same-second reject+edit
+        // in this test would otherwise tie; force the edit's timestamp
+        // forward instead of sleeping (mirrors `set_proposal_created_at`'s
+        // own doc for the identical reasoning).
+        crate::store::test_hooks::set_task_transitioned_at(
+            &store,
+            &task.id,
+            "2099-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        let refetched = crate::ai::AiReadModel::inbox_task(&store.ai_reader(), &task.id)
+            .await
+            .unwrap()
+            .expect("task is still direction_id IS NULL, still in the inbox");
+
+        let (kept2, skipped2) =
+            crate::http::ai_classify::dedup_targets(&store, std::slice::from_ref(&refetched))
+                .await
+                .unwrap();
+        assert_eq!(
+            kept2.len(),
+            1,
+            "a modified task must reproposed after its own rejection"
+        );
+        assert!(skipped2.is_empty());
+    }
+
+    /// T5.7.2 review round 2 (M2): the "situation changed" time basis is the
+    /// rejected proposal's OWN `proposed_at` (when it was first submitted),
+    /// not `rejected_at` (when a human finally got around to deciding on
+    /// it) — a real gap between the two (a proposal a human sat on for a
+    /// while before rejecting) must not hide a Direction that appeared
+    /// DURING that gap. Forces `proposed_at` safely into the past, creates a
+    /// "gap" Direction at real "now", and only THEN rejects (so the gap
+    /// Direction's `created_at` is provably `<= rejected_at`, never `>` it —
+    /// the OLD `rejected_at`-basis code would therefore have called this
+    /// "not new" and kept the suppression). Mutation target: swap
+    /// `r.proposed_at` back for `r.rejected_at` in `dedup_targets` and this
+    /// goes red (`kept` goes back to empty).
+    #[tokio::test]
+    async fn suppress_rejected_classify_uses_proposed_at_not_rejected_at_as_situation_basis() {
+        let (_app, _sink, store) = test_app_with_store().await;
+        let direction_a = store
+            .create_direction("Rejected target", "2026-Q4", None)
+            .await
+            .unwrap();
+        let task = store
+            .create_task(
+                "Ambiguous task",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
             .await
             .unwrap();
 
-        // Negative control: still pending — blocks dedup.
+        let draft = crate::ai::ProposalDraft {
+            id: "p-m2-gap".into(),
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task.id.clone(),
+                direction_id: direction_a.id.clone(),
+            }],
+            rationale: None,
+        };
+        crate::ai::AiSink::submit(&store, Capability::Classify, draft, call_rec("c-m2-gap"))
+            .await
+            .unwrap();
+        crate::store::test_hooks::set_proposal_created_at(
+            &store,
+            "p-m2-gap",
+            "2020-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        // A Direction appears WHILE the (still-pending) proposal is sitting
+        // there, unrejected.
+        let _gap_direction = store
+            .create_direction("Created during the gap", "2026-Q4", None)
+            .await
+            .unwrap();
+
+        // Only NOW does the human reject it — `rejected_at` lands at real
+        // "now", provably at or after `gap_direction`'s `created_at`.
+        store.reject_proposal("p-m2-gap", None).await.unwrap();
+
+        let (kept, skipped) =
+            crate::http::ai_classify::dedup_targets(&store, std::slice::from_ref(&task))
+                .await
+                .unwrap();
+        assert_eq!(
+            kept.len(),
+            1,
+            "a Direction created between proposing and rejecting must already count as \
+             \"new\" — the situation-changed basis is proposed_at, not rejected_at: {skipped:?}"
+        );
+        assert!(skipped.is_empty());
+    }
+
+    /// T5.7.2 review round 2 (M5): a single `sin90_proposal_rejections` row
+    /// whose joined `sin90_proposals.ops` is corrupted JSON must not fail
+    /// `list_rejected_ops`/`dedup_targets` for EVERY OTHER task — it is
+    /// logged and skipped (`Sin90Store::list_rejected_ops`'s own doc), not
+    /// propagated as an `Err` that would take an unrelated task's own valid
+    /// suppression down with it. Mutation target: revert `list_rejected_ops`
+    /// to a bare `.map(..).collect::<Result<Vec<_>>>()` and this goes red —
+    /// `dedup_targets` returns `Err`, and the `.unwrap()` below panics.
+    #[tokio::test]
+    async fn dedup_targets_skips_a_row_with_unparseable_ops_json() {
+        let (_app, _sink, store) = test_app_with_store().await;
+        let direction_a = store
+            .create_direction("Rejected target", "2026-Q4", None)
+            .await
+            .unwrap();
+        let task = store
+            .create_task(
+                "Ambiguous task",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // A genuine, well-formed rejection for `task` — the suppression
+        // this test confirms still works.
+        let draft = crate::ai::ProposalDraft {
+            id: "p-m5-good".into(),
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task.id.clone(),
+                direction_id: direction_a.id.clone(),
+            }],
+            rationale: None,
+        };
+        crate::ai::AiSink::submit(&store, Capability::Classify, draft, call_rec("c-m5-good"))
+            .await
+            .unwrap();
+        store.reject_proposal("p-m5-good", None).await.unwrap();
+
+        // A SEPARATE, corrupted row: a proposal whose `ops` column is not
+        // valid JSON at all, rejected under the same capability.
+        sqlx::query(
+            "INSERT INTO sin90_proposals (id, status, source, ops, created_at)
+             VALUES ('p-m5-corrupt', 'rejected', 'rule', 'not valid json {{{', ?)",
+        )
+        .bind(crate::core::now_iso8601())
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sin90_proposal_rejections
+                 (id, proposal_id, capability_source, proposal_source, ops_summary,
+                  proposed_at, rejected_at)
+             VALUES ('r-m5-corrupt', 'p-m5-corrupt', 'classify', 'rule', 'corrupt', ?, ?)",
+        )
+        .bind(crate::core::now_iso8601())
+        .bind(crate::core::now_iso8601())
+        .execute(store.pool())
+        .await
+        .unwrap();
+
         let (kept, skipped) =
             crate::http::ai_classify::dedup_targets(&store, std::slice::from_ref(&task))
                 .await
                 .unwrap();
         assert!(
             kept.is_empty(),
-            "the pending proposal must still block this task"
+            "the task's OWN valid rejection must still suppress it despite the corrupt row: {kept:?}"
         );
-        assert_eq!(skipped, vec![task.id.clone()]);
+        assert_eq!(skipped, vec![(task.id.clone(), "suppressed_rejected")]);
+    }
 
-        // Reject it (store level directly — the actor gate is an HTTP-layer
-        // concern, pinned separately by `proposal_reject_by_automation_key_
-        // is_403_and_nothing_changes`).
-        store
-            .reject_proposal("p-dedup-reject-1", None)
+    /// Positive control ②: no edit to the task at all, but a brand-new
+    /// non-terminal Direction appears after the rejection — suppression
+    /// lifts (the "situation changed" OR's second leg).
+    #[tokio::test]
+    async fn suppress_rejected_classify_positive_control_new_direction_reproposes() {
+        let (_app, _sink, store) = test_app_with_store().await;
+        let direction = store
+            .create_direction("Side quest", "2026-Q4", None)
             .await
             .unwrap();
+        let task = store
+            .create_task(
+                "Ambiguous task",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+        let draft = crate::ai::ProposalDraft {
+            id: "p-suppress-3".into(),
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task.id.clone(),
+                direction_id: direction.id.clone(),
+            }],
+            rationale: None,
+        };
+        crate::ai::AiSink::submit(
+            &store,
+            Capability::Classify,
+            draft,
+            call_rec("c-suppress-3"),
+        )
+        .await
+        .unwrap();
+        store.reject_proposal("p-suppress-3", None).await.unwrap();
 
-        // The judgement: dedup no longer blocks the task.
+        let (kept, _) =
+            crate::http::ai_classify::dedup_targets(&store, std::slice::from_ref(&task))
+                .await
+                .unwrap();
+        assert!(
+            kept.is_empty(),
+            "no new Direction yet — must stay suppressed"
+        );
+
+        let fresh = store
+            .create_direction("Freshly created", "2026-Q4", None)
+            .await
+            .unwrap();
+        // Force this Direction's `created_at` forward past `rejected_at` —
+        // same same-second tie concern the positive control above has.
+        crate::store::test_hooks::set_direction_created_at(
+            &store,
+            &fresh.id,
+            "2099-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+
         let (kept2, skipped2) =
             crate::http::ai_classify::dedup_targets(&store, std::slice::from_ref(&task))
                 .await
@@ -5050,17 +5362,198 @@ mod ai_classify {
         assert_eq!(
             kept2.len(),
             1,
-            "a rejected proposal must no longer block its target from dedup"
+            "a new non-terminal Direction must lift the suppression"
         );
         assert!(skipped2.is_empty());
-
-        // The rejection log correctly attributes this to `classify`.
-        let rows = crate::store::test_hooks::proposal_rejection_rows(&store, "p-dedup-reject-1")
-            .await
-            .unwrap();
-        assert_eq!(rows[0].capability_source, "classify");
     }
 
+    /// No-retry negative control, the acceptance line's last bullet: without
+    /// EITHER leg of "situation changed", a rejected suggestion never comes
+    /// back on its own, no matter how many times dedup runs.
+    #[tokio::test]
+    async fn suppress_rejected_classify_no_retry_without_situation_change() {
+        let (_app, _sink, store) = test_app_with_store().await;
+        let direction = store
+            .create_direction("Side quest", "2026-Q4", None)
+            .await
+            .unwrap();
+        let task = store
+            .create_task(
+                "Ambiguous task",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+        let draft = crate::ai::ProposalDraft {
+            id: "p-suppress-4".into(),
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task.id.clone(),
+                direction_id: direction.id.clone(),
+            }],
+            rationale: None,
+        };
+        crate::ai::AiSink::submit(
+            &store,
+            Capability::Classify,
+            draft,
+            call_rec("c-suppress-4"),
+        )
+        .await
+        .unwrap();
+        store.reject_proposal("p-suppress-4", None).await.unwrap();
+
+        for _ in 0..3 {
+            let (kept, skipped) =
+                crate::http::ai_classify::dedup_targets(&store, std::slice::from_ref(&task))
+                    .await
+                    .unwrap();
+            assert!(kept.is_empty());
+            assert_eq!(skipped, vec![(task.id.clone(), "suppressed_rejected")]);
+        }
+    }
+
+    /// T5.7.2 review round 2 (M1): the OLD version of this test's "angle
+    /// (a)" assertion — "an accepted real-Direction assignment leaves the
+    /// inbox for good" — was a FALSE POSITIVE: it is trivially true simply
+    /// because a real (non-待定, non-NULL) `direction_id` is never inbox-
+    /// eligible at all (`AiReadModel::inbox_task`'s own membership test),
+    /// regardless of any "was this task modified" judgement whatsoever — it
+    /// never actually exercised the trap the doc comment claimed to guard.
+    /// Replaced with the REAL trap `docs/DESIGN-LIFEOS.md` §2 #31 calls out:
+    /// an ACCEPTED, UNRELATED `ReorderTasks` proposal bumps
+    /// `sin90_tasks.updated_at` for EVERY task in the reordered week
+    /// (`Sin90Op::ReorderTasks`'s apply, `store/repo.rs`) — including one
+    /// still sitting, untouched, in the classify inbox — and that bump must
+    /// never be mistaken for "a human edited this task" (a raw `updated_at`
+    /// compare used to be fooled by exactly this;
+    /// `Sin90Store::task_modified_since`'s own doc has the full story).
+    /// Mutation target: revert `task_modified_since` to a plain
+    /// `sin90_tasks.updated_at > since` compare and this goes red (the
+    /// reorder bump wrongly lifts the suppression).
+    #[tokio::test]
+    async fn suppress_rejected_classify_accept_bump_does_not_count_as_modification() {
+        let (_app, _sink, store) = test_app_with_store().await;
+        let direction_a = store
+            .create_direction("Rejected target", "2026-Q4", None)
+            .await
+            .unwrap();
+        let week = store.create_week("2026-W22").await.unwrap();
+
+        // The task lives in `week` (so an unrelated `ReorderTasks` can touch
+        // it) with `direction_id: None` — still a normal classify-inbox
+        // candidate; week membership and Direction assignment are
+        // independent axes.
+        let seed = crate::core::Sin90Proposal {
+            id: "seed-reorder-trap".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![crate::core::Sin90Op::CreateTasks {
+                week_id: week.id.clone(),
+                tasks: vec![
+                    crate::core::NewTask {
+                        title: "Ambiguous task".into(),
+                        direction_id: None,
+                    },
+                    crate::core::NewTask {
+                        title: "sibling".into(),
+                        direction_id: None,
+                    },
+                ],
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&seed).await.unwrap();
+        store.apply_proposal(&seed.id).await.unwrap();
+        let task_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM sin90_tasks WHERE week_id = ? ORDER BY sort_key ASC",
+        )
+        .bind(&week.id)
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        let task_id = task_ids[0].clone();
+
+        // Round 1: propose direction_a for the task, human rejects it.
+        let draft_a = crate::ai::ProposalDraft {
+            id: "p-suppress-trap-1".into(),
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task_id.clone(),
+                direction_id: direction_a.id.clone(),
+            }],
+            rationale: None,
+        };
+        crate::ai::AiSink::submit(
+            &store,
+            Capability::Classify,
+            draft_a,
+            call_rec("c-suppress-trap-1"),
+        )
+        .await
+        .unwrap();
+        store
+            .reject_proposal("p-suppress-trap-1", None)
+            .await
+            .unwrap();
+
+        // Round 2: an UNRELATED, ACCEPTED `ReorderTasks` for the whole week
+        // — bumps `updated_at` for every task in it, including ours, but is
+        // not a human editing THIS task's content.
+        let reorder = crate::ai::ProposalDraft {
+            id: "p-reorder-trap".into(),
+            ops: vec![crate::core::Sin90Op::ReorderTasks {
+                week_id: week.id.clone(),
+                order: vec![task_ids[1].clone(), task_ids[0].clone()],
+            }],
+            rationale: None,
+        };
+        let reorder_rec = crate::ai::AiCallRecord {
+            id: "c-reorder-trap".into(),
+            run_id: "run-reorder-trap".into(),
+            task_kind: Capability::Propose,
+            engine: crate::ai::Engine::Reflex,
+            fallback_from: None,
+            served_tier: None,
+            model_id: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            latency_ms: 0,
+            ok: true,
+            error_kind: None,
+            proposal_id: None,
+            at: "2026-09-24T00:00:00Z".into(),
+        };
+        crate::ai::AiSink::submit(&store, Capability::Propose, reorder, reorder_rec)
+            .await
+            .unwrap();
+        store.apply_proposal("p-reorder-trap").await.unwrap();
+
+        let refetched = store
+            .list_tasks(None, None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == task_id)
+            .expect("task still exists");
+        assert!(
+            refetched.direction_id.is_none(),
+            "still un-Direction-ed, still a normal classify candidate"
+        );
+
+        let (kept, skipped) =
+            crate::http::ai_classify::dedup_targets(&store, std::slice::from_ref(&refetched))
+                .await
+                .unwrap();
+        assert!(
+            kept.is_empty(),
+            "an accepted, unrelated ReorderTasks bump must not count as \
+             \"task modified\" — suppression must hold"
+        );
+        assert_eq!(skipped, vec![(task_id.clone(), "suppressed_rejected")]);
+    }
     /// L3 (T5.7.2 review round 3): `POST /tasks` (`Sin90Store::create_task`)
     /// is a path INTO 待定 that never goes through `AssignTaskDirection` at
     /// all — a task filed straight in with `direction_id = "sin90-triage"`
