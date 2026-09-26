@@ -270,6 +270,25 @@ impl KernelClients {
         self.transport.call(method, params).await
     }
 
+    /// Like [`Self::call`], but with an overridable response deadline
+    /// instead of the implicit [`transport::RESPONSE_TIMEOUT`] (35s) —
+    /// `model::ModelClient`'s own 125s ceiling (T5.1.2, J10a) is the first
+    /// production caller: `_a24/model/complete`'s own method timeout is
+    /// 120s (ME4-S2 §5.2's `MODEL_CALL_TIMEOUT`), so a caller with a
+    /// SHORTER client-side deadline would time itself out locally before
+    /// the kernel's own "the model took too long" answer ever arrives,
+    /// discarding the more specific error.
+    pub(crate) async fn call_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        response_timeout: Duration,
+    ) -> Result<Value, transport::TransportError> {
+        self.transport
+            .call_with_timeout(method, params, response_timeout)
+            .await
+    }
+
     /// Like [`Self::call`], but waits up to `slot_wait` for an in-flight
     /// slot instead of failing immediately — see
     /// [`transport::Transport::call_with_slot_wait`]. `pub(crate)`, same

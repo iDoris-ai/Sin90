@@ -43,6 +43,12 @@ chrono-tz = "=0.10.4"
 test-hooks = []
 
 [dev-dependencies]
+# L2 (2026-09-26 review): `#[tokio::test(start_paused = true)]` +
+# `tokio::time::{advance, pause}` — `model::ModelClient`'s own 125s-timeout
+# test drives the virtual clock instead of a real 125-second sleep. Cargo
+# unions this feature into the main `tokio` dependency ONLY for test builds
+# (dev-dependency feature additions don't leak into a normal build).
+tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
