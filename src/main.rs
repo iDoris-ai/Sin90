@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use sin90::adapter_agent24::clients::SchedulerClient;
+use sin90::adapter_agent24::clients::{MemoryClient, SchedulerClient};
 use sin90::adapter_agent24::reconciler;
 use sin90::adapter_agent24::{
     listener_from_fd, wire_kernel_clients, FatalHook, KernelClients, SpawnEnv,
@@ -165,19 +165,41 @@ async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
     // it. Dropping it early would close the kernel's only connection for
     // this generation, which the kernel treats as this generation crashing.
     let (sink, model, clients_handle) = wire_kernel_clients(&offer, Arc::new(clients));
-    // T3.3.2: the reconciler only ever runs HERE, mounted mode — it needs a
-    // real `SchedulerClient`, which only exists once the kernel's `Offer`
-    // actually granted `_a24/scheduler/` (`SchedulerClient::new`'s own doc).
-    // `run_standalone` below never constructs one at all, so there is no
-    // reconciler task there — spec.md M3's "无内核（standalone）时 outbox 保持
-    // pending 不报错" holds by construction, not by an extra check: with no
-    // task pulling from `sin90_outbox`, pending rows simply sit there.
-    if let Some(scheduler) = SchedulerClient::new(&clients_handle) {
-        reconciler::spawn_pump_loop(store.clone(), scheduler);
-    } else {
+    // T3.3.2 / T4.4.1 review M1: `_a24/scheduler/` and `_a24/memory/private/`
+    // are granted INDEPENDENTLY — built as two separate `Option`s and
+    // bundled into one `ReconcilerClients` (`adapter_agent24::reconciler`'s
+    // own doc on that struct explains why: the OLD code only ever started
+    // the pump when `scheduler` was `Some`, so a generation granted ONLY
+    // memory never got a pump at all, and its `memory.remember` rows sat
+    // pending with no consumer — not because of anything about memory
+    // itself). `run_standalone` below never constructs either, so there is
+    // no reconciler task there at all — spec.md M3's "无内核（standalone）时
+    // outbox 保持 pending 不报错" holds by construction, not by an extra check.
+    let scheduler = SchedulerClient::new(&clients_handle);
+    let memory = MemoryClient::new(&clients_handle);
+    if scheduler.is_none() {
         tracing::warn!(
             "sin90: kernel did not grant the scheduler capability; Routine cron changes will sit \
-             in sin90_outbox as pending until a future generation is granted it"
+             in sin90_outbox as pending (the reconciler pump still runs for whatever capability \
+             WAS granted — e.g. memory.remember rows, if `_a24/memory/private/` was)"
+        );
+    }
+    if memory.is_none() {
+        tracing::warn!(
+            "sin90: kernel did not grant the memory capability; a finalized Review's derived \
+             summary will sit in sin90_outbox as pending (the reconciler pump still runs for \
+             whatever capability WAS granted — e.g. Routine scheduling, if `_a24/scheduler/` \
+             was)"
+        );
+    }
+    let reconciler_clients = reconciler::ReconcilerClients { scheduler, memory };
+    if reconciler_clients.any() {
+        reconciler::spawn_pump_loop(store.clone(), reconciler_clients);
+    } else {
+        tracing::warn!(
+            "sin90: kernel granted neither the scheduler nor the memory capability; the outbox \
+             reconciler pump will not run at all — sin90_outbox rows of any kind will sit \
+             pending until a future generation is granted at least one of them"
         );
     }
     // T3.5.1, `test-hooks` only: clone the store BEFORE it moves into

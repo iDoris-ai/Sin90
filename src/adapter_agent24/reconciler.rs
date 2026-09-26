@@ -68,16 +68,64 @@
 //! [`apply_one`] (mid-drain) and [`pump_tick`]'s own full-reconcile call
 //! surface this as [`PumpControl::Stop`], which `spawn_pump_loop` obeys by
 //! returning immediately, with no further retries or backoff.
+//!
+//! **T4.4.1** adds a THIRD outbox kind [`apply_one`] understands:
+//! `memory.remember` — the derived summary of a just-finalized Review
+//! (`store::repo::finalize_review`, design DESIGN-LIFEOS.md §2 #24/§4.1),
+//! landed via `_a24/memory/private/remember`. It shares every piece of this
+//! module's infrastructure with the scheduler kinds (the `version` CAS, the
+//! `outbox_row_is_current` re-read, the same error classification table,
+//! the same pump/backoff) with exactly one twist: unlike
+//! `_a24/scheduler/upsert` (dedups by `key` on the kernel side, so a blind
+//! retry converges), `_a24/memory/private/remember` is **not idempotent**
+//! (`MemoryClient::remember`'s own doc: the kernel mints a brand-new id on
+//! EVERY successful call, with no dedup key on the wire at all) — a naive
+//! retry after an ambiguous outcome (`ConnectionLost`/`timeout`, or a crash
+//! between the kernel accepting the call and this row landing `done`) would
+//! plant a second memory for the same Review. [`remember_review_summary`]
+//! closes this at Sin90's OWN layer, exactly as that client's doc comment
+//! suggests: before ever calling `remember`, it calls `recall` for the SAME
+//! `dedup_key` marker this row's own `desired.dedup_key` carries (`review:
+//! <id>`, `store::repo::review_remember_dedup_key`) and treats a match as
+//! already-done — no NEW local table, no second source of truth, just a
+//! kernel-side check using the one marker this row already carries.
+//! Finalizing a Review is itself a one-way `draft -> finalized` transition
+//! (`core::transitions::review_transition_allowed`) with no un-finalize path
+//! today, so `finalize_review` can enqueue this row's `dedup_key` AT MOST
+//! ONCE per Review ever — the `recall` pre-check exists purely to make a
+//! RETRY of that one enqueue safe, not to arbitrate between two different
+//! "final" versions of the same Review's body (there is no such thing yet;
+//! see [`remember_review_summary`]'s doc for what a future un-finalize/
+//! re-finalize would need to change here).
+//!
+//! **T4.4.1 review M2/L4 — `recall`'s real cost.** The kernel's `recall`
+//! (verified against the running implementation, 2026-09) is a
+//! case-insensitive SUBSTRING match over `kind` or the JSON-serialized
+//! `body`, scanned newest-to-oldest, capped at 2000 lines of underlying
+//! storage PER CALL regardless of `page_size` (itself capped at 50) — a
+//! non-empty `cursor` means that 2000-line window was exhausted with more
+//! (matching or not) history still unscanned, not "there are more matches."
+//! [`memory_recall_finds_dedup_key`] therefore follows `cursor` across up to
+//! [`RECALL_PRECHECK_MAX_PAGES`] calls before it can say a `dedup_key` is
+//! DEFINITELY absent — each pre-check can cost up to
+//! `RECALL_PRECHECK_MAX_PAGES * 2000` lines of kernel-side scanning. Under a
+//! large backlog of pending `memory.remember` rows landing at once, this is
+//! real load the kernel may itself throttle with `RateLimited` (which this
+//! pump already treats as "back off the whole batch," same as any other
+//! kernel-reported capacity signal) — an accepted cost, not a bug: the
+//! alternative (trusting a single, possibly-incomplete page) risks planting
+//! a duplicate memory, which is strictly worse than a slower pump.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 use serde::Deserialize;
+use serde_json::{json, Map, Value};
 
 use crate::adapter_agent24::clients::scheduler::{
     ModuleScheduleState, ModuleSpec, SchedulerClient,
 };
-use crate::adapter_agent24::clients::ClientError;
+use crate::adapter_agent24::clients::{ClientError, MemoryClient};
 use crate::core::{iso8601_after_secs, now_iso8601, RoutineStatus};
 use crate::store::{OutboxRow, Sin90Store, StoreError};
 
@@ -117,6 +165,36 @@ pub enum ReconcileError {
     Kernel(#[from] ClientError),
 }
 
+/// T4.4.1 review M1: bundles the reconciler's kernel-facing clients. A
+/// generation's `Offer` grants `_a24/scheduler/` and `_a24/memory/private/`
+/// INDEPENDENTLY (architecture.md 不可破边界 #7: "只声明真正用到的能力；代码按
+/// 「句柄可能不在」写") — before this struct, [`spawn_pump_loop`] took an
+/// OWNED, mandatory `SchedulerClient`, so `main.rs` never even started the
+/// pump when `_a24/scheduler/` was missing, even if `_a24/memory/private/`
+/// WAS granted (a `memory.remember` row would then sit `pending` forever
+/// with no consumer at all, not because of anything about memory itself).
+/// Bundling both as independent `Option`s lets [`spawn_pump_loop`] start the
+/// instant EITHER is `Some`, and lets [`apply_one`] skip only the kind(s) it
+/// cannot serve (H1 review) rather than the whole pump refusing to exist.
+#[derive(Clone)]
+pub struct ReconcilerClients {
+    pub scheduler: Option<SchedulerClient>,
+    pub memory: Option<MemoryClient>,
+}
+
+impl ReconcilerClients {
+    /// Whether there is any reason for the pump to run at all — `main.rs`
+    /// only calls [`spawn_pump_loop`] when this is `true`; when both are
+    /// `None` (this generation's `Offer` granted neither capability), there
+    /// is nothing whatsoever for a pump to do, and NOT spawning one at all
+    /// is the correct degrade — same posture `wire_kernel_clients` already
+    /// takes when an `Offer` grants no capability Sin90 uses at all.
+    #[must_use]
+    pub fn any(&self) -> bool {
+        self.scheduler.is_some() || self.memory.is_some()
+    }
+}
+
 /// The wire shape of a `scheduler.upsert` outbox row's `desired` column
 /// (`store::repo::routine_outbox_upsert_desired`): `{key, spec: {cron, tz},
 /// enabled}`. Note this is NOT [`ModuleSpec`]'s own tagged shape — `desired`
@@ -142,8 +220,163 @@ struct DeleteDesired {
     key: String,
 }
 
+/// `memory.remember` outbox row's `desired` column
+/// (`store::repo::review_remember_desired`, T4.4.1): a derived, already-
+/// truncated (`store::repo::REVIEW_SUMMARY_MAX_CHARS`) summary of a
+/// just-finalized Review, plus enough identity to both send to the kernel
+/// AND to recognize on a later `recall` (`dedup_key`). `dedup_key` here is
+/// deliberately the SAME string as `OutboxRow::dedup_key` on this row — not
+/// re-derived independently — see [`remember_review_summary`].
+#[derive(Debug, Deserialize)]
+struct RememberDesired {
+    dedup_key: String,
+    review_id: String,
+    review_kind: String,
+    period: String,
+    summary: String,
+    finalized_at: String,
+}
+
 fn parse_desired<T: serde::de::DeserializeOwned>(row: &OutboxRow) -> Result<T, serde_json::Error> {
     serde_json::from_value(row.desired.clone())
+}
+
+/// T4.4.1 review M2: how many `recall` pages [`memory_recall_finds_dedup_key`]
+/// follows via `cursor` before giving up. The kernel's own `recall` caps
+/// each CALL at scanning 2000 lines of underlying storage (newest to
+/// oldest) regardless of `page_size` — a non-empty `cursor` means that
+/// window was exhausted with more (matching or not) history left unscanned,
+/// NOT "there are more matches." Following the cursor to completion is
+/// therefore the only way to know FOR SURE a `dedup_key` marker is absent;
+/// 10 pages (≤ 20 000 lines of kernel-side scan) bounds a persistently
+/// large/busy history before this pre-check reports
+/// [`RecallCheck::Inconclusive`] instead of scanning forever — see the
+/// module doc's own M2/L4 paragraph for the accepted cost.
+const RECALL_PRECHECK_MAX_PAGES: usize = 10;
+
+/// `recall`'s own maximum `page_size` (module doc: "page_size 上限 50") —
+/// using the max shrinks the number of pages [`memory_recall_finds_dedup_key`]
+/// needs to exhaust a given amount of history.
+const RECALL_PRECHECK_PAGE_SIZE: usize = 50;
+
+/// The outcome of [`memory_recall_finds_dedup_key`]'s pre-check.
+enum RecallCheck {
+    /// A memory bearing the exact `dedup_key` marker was found — its own
+    /// kernel-minted id, for [`remember_review_summary`] to hand back
+    /// unchanged (T4.4.1 review L5: so the SAME `result_ref` lands on the
+    /// outbox row whether this row's memory was just-created or was found
+    /// already there from an earlier, ambiguously-outcomed attempt).
+    Found(String),
+    /// `cursor` ran out (became `None`) WITHOUT ever matching — the kernel's
+    /// entire relevant history was scanned; a `remember` call is safe.
+    NotFound,
+    /// T4.4.1 review M2: scanned [`RECALL_PRECHECK_MAX_PAGES`] pages and
+    /// `cursor` was STILL non-empty — genuinely UNKNOWN whether a match
+    /// exists further back. Callers must treat this as "try again later,"
+    /// never as "absent" (the whole point of paginating instead of trusting
+    /// one page: a false "not found" here would plant a duplicate memory).
+    Inconclusive,
+}
+
+/// T4.4.1 review M2: has a memory with this EXACT `dedup_key` marker
+/// already been written? Follows `recall`'s own `cursor` across up to
+/// [`RECALL_PRECHECK_MAX_PAGES`] pages, checking each candidate's
+/// `body.dedup_key` field for an EXACT match on every page — `recall`'s own
+/// substring-match ranking is never trusted for anything beyond "is this
+/// candidate worth checking," only the exact `dedup_key` equality decides a
+/// match.
+async fn memory_recall_finds_dedup_key(
+    memory: &MemoryClient,
+    dedup_key: &str,
+) -> Result<RecallCheck, ClientError> {
+    let mut cursor: Option<String> = None;
+    for _ in 0..RECALL_PRECHECK_MAX_PAGES {
+        let page = memory
+            .recall(
+                dedup_key,
+                RECALL_PRECHECK_PAGE_SIZE,
+                cursor.as_deref(),
+                None,
+            )
+            .await?;
+        if let Some(found) = page
+            .items
+            .iter()
+            .find(|item| item.body.get("dedup_key").and_then(Value::as_str) == Some(dedup_key))
+        {
+            return Ok(RecallCheck::Found(found.id.clone()));
+        }
+        match page.cursor {
+            Some(next) => cursor = Some(next),
+            None => return Ok(RecallCheck::NotFound),
+        }
+    }
+    Ok(RecallCheck::Inconclusive)
+}
+
+/// T4.4.1: lands ONE `memory.remember` row onto `_a24/memory/private/
+/// remember` — idempotently, despite that method itself minting a fresh id
+/// on every successful call (`MemoryClient::remember`'s own doc). The
+/// `recall` pre-check in [`memory_recall_finds_dedup_key`] is what makes a
+/// RETRY of this same row (after `ConnectionLost`/`timeout`, or a crash
+/// between the kernel accepting the call and `outbox_mark_done` committing)
+/// safe: if a memory with this row's `dedup_key` already exists, this
+/// returns its id WITHOUT calling `remember` again, and [`apply_one`]'s
+/// caller marks the row `done` (with that SAME id as `result_ref`) exactly
+/// as if `remember` itself had just succeeded.
+///
+/// T4.4.1 review M2: [`RecallCheck::Inconclusive`] (the pre-check could not
+/// scan far enough back to be SURE) is surfaced as `Err(ClientError::Other)`
+/// — NOT treated as "not found." `ClientError::Other` is neither permanent
+/// nor retryable-with-a-hard-guarantee in this crate's own closed set, but
+/// `apply_one`'s classification table's final "everything else" bucket
+/// already retries it with backoff, which is exactly the right response to
+/// "try again later, we genuinely don't know yet."
+///
+/// **Semantics if a Review's finalized content could ever change** (it
+/// cannot today — `core::transitions::review_transition_allowed` is
+/// `draft -> finalized` only, no un-finalize path exists to re-finalize a
+/// changed body): this function's `dedup_key`-only equality check would
+/// treat a "re-finalized with different content" Review as already
+/// remembered and silently skip writing the new summary — WRONG the moment
+/// such a path exists. A future un-finalize/re-finalize feature must widen
+/// the marker this checks (e.g. fold a content hash of `summary` into
+/// `dedup_key`, the same way `store::repo`'s own `ReviewSnap`/`body_sha256`
+/// already tracks a Review's body identity for its Proposal CAS) so a
+/// genuinely different finalized body mints a genuinely new memory instead
+/// of being suppressed as a duplicate.
+async fn remember_review_summary(
+    memory: &MemoryClient,
+    desired: &RememberDesired,
+) -> Result<String, ClientError> {
+    match memory_recall_finds_dedup_key(memory, &desired.dedup_key).await? {
+        RecallCheck::Found(id) => return Ok(id),
+        RecallCheck::NotFound => {}
+        RecallCheck::Inconclusive => {
+            return Err(ClientError::Other(format!(
+                "recall pre-check for dedup_key {:?} did not finish within {} pages (cursor \
+                 still non-empty) — cannot yet tell whether a memory already exists; retrying \
+                 later rather than risking a duplicate remember",
+                desired.dedup_key, RECALL_PRECHECK_MAX_PAGES
+            )));
+        }
+    }
+    let mut body = Map::new();
+    body.insert("dedup_key".to_string(), json!(desired.dedup_key));
+    body.insert("review_id".to_string(), json!(desired.review_id));
+    body.insert("review_kind".to_string(), json!(desired.review_kind));
+    body.insert("period".to_string(), json!(desired.period));
+    body.insert("summary".to_string(), json!(desired.summary));
+    body.insert("finalized_at".to_string(), json!(desired.finalized_at));
+    // `kind` here is the MEMORY client's own free-form category param
+    // (`MemoryClient::remember`'s doc: "Sin90's own free-form category") —
+    // a different axis from `desired.review_kind` (the Review's
+    // daily/weekly/rhythm kind) and from this outbox row's OWN `kind`
+    // column (`"memory.remember"`, the reconciler's dispatch tag). All
+    // three happen to contain the word "kind" but answer different
+    // questions; `"review.summary"` mirrors `MemoryClient`'s own doctest.
+    let remembered = memory.remember("review.summary", body, None).await?;
+    Ok(remembered.id)
 }
 
 /// spec.md M3: "退避（1s 起，×2，上限 5min）". `attempts_after_increment` is the
@@ -275,13 +508,45 @@ enum RowOutcome {
 ///   reached [`OTHER_BUCKET_EXHAUSTION_THRESHOLD`], in which case it is
 ///   marked `failed(kind = "exhausted")` with a `warn!` instead.
 ///
+/// A successful call's `Result::Ok` payload (T4.4.1 review L5) is now
+/// `Option<String>` rather than `()`: an optional kernel-minted identifier
+/// the call produced, persisted onto the row's `result_ref` column by
+/// `outbox_mark_done` — `Some(id)` for `memory.remember`
+/// ([`remember_review_summary`]'s own return value), `None` for
+/// `scheduler.upsert`/`.delete` (neither produces a comparable "fresh
+/// identity" worth recording).
+///
+/// **T4.4.1**: `memory.remember` rows go through the exact same table above
+/// once [`remember_review_summary`] hands back a `Result<String, ClientError>`
+/// — including the `recall`-based idempotency check that function does
+/// BEFORE ever calling `remember` (see its own doc).
+///
+/// **T4.4.1 review H1**: a row whose kind needs a capability this
+/// generation's `Offer` did NOT grant (`clients.scheduler`/`clients.memory`
+/// is `None` for a `scheduler.*`/`memory.remember` row respectively) is
+/// left COMPLETELY UNTOUCHED — no store write at all, [`RowOutcome::
+/// Continue`] — rather than marked `failed`. The earlier round of this task
+/// marked it `failed(forbidden)`, which is WRONG: a missing grant is a
+/// property of THIS GENERATION (fixed at handshake time, architecture.md:
+/// "no reconnect, no `Offer` change after construction"), not a property of
+/// the row itself — a LATER generation (after a restart, granted the
+/// capability this time) can still land it, but only if it is still sitting
+/// `pending` when that generation's pump starts draining. `failed` is a
+/// terminal state nothing ever re-activates (`outbox_due_pending` only
+/// reads `pending`), so marking it `failed` here would have silently and
+/// permanently discarded a correction/summary a future generation could
+/// have delivered. Leaving it untouched means it stays due on literally
+/// every subsequent tick of a generation that still lacks the capability —
+/// accepted as harmless (a cheap local read, no wire call) rather than
+/// worth a dedicated backoff of its own.
+///
 /// A row whose `kind` this DISPATCH does not recognize at all (never reaches
 /// the kernel-call table above) is a SEPARATE case from a bad payload for a
 /// kind it DOES recognize — see the `other =>` arm's own doc below for why
 /// the two must not be conflated.
 async fn apply_one(
     store: &Sin90Store,
-    scheduler: &SchedulerClient,
+    clients: &ReconcilerClients,
     row: &OutboxRow,
 ) -> Result<RowOutcome, ReconcileError> {
     if !store.outbox_row_is_current(&row.id, row.version).await? {
@@ -290,18 +555,23 @@ async fn apply_one(
         return Ok(RowOutcome::Continue);
     }
     let is_delete = row.kind == "scheduler.delete";
-    let result: Result<(), ClientError> = match row.kind.as_str() {
+    let result: Result<Option<String>, ClientError> = match row.kind.as_str() {
         "scheduler.upsert" => match parse_desired::<UpsertDesired>(row) {
-            Ok(desired) => {
-                let spec = ModuleSpec::Cron {
-                    expr: desired.spec.cron,
-                    tz: Some(desired.spec.tz),
-                };
-                scheduler
-                    .upsert(&desired.key, &spec, desired.enabled, None, None)
-                    .await
-                    .map(|_| ())
-            }
+            Ok(desired) => match &clients.scheduler {
+                Some(scheduler) => {
+                    let spec = ModuleSpec::Cron {
+                        expr: desired.spec.cron,
+                        tz: Some(desired.spec.tz),
+                    };
+                    scheduler
+                        .upsert(&desired.key, &spec, desired.enabled, None, None)
+                        .await
+                        .map(|_| None)
+                }
+                // H1 review: see this function's own doc — a missing grant
+                // is skipped, never marked `failed`.
+                None => return Ok(RowOutcome::Continue),
+            },
             Err(e) => {
                 // H3 review: a bad row must not stall the whole pump — mark
                 // it failed and move on, instead of propagating an error
@@ -319,7 +589,10 @@ async fn apply_one(
             }
         },
         "scheduler.delete" => match parse_desired::<DeleteDesired>(row) {
-            Ok(desired) => scheduler.delete(&desired.key, None).await.map(|_| ()),
+            Ok(desired) => match &clients.scheduler {
+                Some(scheduler) => scheduler.delete(&desired.key, None).await.map(|_| None),
+                None => return Ok(RowOutcome::Continue),
+            },
             Err(e) => {
                 store
                     .outbox_mark_failed(
@@ -327,6 +600,23 @@ async fn apply_one(
                         row.version,
                         "bad_desired",
                         &format!("scheduler.delete desired payload: {e}"),
+                    )
+                    .await?;
+                return Ok(RowOutcome::Continue);
+            }
+        },
+        "memory.remember" => match parse_desired::<RememberDesired>(row) {
+            Ok(desired) => match &clients.memory {
+                Some(memory) => remember_review_summary(memory, &desired).await.map(Some),
+                None => return Ok(RowOutcome::Continue),
+            },
+            Err(e) => {
+                store
+                    .outbox_mark_failed(
+                        &row.id,
+                        row.version,
+                        "bad_desired",
+                        &format!("memory.remember desired payload: {e}"),
                     )
                     .await?;
                 return Ok(RowOutcome::Continue);
@@ -391,8 +681,10 @@ async fn apply_one(
     };
 
     match result {
-        Ok(()) => {
-            store.outbox_mark_done(&row.id, row.version, None).await?;
+        Ok(result_ref) => {
+            store
+                .outbox_mark_done(&row.id, row.version, result_ref.as_deref())
+                .await?;
             Ok(RowOutcome::Continue)
         }
         // `delete` + `NotFound` = the kernel already agrees this key is
@@ -500,12 +792,12 @@ pub enum PumpControl {
 /// in the future) instead of sleeping through a real backoff window.
 async fn drain_pending_before(
     store: &Sin90Store,
-    scheduler: &SchedulerClient,
+    clients: &ReconcilerClients,
     now: &str,
 ) -> Result<PumpControl, ReconcileError> {
     let due = store.outbox_due_pending(now).await?;
     for row in due {
-        match apply_one(store, scheduler, &row).await? {
+        match apply_one(store, clients, &row).await? {
             RowOutcome::Continue => {}
             RowOutcome::StopBatch => break,
             RowOutcome::Revoked => return Ok(PumpControl::Stop),
@@ -520,11 +812,15 @@ async fn drain_pending_before(
 /// 指数退避"). Stops after one pass over whatever was due AT THE MOMENT it
 /// read the list — [`spawn_pump_loop`] is what turns this into an ongoing
 /// pump.
+///
+/// `clients` (T4.4.1 review M1): either half may be `None` — see
+/// [`ReconcilerClients`]'s and [`apply_one`]'s own docs for what happens to
+/// a row whose kind needs the capability that is missing.
 pub async fn drain_pending(
     store: &Sin90Store,
-    scheduler: &SchedulerClient,
+    clients: &ReconcilerClients,
 ) -> Result<PumpControl, ReconcileError> {
-    drain_pending_before(store, scheduler, &now_iso8601()).await
+    drain_pending_before(store, clients, &now_iso8601()).await
 }
 
 /// Sin90's own desired kernel state for one non-retired Routine, as seen at
@@ -611,10 +907,21 @@ async fn local_desired_map(
 /// [`Sin90Store::outbox_enqueue_delete_for_orphan`]'s own docs, for why every
 /// correction re-reads `sin90_routines` fresh rather than trusting the
 /// snapshot this function itself built.
+///
+/// T4.4.1 review M1: a no-op (`Ok(())` immediately) when `clients.scheduler`
+/// is `None` — this function's entire job is comparing Sin90's Routines
+/// against `_a24/scheduler/list`, which is meaningless without a
+/// `SchedulerClient`. A generation granted only `_a24/memory/private/` (not
+/// `_a24/scheduler/`) still runs [`spawn_pump_loop`]/[`pump_tick`] for its
+/// `memory.remember` rows; this is simply the half of that pump with
+/// nothing to do.
 pub async fn reconcile_full(
     store: &Sin90Store,
-    scheduler: &SchedulerClient,
+    clients: &ReconcilerClients,
 ) -> Result<(), ReconcileError> {
+    let Some(scheduler) = &clients.scheduler else {
+        return Ok(());
+    };
     let local = local_desired_map(store).await?;
     let kernel_state = scheduler.list(None).await?;
     let kernel: BTreeMap<String, ModuleScheduleState> = kernel_state
@@ -711,13 +1018,14 @@ pub async fn reconcile_full(
 }
 
 /// Runs [`reconcile_full`] once, then [`drain_pending`] once — what a caller
-/// wanting one complete startup pass end to end reaches for.
+/// wanting one complete startup pass end to end reaches for. `memory`
+/// (T4.4.1): see [`drain_pending`]'s own doc.
 pub async fn reconcile_once(
     store: &Sin90Store,
-    scheduler: &SchedulerClient,
+    clients: &ReconcilerClients,
 ) -> Result<(), ReconcileError> {
-    reconcile_full(store, scheduler).await?;
-    drain_pending(store, scheduler).await?;
+    reconcile_full(store, clients).await?;
+    drain_pending(store, clients).await?;
     Ok(())
 }
 
@@ -778,11 +1086,11 @@ impl PumpState {
 /// calling this function entirely, not just skip the rest of this tick.
 async fn pump_tick(
     store: &Sin90Store,
-    scheduler: &SchedulerClient,
+    clients: &ReconcilerClients,
     mut state: PumpState,
     full_reconcile_interval: Duration,
 ) -> (PumpControl, PumpState) {
-    match drain_pending(store, scheduler).await {
+    match drain_pending(store, clients).await {
         Ok(PumpControl::Stop) => return (PumpControl::Stop, state),
         Ok(PumpControl::Continue) => {}
         Err(e) => tracing::warn!(error = %e, "sin90: outbox pump pass failed"),
@@ -795,7 +1103,7 @@ async fn pump_tick(
         now >= state.next_full_attempt
     };
     if full_reconcile_due {
-        match reconcile_full(store, scheduler).await {
+        match reconcile_full(store, clients).await {
             Ok(()) => {
                 state.full_ok = true;
                 state.full_attempts = 0;
@@ -841,16 +1149,24 @@ async fn pump_tick(
 /// it). The returned `JoinHandle` runs for the process's whole life;
 /// `main.rs` is not expected to ever await or abort it (same posture it
 /// already takes toward `KernelEventSink`'s own worker tasks).
+///
+/// `clients` (T4.4.1 review M1): an owned [`ReconcilerClients`] — callers
+/// (`main.rs`) only call this when [`ReconcilerClients::any`] is `true`
+/// (there is otherwise nothing for a pump to do at all). Either half may
+/// still individually be `None`: a generation granted only ONE of
+/// `_a24/scheduler/`/`_a24/memory/private/` still runs the WHOLE pump, it
+/// just skips (pending, untouched) whichever outbox kind needs the missing
+/// one (see [`apply_one`]'s own H1 doc paragraph).
 pub fn spawn_pump_loop(
     store: Sin90Store,
-    scheduler: SchedulerClient,
+    clients: ReconcilerClients,
 ) -> tokio::task::JoinHandle<()> {
     let notify = store.outbox_notify();
     tokio::spawn(async move {
         let mut state = PumpState::new();
         loop {
             let (control, new_state) =
-                pump_tick(&store, &scheduler, state, FULL_RECONCILE_INTERVAL).await;
+                pump_tick(&store, &clients, state, FULL_RECONCILE_INTERVAL).await;
             state = new_state;
             if control == PumpControl::Stop {
                 return;
@@ -887,6 +1203,24 @@ mod tests {
     async fn scheduler_and_peer() -> (SchedulerClient, FakePeer) {
         let (clients, peer) = fake_kernel(vec!["_a24/scheduler/".to_string()]).await;
         (SchedulerClient::new(&clients).unwrap(), peer)
+    }
+
+    /// T4.4.1 review M1: wraps a bare `SchedulerClient` into a
+    /// [`ReconcilerClients`] with `memory: None` — the shape every function
+    /// under test now takes, for tests that only care about scheduler kinds.
+    fn only_scheduler(scheduler: SchedulerClient) -> ReconcilerClients {
+        ReconcilerClients {
+            scheduler: Some(scheduler),
+            memory: None,
+        }
+    }
+
+    /// T4.4.1 review M1: both clients granted.
+    fn scheduler_and_memory(scheduler: SchedulerClient, memory: MemoryClient) -> ReconcilerClients {
+        ReconcilerClients {
+            scheduler: Some(scheduler),
+            memory: Some(memory),
+        }
     }
 
     fn new_routine(cron: &str) -> NewRoutine {
@@ -1189,11 +1523,23 @@ mod tests {
             let state = PumpState::new(); // `next_full_attempt` due immediately.
                                           // Tick 1: drain (the stale row — rejected), then the startup
                                           // full reconcile (enqueues the correct correction).
-            let (_, state) = pump_tick(&store, &scheduler, state, FULL_RECONCILE_INTERVAL).await;
+            let (_, state) = pump_tick(
+                &store,
+                &only_scheduler(scheduler.clone()),
+                state,
+                FULL_RECONCILE_INTERVAL,
+            )
+            .await;
             // Tick 2: drain (the freshly-corrected row — accepted). Too soon
             // for `FULL_RECONCILE_INTERVAL` to make a second full reconcile
             // due, so this tick is drain-only.
-            pump_tick(&store, &scheduler, state, FULL_RECONCILE_INTERVAL).await;
+            pump_tick(
+                &store,
+                &only_scheduler(scheduler.clone()),
+                state,
+                FULL_RECONCILE_INTERVAL,
+            )
+            .await;
             store
         });
 
@@ -1253,9 +1599,13 @@ mod tests {
         let dedup_key = outbox_dedup_key(&routine.id);
 
         let drain = tokio::spawn(async move {
-            drain_pending_before(&store, &scheduler, "2099-01-01T00:00:00Z")
-                .await
-                .unwrap();
+            drain_pending_before(
+                &store,
+                &only_scheduler(scheduler.clone()),
+                "2099-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
             (store, scheduler)
         });
         let fake = FakeKernel::default().drive(&mut peer, 1).await;
@@ -1268,7 +1618,9 @@ mod tests {
         fake.schedules.remove(&key);
 
         let run = tokio::spawn(async move {
-            reconcile_once(&store, &scheduler).await.unwrap();
+            reconcile_once(&store, &only_scheduler(scheduler.clone()))
+                .await
+                .unwrap();
             store
         });
         let fake = fake.drive(&mut peer, 2).await; // list + 1 upsert
@@ -1299,9 +1651,13 @@ mod tests {
         let dedup_key = outbox_dedup_key(&routine.id);
 
         let drain = tokio::spawn(async move {
-            drain_pending_before(&store, &scheduler, "2099-01-01T00:00:00Z")
-                .await
-                .unwrap();
+            drain_pending_before(
+                &store,
+                &only_scheduler(scheduler.clone()),
+                "2099-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
             (store, scheduler)
         });
         let fake = FakeKernel::default().drive(&mut peer, 1).await;
@@ -1318,9 +1674,13 @@ mod tests {
             .unwrap();
 
         let drain2 = tokio::spawn(async move {
-            drain_pending_before(&store, &scheduler, "2099-01-01T00:00:00Z")
-                .await
-                .unwrap();
+            drain_pending_before(
+                &store,
+                &only_scheduler(scheduler.clone()),
+                "2099-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
             store
         });
         let fake = fake.drive(&mut peer, 1).await;
@@ -1347,7 +1707,9 @@ mod tests {
         let (scheduler, mut peer) = scheduler_and_peer().await;
 
         let run = tokio::spawn(async move {
-            reconcile_once(&store, &scheduler).await.unwrap();
+            reconcile_once(&store, &only_scheduler(scheduler.clone()))
+                .await
+                .unwrap();
             store
         });
         let fake = FakeKernel::default()
@@ -1385,7 +1747,9 @@ mod tests {
         let (scheduler, mut peer) = scheduler_and_peer().await;
 
         let run = tokio::spawn(async move {
-            reconcile_once(&store, &scheduler).await.unwrap();
+            reconcile_once(&store, &only_scheduler(scheduler.clone()))
+                .await
+                .unwrap();
             store
         });
         let fake = FakeKernel::default()
@@ -1448,7 +1812,9 @@ mod tests {
 
         let (scheduler, mut peer) = scheduler_and_peer().await;
         let run = tokio::spawn(async move {
-            reconcile_once(&store, &scheduler).await.unwrap();
+            reconcile_once(&store, &only_scheduler(scheduler.clone()))
+                .await
+                .unwrap();
             store
         });
         let fake = FakeKernel::default()
@@ -1483,9 +1849,13 @@ mod tests {
         let key = kernel_key(&routine.id);
 
         let drain = tokio::spawn(async move {
-            drain_pending_before(&store, &scheduler, "2099-01-01T00:00:00Z")
-                .await
-                .unwrap();
+            drain_pending_before(
+                &store,
+                &only_scheduler(scheduler.clone()),
+                "2099-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
             (store, scheduler)
         });
         let mut fake = FakeKernel::default().drive(&mut peer, 1).await;
@@ -1496,7 +1866,9 @@ mod tests {
         fake.schedules.get_mut(&key).unwrap().cron = "0 8 * * *".to_string();
 
         let run = tokio::spawn(async move {
-            reconcile_once(&store, &scheduler).await.unwrap();
+            reconcile_once(&store, &only_scheduler(scheduler.clone()))
+                .await
+                .unwrap();
             store
         });
         let fake = fake.drive(&mut peer, 2).await; // list + corrective upsert
@@ -1516,9 +1888,13 @@ mod tests {
         let key = kernel_key(&routine.id);
 
         let drain = tokio::spawn(async move {
-            drain_pending_before(&store, &scheduler, "2099-01-01T00:00:00Z")
-                .await
-                .unwrap();
+            drain_pending_before(
+                &store,
+                &only_scheduler(scheduler.clone()),
+                "2099-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
             (store, scheduler)
         });
         let mut fake = FakeKernel::default().drive(&mut peer, 1).await;
@@ -1528,7 +1904,9 @@ mod tests {
             Some("quota exceeded upstream".to_string());
 
         let run = tokio::spawn(async move {
-            reconcile_once(&store, &scheduler).await.unwrap();
+            reconcile_once(&store, &only_scheduler(scheduler.clone()))
+                .await
+                .unwrap();
             store
         });
         let fake = fake.drive(&mut peer, 2).await; // list + recovery upsert
@@ -1551,9 +1929,13 @@ mod tests {
         let dedup_key = outbox_dedup_key(&routine.id);
 
         let drain = tokio::spawn(async move {
-            drain_pending_before(&store, &scheduler, "2099-01-01T00:00:00Z")
-                .await
-                .unwrap();
+            drain_pending_before(
+                &store,
+                &only_scheduler(scheduler.clone()),
+                "2099-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
             (store, scheduler)
         });
         let mut fake = FakeKernel::default().drive(&mut peer, 1).await;
@@ -1564,7 +1946,9 @@ mod tests {
         fake.schedules.get_mut(&key).unwrap().cron = "0  7  *  *  mon,wed,fri".to_string();
 
         let run = tokio::spawn(async move {
-            reconcile_once(&store, &scheduler).await.unwrap();
+            reconcile_once(&store, &only_scheduler(scheduler.clone()))
+                .await
+                .unwrap();
             store
         });
         // Only the `list()` call — no upsert, because normalization must see
@@ -1596,9 +1980,13 @@ mod tests {
         let key = kernel_key(&routine.id);
 
         let drain = tokio::spawn(async move {
-            drain_pending_before(&store, &scheduler, "2099-01-01T00:00:00Z")
-                .await
-                .unwrap();
+            drain_pending_before(
+                &store,
+                &only_scheduler(scheduler.clone()),
+                "2099-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
             (store, scheduler)
         });
         let mut fake = FakeKernel::default().drive(&mut peer, 1).await;
@@ -1607,7 +1995,9 @@ mod tests {
         fake.schedules.get_mut(&key).unwrap().cron = "0 9 * * MON,WED,FRI".to_string();
 
         let run = tokio::spawn(async move {
-            reconcile_once(&store, &scheduler).await.unwrap();
+            reconcile_once(&store, &only_scheduler(scheduler.clone()))
+                .await
+                .unwrap();
             store
         });
         let fake = fake.drive(&mut peer, 2).await; // list + corrective upsert
@@ -1634,9 +2024,13 @@ mod tests {
         let drifted_key = kernel_key(&drifted.id);
 
         let drain = tokio::spawn(async move {
-            drain_pending_before(&store, &scheduler, "2099-01-01T00:00:00Z")
-                .await
-                .unwrap();
+            drain_pending_before(
+                &store,
+                &only_scheduler(scheduler.clone()),
+                "2099-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
             (store, scheduler)
         });
         let mut fake = FakeKernel::default().drive(&mut peer, 2).await; // both initial creates
@@ -1653,7 +2047,9 @@ mod tests {
         fake.schedules.get_mut(&drifted_key).unwrap().enabled = false;
 
         let run = tokio::spawn(async move {
-            reconcile_once(&store, &scheduler).await.unwrap();
+            reconcile_once(&store, &only_scheduler(scheduler.clone()))
+                .await
+                .unwrap();
             (store, scheduler)
         });
         // list + exactly ONE upsert (drifted only — suspended must not get one).
@@ -1697,7 +2093,9 @@ mod tests {
             .user_suspended = false;
         fake.schedules.get_mut(&suspended_key).unwrap().enabled = true;
         let run2 = tokio::spawn(async move {
-            reconcile_full(&store, &scheduler).await.unwrap();
+            reconcile_full(&store, &only_scheduler(scheduler.clone()))
+                .await
+                .unwrap();
             store
         });
         let _fake = fake.drive(&mut peer, 1).await; // just the list — nothing else needed.
@@ -1719,9 +2117,13 @@ mod tests {
         let dedup_key = outbox_dedup_key(&routine.id);
 
         let drain1 = tokio::spawn(async move {
-            drain_pending_before(&store, &scheduler, "2099-01-01T00:00:00Z")
-                .await
-                .unwrap();
+            drain_pending_before(
+                &store,
+                &only_scheduler(scheduler.clone()),
+                "2099-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
             (store, scheduler)
         });
         let fake = FakeKernel::default()
@@ -1746,9 +2148,13 @@ mod tests {
         assert!(rows[0].next_attempt_at.is_some());
 
         let drain2 = tokio::spawn(async move {
-            drain_pending_before(&store, &scheduler, "2099-01-01T00:00:00Z")
-                .await
-                .unwrap();
+            drain_pending_before(
+                &store,
+                &only_scheduler(scheduler.clone()),
+                "2099-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
             store
         });
         let _fake = fake.drive(&mut peer, 1).await;
@@ -1772,9 +2178,13 @@ mod tests {
         let dedup_key = outbox_dedup_key(&routine.id);
 
         let drain = tokio::spawn(async move {
-            drain_pending_before(&store, &scheduler, "2099-01-01T00:00:00Z")
-                .await
-                .unwrap();
+            drain_pending_before(
+                &store,
+                &only_scheduler(scheduler.clone()),
+                "2099-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
             store
         });
         let _fake = FakeKernel::default()
@@ -1818,9 +2228,13 @@ mod tests {
             .unwrap();
 
         let drain = tokio::spawn(async move {
-            drain_pending_before(&store, &scheduler, "2099-01-01T00:00:00Z")
-                .await
-                .unwrap();
+            drain_pending_before(
+                &store,
+                &only_scheduler(scheduler.clone()),
+                "2099-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
             store
         });
         let req = read_request(&mut peer).await;
@@ -1860,9 +2274,13 @@ mod tests {
             .version;
 
         let drain = tokio::spawn(async move {
-            let control = drain_pending_before(&store, &scheduler, "2099-01-01T00:00:00Z")
-                .await
-                .unwrap();
+            let control = drain_pending_before(
+                &store,
+                &only_scheduler(scheduler.clone()),
+                "2099-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
             (control, store)
         });
         let req = read_request(&mut peer).await;
@@ -1910,9 +2328,13 @@ mod tests {
             .unwrap();
 
         let drain = tokio::spawn(async move {
-            drain_pending_before(&store, &scheduler, "2099-01-01T00:00:00Z")
-                .await
-                .unwrap()
+            drain_pending_before(
+                &store,
+                &only_scheduler(scheduler.clone()),
+                "2099-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap()
         });
         let _req = read_request(&mut peer).await;
         drop(peer); // triggers ConnectionLost on the in-flight call.
@@ -1931,7 +2353,13 @@ mod tests {
 
         let task = tokio::spawn(async move {
             let state = PumpState::new();
-            pump_tick(&store, &scheduler, state, FULL_RECONCILE_INTERVAL).await
+            pump_tick(
+                &store,
+                &only_scheduler(scheduler.clone()),
+                state,
+                FULL_RECONCILE_INTERVAL,
+            )
+            .await
         });
         let req = read_request(&mut peer).await;
         assert_eq!(req["method"], "_a24/scheduler/list");
@@ -1954,7 +2382,7 @@ mod tests {
         let store = Sin90Store::open_memory().await.unwrap();
         let (scheduler, mut peer) = scheduler_and_peer().await;
 
-        let handle = spawn_pump_loop(store, scheduler);
+        let handle = spawn_pump_loop(store, only_scheduler(scheduler));
 
         let req = read_request(&mut peer).await;
         assert_eq!(req["method"], "_a24/scheduler/list");
@@ -1983,9 +2411,13 @@ mod tests {
         let second_dedup = outbox_dedup_key(&second.id);
 
         let drain = tokio::spawn(async move {
-            drain_pending_before(&store, &scheduler, "2099-01-01T00:00:00Z")
-                .await
-                .unwrap();
+            drain_pending_before(
+                &store,
+                &only_scheduler(scheduler.clone()),
+                "2099-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
             store
         });
         let req = read_request(&mut peer).await;
@@ -2028,9 +2460,13 @@ mod tests {
         let mut scheduler = scheduler;
         for attempt in 1..=OTHER_BUCKET_EXHAUSTION_THRESHOLD {
             let drain = tokio::spawn(async move {
-                drain_pending_before(&store, &scheduler, "2099-01-01T00:00:00Z")
-                    .await
-                    .unwrap();
+                drain_pending_before(
+                    &store,
+                    &only_scheduler(scheduler.clone()),
+                    "2099-01-01T00:00:00Z",
+                )
+                .await
+                .unwrap();
                 (store, scheduler)
             });
             let req = read_request(&mut peer).await;
@@ -2087,9 +2523,13 @@ mod tests {
         .unwrap();
 
         let run = tokio::spawn(async move {
-            drain_pending_before(&store, &scheduler, "2099-01-01T00:00:00Z")
-                .await
-                .unwrap();
+            drain_pending_before(
+                &store,
+                &only_scheduler(scheduler.clone()),
+                "2099-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
             store
         });
         // The bad row never reaches the wire at all (H3: caught before any
@@ -2159,9 +2599,13 @@ mod tests {
         );
 
         let run = tokio::spawn(async move {
-            drain_pending_before(&store, &scheduler, "2099-01-01T00:00:00Z")
-                .await
-                .unwrap();
+            drain_pending_before(
+                &store,
+                &only_scheduler(scheduler.clone()),
+                "2099-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
             store
         });
         let _fake = FakeKernel::default().drive(&mut peer, 1).await;
@@ -2249,7 +2693,7 @@ mod tests {
         // assertion instead of an actually-hanging test suite.
         let outcome = tokio::time::timeout(
             Duration::from_millis(200),
-            apply_one(&store, &scheduler, &stale_row),
+            apply_one(&store, &only_scheduler(scheduler.clone()), &stale_row),
         )
         .await
         .expect("a stale row must be skipped locally, never block on a kernel round-trip")
@@ -2288,9 +2732,13 @@ mod tests {
 
         let store_for_edit = store.clone();
         let drain = tokio::spawn(async move {
-            drain_pending_before(&store, &scheduler, "2099-01-01T00:00:00Z")
-                .await
-                .unwrap();
+            drain_pending_before(
+                &store,
+                &only_scheduler(scheduler.clone()),
+                "2099-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
             (store, scheduler)
         });
 
@@ -2341,9 +2789,13 @@ mod tests {
 
         // A subsequent drain sends v2, and it lands correctly.
         let drain2 = tokio::spawn(async move {
-            drain_pending_before(&store, &scheduler, "2099-01-01T00:00:00Z")
-                .await
-                .unwrap();
+            drain_pending_before(
+                &store,
+                &only_scheduler(scheduler.clone()),
+                "2099-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
             store
         });
         let fake = FakeKernel::default()
@@ -2381,9 +2833,13 @@ mod tests {
 
         let store_for_edit = store.clone();
         let drain = tokio::spawn(async move {
-            drain_pending_before(&store, &scheduler, "2099-01-01T00:00:00Z")
-                .await
-                .unwrap();
+            drain_pending_before(
+                &store,
+                &only_scheduler(scheduler.clone()),
+                "2099-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
             store
         });
 
@@ -2442,9 +2898,13 @@ mod tests {
 
         let store_for_edit = store.clone();
         let drain = tokio::spawn(async move {
-            drain_pending_before(&store, &scheduler, "2099-01-01T00:00:00Z")
-                .await
-                .unwrap();
+            drain_pending_before(
+                &store,
+                &only_scheduler(scheduler.clone()),
+                "2099-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
             store
         });
 
@@ -2486,8 +2946,13 @@ mod tests {
 
         let task = tokio::spawn(async move {
             let state = PumpState::new();
-            let (control, state) =
-                pump_tick(&store, &scheduler, state, FULL_RECONCILE_INTERVAL).await;
+            let (control, state) = pump_tick(
+                &store,
+                &only_scheduler(scheduler.clone()),
+                state,
+                FULL_RECONCILE_INTERVAL,
+            )
+            .await;
             (control, state, store, scheduler)
         });
 
@@ -2508,7 +2973,13 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1100)).await;
 
         let task2 = tokio::spawn(async move {
-            pump_tick(&store, &scheduler, state, FULL_RECONCILE_INTERVAL).await
+            pump_tick(
+                &store,
+                &only_scheduler(scheduler.clone()),
+                state,
+                FULL_RECONCILE_INTERVAL,
+            )
+            .await
         });
         let req = read_request(&mut peer).await;
         assert_eq!(req["method"], "_a24/scheduler/list");
@@ -2541,7 +3012,7 @@ mod tests {
         let dedup_key = outbox_dedup_key(&routine.id);
         let store_check = store.clone();
 
-        let handle = spawn_pump_loop(store, scheduler);
+        let handle = spawn_pump_loop(store, only_scheduler(scheduler));
 
         // Drain runs BEFORE the full-reconcile due-check in the SAME tick
         // (H1 fix) — the pending upsert must be the FIRST wire call, not
@@ -2589,7 +3060,8 @@ mod tests {
 
         let task = tokio::spawn(async move {
             let state = PumpState::new();
-            let (_, state) = pump_tick(&store, &scheduler, state, interval).await;
+            let (_, state) =
+                pump_tick(&store, &only_scheduler(scheduler.clone()), state, interval).await;
             (state, store, scheduler)
         });
         let req = read_request(&mut peer).await;
@@ -2600,8 +3072,9 @@ mod tests {
 
         tokio::time::sleep(interval + Duration::from_millis(70)).await;
 
-        let task2 =
-            tokio::spawn(async move { pump_tick(&store, &scheduler, state, interval).await });
+        let task2 = tokio::spawn(async move {
+            pump_tick(&store, &only_scheduler(scheduler.clone()), state, interval).await
+        });
         let req2 = read_request(&mut peer).await;
         assert_eq!(
             req2["method"], "_a24/scheduler/list",
@@ -2647,6 +3120,676 @@ mod tests {
         assert!(
             !body.contains("reconciler"),
             "run_standalone's body must never reference the reconciler module:\n{body}"
+        );
+    }
+
+    // ----- T4.4.1: `memory.remember` outbox kind ------------------------------
+
+    /// Builds a fake kernel granting BOTH `_a24/scheduler/` and
+    /// `_a24/memory/private/` — `apply_one`'s `scheduler` parameter is
+    /// mandatory (this module never runs at all without one, see module
+    /// doc), even for a test that only exercises the `memory.remember` arm
+    /// and never sends the fake kernel a single scheduler request.
+    async fn scheduler_and_memory_and_peer() -> (SchedulerClient, MemoryClient, FakePeer) {
+        let (clients, peer) = fake_kernel(vec![
+            "_a24/scheduler/".to_string(),
+            "_a24/memory/private/".to_string(),
+        ])
+        .await;
+        (
+            SchedulerClient::new(&clients).unwrap(),
+            MemoryClient::new(&clients).unwrap(),
+            peer,
+        )
+    }
+
+    /// A finalized Review, via the REAL `finalize_review` path (not a raw
+    /// outbox insert) — exercises `store::repo::review_remember_desired`
+    /// exactly as production does. Returns the row's own `dedup_key`.
+    async fn finalize_a_review(store: &Sin90Store) -> String {
+        let review = store
+            .create_review(&crate::core::NewReview {
+                kind: crate::core::ReviewKind::Daily,
+                period: "2026-09-24".to_string(),
+            })
+            .await
+            .unwrap();
+        store
+            .update_review_body(&review.id, "shipped T4.4.1")
+            .await
+            .unwrap();
+        store.finalize_review(&review.id).await.unwrap();
+        format!("review:{}", review.id)
+    }
+
+    /// Happy path: `recall` finds nothing (nobody has remembered this Review
+    /// yet), so `apply_one` goes on to call `remember`, and a successful
+    /// response marks the row `done`. Mutation target: removing the
+    /// `"memory.remember" => ...` arm from `apply_one`'s dispatch (or
+    /// routing it through the generic `other` arm) turns this red — the row
+    /// would be marked `failed(bad_desired)` instead of `done`, and neither
+    /// wire request would ever go out.
+    #[tokio::test]
+    async fn reconcile_t441_memory_remember_lands_after_recall_finds_nothing() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let (scheduler, memory, mut peer) = scheduler_and_memory_and_peer().await;
+        let dedup_key = finalize_a_review(&store).await;
+
+        let drain = tokio::spawn(async move {
+            drain_pending_before(
+                &store,
+                &scheduler_and_memory(scheduler.clone(), memory.clone()),
+                "2099-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
+            store
+        });
+
+        let recall_req = read_request(&mut peer).await;
+        assert_eq!(recall_req["method"], "_a24/memory/private/recall");
+        assert_eq!(recall_req["params"]["query"], dedup_key);
+        respond(&mut peer, &recall_req, json!({"items": [], "cursor": null})).await;
+
+        let remember_req = read_request(&mut peer).await;
+        assert_eq!(remember_req["method"], "_a24/memory/private/remember");
+        assert_eq!(remember_req["params"]["kind"], "review.summary");
+        assert_eq!(remember_req["params"]["body"]["dedup_key"], dedup_key);
+        assert_eq!(remember_req["params"]["body"]["summary"], "shipped T4.4.1");
+        respond(
+            &mut peer,
+            &remember_req,
+            json!({"id": "osmem:01T441", "at": "2026-09-26T00:00:00Z"}),
+        )
+        .await;
+
+        let store = drain.await.unwrap();
+        let rows = test_hooks::outbox_rows_for(&store, &dedup_key)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "done");
+    }
+
+    /// Idempotency (the task's own acceptance bar: "同一个 review 重复定稿，
+    /// 或者重启后，不能在内核里产生多条记忆"): if `recall` already reports a
+    /// memory bearing this row's `dedup_key`, `apply_one` marks the row
+    /// `done` WITHOUT ever calling `remember` again. Proven the same way
+    /// `reconcile_m3_stale_row_is_skipped_before_any_kernel_call` proves its
+    /// own "never sends a second request": nobody answers a `remember`
+    /// request in this test at all, so if `remember_review_summary` called
+    /// it anyway, the drain would hang past the timeout instead of the row
+    /// ever reaching `done`. Mutation target: deleting the
+    /// `memory_recall_finds_dedup_key` pre-check (calling `remember`
+    /// unconditionally) turns this red — it hangs.
+    #[tokio::test]
+    async fn reconcile_t441_recall_finds_existing_dedup_key_skips_remember_call() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let (scheduler, memory, mut peer) = scheduler_and_memory_and_peer().await;
+        let dedup_key = finalize_a_review(&store).await;
+
+        let drain = tokio::spawn(async move {
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                drain_pending_before(
+                    &store,
+                    &scheduler_and_memory(scheduler.clone(), memory.clone()),
+                    "2099-01-01T00:00:00Z",
+                ),
+            )
+            .await
+            .expect("must not hang waiting on a `remember` call that never happens")
+            .unwrap();
+            store
+        });
+
+        let recall_req = read_request(&mut peer).await;
+        assert_eq!(recall_req["method"], "_a24/memory/private/recall");
+        respond(
+            &mut peer,
+            &recall_req,
+            json!({
+                "items": [{
+                    "id": "osmem:already-there",
+                    "kind": "review.summary",
+                    "body": {"dedup_key": dedup_key, "summary": "old"},
+                    "at": "2026-09-25T00:00:00Z",
+                }],
+                "cursor": null,
+            }),
+        )
+        .await;
+
+        let store = drain.await.unwrap();
+        let rows = test_hooks::outbox_rows_for(&store, &dedup_key)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].status, "done",
+            "recognized as already-remembered via recall — done without a second remember call"
+        );
+    }
+
+    /// Positive control for the recall-scan itself: a page full of OTHER
+    /// memories (none carrying this row's `dedup_key`) must NOT be treated
+    /// as a match — `remember` still gets called. Guards against a
+    /// mutation that made the scan match on ANY non-empty page.
+    #[tokio::test]
+    async fn reconcile_t441_recall_with_unrelated_items_still_calls_remember() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let (scheduler, memory, mut peer) = scheduler_and_memory_and_peer().await;
+        let dedup_key = finalize_a_review(&store).await;
+
+        let drain = tokio::spawn(async move {
+            drain_pending_before(
+                &store,
+                &scheduler_and_memory(scheduler.clone(), memory.clone()),
+                "2099-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
+            store
+        });
+
+        let recall_req = read_request(&mut peer).await;
+        respond(
+            &mut peer,
+            &recall_req,
+            json!({
+                "items": [{
+                    "id": "osmem:unrelated",
+                    "kind": "review.summary",
+                    "body": {"dedup_key": "review:some-other-id"},
+                    "at": "2026-09-20T00:00:00Z",
+                }],
+                "cursor": null,
+            }),
+        )
+        .await;
+
+        let remember_req = read_request(&mut peer).await;
+        assert_eq!(remember_req["method"], "_a24/memory/private/remember");
+        respond(
+            &mut peer,
+            &remember_req,
+            json!({"id": "osmem:new", "at": "2026-09-26T00:00:00Z"}),
+        )
+        .await;
+
+        let store = drain.await.unwrap();
+        let rows = test_hooks::outbox_rows_for(&store, &dedup_key)
+            .await
+            .unwrap();
+        assert_eq!(rows[0].status, "done");
+    }
+
+    /// T4.4.1 review H1: this generation's `Offer` never granted
+    /// `_a24/memory/private/` (`memory: None`) — the row must be left
+    /// COMPLETELY UNTOUCHED, still `pending`, WITHOUT any wire call at all
+    /// (proven the same "nobody answers `peer`, a hang means a mutation"
+    /// way as the tests above) — never marked `failed`, since a `failed` row
+    /// is a terminal state `outbox_due_pending` never picks back up, which
+    /// would permanently discard a correction a LATER, granted generation
+    /// could still deliver. Mutation target: reverting to the OLD
+    /// `outbox_mark_failed(..., "forbidden", ...)` behavior turns this red
+    /// (`status` reads `failed`, not `pending`).
+    #[tokio::test]
+    async fn reconcile_t441_memory_not_granted_leaves_row_untouched_pending() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let (clients, peer) = fake_kernel(vec!["_a24/scheduler/".to_string()]).await;
+        let scheduler = SchedulerClient::new(&clients).unwrap();
+        assert!(MemoryClient::new(&clients).is_none());
+        let dedup_key = finalize_a_review(&store).await;
+        let version_before = test_hooks::outbox_rows_for(&store, &dedup_key)
+            .await
+            .unwrap()[0]
+            .version;
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(500),
+            drain_pending_before(
+                &store,
+                &only_scheduler(scheduler.clone()),
+                "2099-01-01T00:00:00Z",
+            ),
+        )
+        .await
+        .expect("must not hang — there is no kernel call to make at all")
+        .unwrap();
+        assert_eq!(outcome, PumpControl::Continue);
+        drop(peer);
+
+        let rows = test_hooks::outbox_rows_for(&store, &dedup_key)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "pending", "must not be marked failed");
+        assert!(rows[0].failure_kind.is_none());
+        assert_eq!(
+            rows[0].version, version_before,
+            "left completely untouched, not just left pending"
+        );
+    }
+
+    /// T4.4.1 review H1 (the actual acceptance bar): a row that sat
+    /// `pending` through a generation with no memory grant lands the moment
+    /// a LATER generation IS granted `_a24/memory/private/` — the row was
+    /// never discarded, so restart-then-grant genuinely recovers. Mutation
+    /// target: marking the row `failed` in the ungranted pass (the OLD
+    /// behavior) turns this red — `outbox_due_pending` would never hand the
+    /// row to the second drain at all, so the `recall`/`remember` requests
+    /// below would simply never arrive, and the final `assert_eq!` would
+    /// read `"failed"` instead of `"done"`.
+    #[tokio::test]
+    async fn reconcile_t441_memory_granted_later_still_lands_a_row_that_waited() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let dedup_key = finalize_a_review(&store).await;
+
+        // First "generation": scheduler only, no memory grant at all.
+        {
+            let (clients, peer) = fake_kernel(vec!["_a24/scheduler/".to_string()]).await;
+            let scheduler = SchedulerClient::new(&clients).unwrap();
+            assert!(MemoryClient::new(&clients).is_none());
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                drain_pending_before(&store, &only_scheduler(scheduler), "2099-01-01T00:00:00Z"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            drop(peer);
+        }
+        let rows = test_hooks::outbox_rows_for(&store, &dedup_key)
+            .await
+            .unwrap();
+        assert_eq!(rows[0].status, "pending", "waiting for a grant");
+
+        // A LATER "generation" (a fresh `fake_kernel`, standing in for a
+        // process restart with a new handshake — this crate's own
+        // `KernelClients` never reconnects within one generation): memory IS
+        // granted now.
+        let (scheduler2, memory2, mut peer2) = scheduler_and_memory_and_peer().await;
+        let drain = tokio::spawn(async move {
+            drain_pending_before(
+                &store,
+                &scheduler_and_memory(scheduler2, memory2),
+                "2099-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
+            store
+        });
+        let recall_req = read_request(&mut peer2).await;
+        assert_eq!(recall_req["method"], "_a24/memory/private/recall");
+        respond(
+            &mut peer2,
+            &recall_req,
+            json!({"items": [], "cursor": null}),
+        )
+        .await;
+        let remember_req = read_request(&mut peer2).await;
+        assert_eq!(remember_req["method"], "_a24/memory/private/remember");
+        respond(
+            &mut peer2,
+            &remember_req,
+            json!({"id": "osmem:granted-later", "at": "2026-09-27T00:00:00Z"}),
+        )
+        .await;
+        let store = drain.await.unwrap();
+
+        let rows = test_hooks::outbox_rows_for(&store, &dedup_key)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "the SAME row, not a second one");
+        assert_eq!(rows[0].status, "done");
+        assert_eq!(rows[0].result_ref.as_deref(), Some("osmem:granted-later"));
+    }
+
+    /// Same "a bad row must not stall the batch" contract H3 already proved
+    /// for `scheduler.*` — now for `memory.remember`'s own desired shape.
+    #[tokio::test]
+    async fn reconcile_t441_bad_desired_payload_is_marked_failed_and_does_not_block_the_batch() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let (scheduler, memory, mut peer) = scheduler_and_memory_and_peer().await;
+
+        test_hooks::insert_raw_outbox_row(
+            &store,
+            "bad-memory-row",
+            "memory.remember",
+            "review:does-not-exist",
+            "{\"not\": \"the expected shape\"}",
+            "2000-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        let good_dedup_key = finalize_a_review(&store).await;
+
+        let drain = tokio::spawn(async move {
+            drain_pending_before(
+                &store,
+                &scheduler_and_memory(scheduler.clone(), memory.clone()),
+                "2099-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
+            store
+        });
+
+        // The bad row never reaches the wire — only the good row's `recall`
+        // (answered empty) then `remember` do.
+        let recall_req = read_request(&mut peer).await;
+        assert_eq!(recall_req["method"], "_a24/memory/private/recall");
+        respond(&mut peer, &recall_req, json!({"items": [], "cursor": null})).await;
+        let remember_req = read_request(&mut peer).await;
+        assert_eq!(remember_req["method"], "_a24/memory/private/remember");
+        respond(
+            &mut peer,
+            &remember_req,
+            json!({"id": "osmem:good", "at": "2026-09-26T00:00:00Z"}),
+        )
+        .await;
+
+        let store = drain.await.unwrap();
+
+        let bad_rows = test_hooks::outbox_rows_for(&store, "review:does-not-exist")
+            .await
+            .unwrap();
+        assert_eq!(bad_rows[0].status, "failed");
+        assert_eq!(bad_rows[0].failure_kind.as_deref(), Some("bad_desired"));
+
+        let good_rows = test_hooks::outbox_rows_for(&store, &good_dedup_key)
+            .await
+            .unwrap();
+        assert_eq!(good_rows[0].status, "done");
+    }
+
+    // ----- T4.4.1 review M1: memory-only generation still runs the pump ------
+
+    /// A generation granted ONLY `_a24/memory/private/` (no `_a24/scheduler/`
+    /// at all) must still land a `memory.remember` row — the OLD code made
+    /// `scheduler: SchedulerClient` a mandatory, owned parameter throughout
+    /// this module, so `main.rs` never even started a pump in this scenario;
+    /// a `memory.remember` row would then sit `pending` forever with no
+    /// consumer, for a reason that has nothing to do with memory itself.
+    /// Uses [`reconcile_once`] (not just `drain_pending`) to ALSO prove
+    /// [`reconcile_full`]'s "no scheduler, no-op" early return does not
+    /// abort or otherwise interfere with the memory row landing in the SAME
+    /// call. Mutation target: making [`apply_one`] bail out for EVERY row
+    /// whenever `clients.scheduler` is `None` (the shape of the old,
+    /// scheduler-mandatory design) turns this red — the memory row would
+    /// stay `pending` and the drain would hang waiting for a `recall`
+    /// request that never gets sent.
+    #[tokio::test]
+    async fn reconcile_m1_memory_only_generation_still_lands_memory_remember_rows() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let dedup_key = finalize_a_review(&store).await;
+        let (clients, mut peer) = fake_kernel(vec!["_a24/memory/private/".to_string()]).await;
+        assert!(
+            SchedulerClient::new(&clients).is_none(),
+            "this generation must NOT have scheduler granted"
+        );
+        let memory = MemoryClient::new(&clients).unwrap();
+        let reconciler_clients = ReconcilerClients {
+            scheduler: None,
+            memory: Some(memory),
+        };
+
+        let run = tokio::spawn(async move {
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                reconcile_once(&store, &reconciler_clients),
+            )
+            .await
+            .expect("must not hang — a memory-only generation must still drain memory rows")
+            .unwrap();
+            store
+        });
+        let recall_req = read_request(&mut peer).await;
+        assert_eq!(recall_req["method"], "_a24/memory/private/recall");
+        respond(&mut peer, &recall_req, json!({"items": [], "cursor": null})).await;
+        let remember_req = read_request(&mut peer).await;
+        assert_eq!(remember_req["method"], "_a24/memory/private/remember");
+        respond(
+            &mut peer,
+            &remember_req,
+            json!({"id": "osmem:memory-only", "at": "2026-09-27T00:00:00Z"}),
+        )
+        .await;
+        let store = run.await.unwrap();
+
+        let rows = test_hooks::outbox_rows_for(&store, &dedup_key)
+            .await
+            .unwrap();
+        assert_eq!(rows[0].status, "done");
+        assert_eq!(rows[0].result_ref.as_deref(), Some("osmem:memory-only"));
+    }
+
+    // ----- T4.4.1 review M2: recall pre-check follows cursor across pages -----
+
+    /// The kernel's own `recall` scans up to 2000 lines PER CALL and reports
+    /// a non-empty `cursor` when that window was exhausted with more history
+    /// left unscanned — a single-page pre-check could wrongly conclude
+    /// "not found" and plant a duplicate. This proves
+    /// [`memory_recall_finds_dedup_key`] follows `cursor` to a SECOND page
+    /// and finds the match there, WITHOUT ever calling `remember` (page 1
+    /// itself only contains an unrelated item). Mutation target: hard-coding
+    /// the pre-check to stop after one page (e.g. changing
+    /// `RECALL_PRECHECK_MAX_PAGES` iterations to always break after the
+    /// first) turns this red — page 2 would never be requested, the
+    /// pre-check would report `NotFound` off an incomplete scan, and
+    /// `remember` would be called (this test provides no response for that,
+    /// so the drain would hang past the timeout).
+    #[tokio::test]
+    async fn reconcile_m2_recall_precheck_follows_cursor_to_a_later_page_before_calling_remember() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let dedup_key = finalize_a_review(&store).await;
+        let (scheduler, memory, mut peer) = scheduler_and_memory_and_peer().await;
+
+        let drain = tokio::spawn(async move {
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                drain_pending_before(
+                    &store,
+                    &scheduler_and_memory(scheduler, memory),
+                    "2099-01-01T00:00:00Z",
+                ),
+            )
+            .await
+            .expect("must not hang waiting on a `remember` call that must not happen")
+            .unwrap();
+            store
+        });
+
+        let page1 = read_request(&mut peer).await;
+        assert_eq!(page1["method"], "_a24/memory/private/recall");
+        assert_eq!(
+            page1["params"]["cursor"],
+            Value::Null,
+            "the first page carries no cursor"
+        );
+        respond(
+            &mut peer,
+            &page1,
+            json!({
+                "items": [{
+                    "id": "osmem:unrelated",
+                    "kind": "review.summary",
+                    "body": {"dedup_key": "review:some-other-review"},
+                    "at": "2026-09-01T00:00:00Z",
+                }],
+                "cursor": "cursor-to-page-2",
+            }),
+        )
+        .await;
+
+        let page2 = read_request(&mut peer).await;
+        assert_eq!(page2["method"], "_a24/memory/private/recall");
+        assert_eq!(page2["params"]["cursor"], "cursor-to-page-2");
+        respond(
+            &mut peer,
+            &page2,
+            json!({
+                "items": [{
+                    "id": "osmem:found-on-page-2",
+                    "kind": "review.summary",
+                    "body": {"dedup_key": dedup_key},
+                    "at": "2026-09-26T00:00:00Z",
+                }],
+                "cursor": null,
+            }),
+        )
+        .await;
+
+        let store = drain.await.unwrap();
+        let rows = test_hooks::outbox_rows_for(&store, &dedup_key)
+            .await
+            .unwrap();
+        assert_eq!(rows[0].status, "done");
+        assert_eq!(rows[0].result_ref.as_deref(), Some("osmem:found-on-page-2"));
+    }
+
+    /// M2's OTHER half: if `cursor` is STILL non-empty after
+    /// `RECALL_PRECHECK_MAX_PAGES` pages, the pre-check must report
+    /// [`RecallCheck::Inconclusive`] — surfaced as a retryable error, never
+    /// as "not found" (which would risk a duplicate `remember`). Proven by
+    /// scripting every one of the `RECALL_PRECHECK_MAX_PAGES` pages with a
+    /// non-empty `cursor` and no match, then asserting the row stays
+    /// `pending` with a bumped `other_bucket_attempts` — NOT `done` (which
+    /// would mean `remember` was wrongly called off an incomplete scan).
+    #[tokio::test]
+    async fn reconcile_m2_recall_precheck_exhausting_all_pages_retries_instead_of_assuming_absent()
+    {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let dedup_key = finalize_a_review(&store).await;
+        let (scheduler, memory, mut peer) = scheduler_and_memory_and_peer().await;
+
+        let drain = tokio::spawn(async move {
+            drain_pending_before(
+                &store,
+                &scheduler_and_memory(scheduler, memory),
+                "2099-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
+            store
+        });
+
+        for page_num in 0..RECALL_PRECHECK_MAX_PAGES {
+            let req = read_request(&mut peer).await;
+            assert_eq!(req["method"], "_a24/memory/private/recall");
+            respond(
+                &mut peer,
+                &req,
+                json!({
+                    "items": [],
+                    "cursor": format!("cursor-{page_num}"),
+                }),
+            )
+            .await;
+        }
+
+        let store = drain.await.unwrap();
+        let rows = test_hooks::outbox_rows_for(&store, &dedup_key)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows[0].status, "pending",
+            "inconclusive must retry, never be treated as done or permanently failed"
+        );
+        assert_eq!(rows[0].other_bucket_attempts, 1);
+    }
+
+    // ----- T4.4.1 review M3: an ambiguous `remember` outcome is safe to retry -
+
+    /// The scenario M3 asked for explicitly: `remember` is SENT, but its
+    /// response is lost (`ConnectionLost`) — the kernel may have actually
+    /// completed the call. On the NEXT attempt (a fresh connection, standing
+    /// in for a reconnect/restart — this crate's own `KernelClients` never
+    /// reconnects within one generation), `recall` finds the memory the
+    /// kernel created the first time, so `remember` must NOT be called
+    /// again. `remember` is therefore sent exactly ONCE across both
+    /// attempts, and the row ends up `done` with the id `recall` reported.
+    #[tokio::test]
+    async fn reconcile_m3_remember_response_lost_then_recall_finds_it_remember_called_once_total() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let dedup_key = finalize_a_review(&store).await;
+
+        // ---- Attempt 1: recall finds nothing, remember is sent, but the
+        //      connection dies before any response arrives.
+        {
+            let (scheduler, memory, mut peer) = scheduler_and_memory_and_peer().await;
+            let clients = scheduler_and_memory(scheduler, memory);
+            let store_for_drain = store.clone();
+            let drain = tokio::spawn(async move {
+                drain_pending_before(&store_for_drain, &clients, "2099-01-01T00:00:00Z")
+                    .await
+                    .unwrap()
+            });
+            let recall_req = read_request(&mut peer).await;
+            assert_eq!(recall_req["method"], "_a24/memory/private/recall");
+            respond(&mut peer, &recall_req, json!({"items": [], "cursor": null})).await;
+            let remember_req = read_request(&mut peer).await;
+            assert_eq!(remember_req["method"], "_a24/memory/private/remember");
+            drop(peer); // ConnectionLost: no response ever comes back.
+            let control = drain.await.unwrap();
+            assert_eq!(control, PumpControl::Continue);
+        }
+        let rows = test_hooks::outbox_rows_for(&store, &dedup_key)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows[0].status, "pending",
+            "outcome unknown — must not be marked done or failed"
+        );
+        assert_eq!(
+            rows[0].attempts, 0,
+            "ConnectionLost leaves the row completely untouched"
+        );
+
+        // ---- Attempt 2 (a fresh connection): recall now finds the memory
+        //      the kernel actually created during attempt 1 — `remember`
+        //      must NOT be sent again. Wrapped in a timeout: a regression in
+        //      the idempotency pre-check would call `remember` a second
+        //      time, and this test provides no response for that, so a hang
+        //      (not a wrong assertion) is what a regression here produces.
+        let (scheduler2, memory2, mut peer2) = scheduler_and_memory_and_peer().await;
+        let clients2 = scheduler_and_memory(scheduler2, memory2);
+        let drain2 = tokio::spawn(async move {
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                drain_pending_before(&store, &clients2, "2099-01-01T00:00:00Z"),
+            )
+            .await
+            .expect("must not hang waiting on a second `remember` call")
+            .unwrap();
+            store
+        });
+        let recall_req2 = read_request(&mut peer2).await;
+        assert_eq!(recall_req2["method"], "_a24/memory/private/recall");
+        respond(
+            &mut peer2,
+            &recall_req2,
+            json!({
+                "items": [{
+                    "id": "osmem:lost-response-actually-landed",
+                    "kind": "review.summary",
+                    "body": {"dedup_key": dedup_key},
+                    "at": "2026-09-27T00:00:00Z",
+                }],
+                "cursor": null,
+            }),
+        )
+        .await;
+        let store = drain2.await.unwrap();
+
+        let rows = test_hooks::outbox_rows_for(&store, &dedup_key)
+            .await
+            .unwrap();
+        assert_eq!(rows[0].status, "done");
+        assert_eq!(
+            rows[0].result_ref.as_deref(),
+            Some("osmem:lost-response-actually-landed")
         );
     }
 

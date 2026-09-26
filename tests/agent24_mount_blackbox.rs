@@ -1574,3 +1574,275 @@ fn routine_m3_real_mount_acceptance() {
     assert_eq!(status, 200, "retire transition: {body}");
     wait_for_schedule_row_absent(&d4, &key_a, sync_timeout);
 }
+
+/// **T4.4.1 — real-mount acceptance**: a finalized Review's derived-summary
+/// `memory.remember` outbox row actually lands in the real kernel's private
+/// memory, through the REAL `adapter_agent24::reconciler` pump — and is
+/// findable again via `_a24/memory/private/recall` on its exact `dedup_key`
+/// (`review:<id>`), the task's own acceptance bar.
+///
+/// The WRITE side is entirely ordinary production code, no test-hooks
+/// involved: `POST /reviews` -> `PATCH /reviews/{id}` -> `POST
+/// /reviews/{id}/finalize` through the real proxy, which is
+/// `store::repo::finalize_review` enqueueing onto `sin90_outbox`, drained by
+/// the real `spawn_pump_loop` this same mounted `sin90` process is already
+/// running (`main.rs::run_as_agent24_module`) — nothing about landing the
+/// memory needs `test-hooks` at all. Only the READ-back verification does:
+/// the shipped binary has no other route an ordinary HTTP client could use
+/// to drive `_a24/memory/private/recall` with an arbitrary query, so this
+/// reuses `POST /debug/kernel-roundtrip` (same route
+/// `kernel_clients_roundtrip` above uses) via its `memory_recall_query`
+/// field (`adapter_agent24::kernel_roundtrip`, added alongside this test) —
+/// polled in a loop because the pump lands the row asynchronously
+/// (`outbox_notify` wakes it promptly, but this test does not assume a
+/// specific latency). Each poll also re-runs that route's OWN fixed probe
+/// (remember/approval/scheduler) as a side effect — accepted, same as
+/// `kernel_clients_roundtrip`'s own "not cleaned up, throwaway `$HOME` only"
+/// posture (that route's module doc); this test asserts nothing about those
+/// fields, only about `memory.recall_extra`.
+///
+/// **T4.4.1 review M4**: beyond "found at least one," this test also
+/// asserts the `dedup_key` query returns EXACTLY one match, and — after
+/// dropping this mounted `sin90` process and starting a genuinely fresh one
+/// against the SAME `$HOME`/`sin90.db` (a real restart, not just a second
+/// call) — that the SAME query still returns exactly one match with the
+/// SAME kernel-minted id. This is the idempotency claim's real end-to-end
+/// proof: `store::repo::finalize_review` can only ever enqueue this
+/// `dedup_key` once (that function's own doc), but a restart exercises the
+/// reconciler's OWN pump starting fresh against already-`done` rows, which
+/// is exactly the scenario `adapter_agent24::reconciler::remember_review_summary`'s
+/// `recall` pre-check exists to keep safe.
+#[test]
+#[ignore = "needs a sibling Agent24 checkout; run explicitly: cargo test --test agent24_mount_blackbox -- --ignored --test-threads=1"]
+fn t441_finalized_review_summary_is_recallable_from_kernel_memory() {
+    let checkout = agent24_checkout().unwrap_or_else(|| {
+        panic!(
+            "no Agent24 checkout found (set AGENT24_CHECKOUT or place it at ../Agent24) — this \
+             test must FAIL, not silently skip, when its prerequisite is missing"
+        )
+    });
+    let agent24d_bin = build_agent24d(&checkout);
+    let sin90_bin = build_sin90_with_test_hooks();
+
+    let home = tmp_home("t441");
+
+    // Same "nothing already mounted" guard the other two tests use.
+    let d1 = start_daemon(&home, &agent24d_bin, &[]);
+    let (status, body) = http_get(d1.port, Some(&d1.token), "/api/v1/os").unwrap();
+    assert_eq!(status, 200, "{body}");
+    let before: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        before["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["name"] != "sin90"),
+        "cannot run this test: agent24d still has an in-process \"sin90\" module compiled in: \
+         {body}"
+    );
+    drop(d1);
+
+    install_sin90(&home.join(".agent24/packages"), &sin90_bin);
+
+    let d2 = start_daemon(&home, &agent24d_bin, &[]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if os_list_entry(&d2, "sin90")["state"] == "mounted" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "sin90 never reached state \"mounted\"; daemon log:\n{}",
+            d2.combined_log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let human_key = d2.read_actor_key(&home, "human", Duration::from_secs(10));
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some((status, _)) = http_get(d2.port, Some(&d2.token), "/api/v1/sin90/today") {
+            if status == 200 {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "sin90 never answered /today through the real proxy; daemon log:\n{}",
+            d2.combined_log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // ---- create, write, finalize a real Review through the real proxy ----
+    let (status, body) = http_call(
+        d2.port,
+        "POST",
+        "/api/v1/sin90/reviews",
+        Some(&d2.token),
+        Some(&human_key),
+        Some(r#"{"kind":"daily","period":"2026-09-24"}"#),
+    )
+    .unwrap();
+    assert_eq!(status, 201, "POST /reviews through the real proxy: {body}");
+    let review: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let review_id = review["id"].as_str().unwrap().to_owned();
+
+    let (status, body) = http_call(
+        d2.port,
+        "PATCH",
+        &format!("/api/v1/sin90/reviews/{review_id}"),
+        Some(&d2.token),
+        Some(&human_key),
+        Some(r#"{"body":"T4.4.1 real-mount acceptance summary"}"#),
+    )
+    .unwrap();
+    assert_eq!(
+        status, 200,
+        "PATCH /reviews/{{id}} through the real proxy: {body}"
+    );
+
+    let (status, body) = http_call(
+        d2.port,
+        "POST",
+        &format!("/api/v1/sin90/reviews/{review_id}/finalize"),
+        Some(&d2.token),
+        Some(&human_key),
+        Some("{}"),
+    )
+    .unwrap();
+    assert_eq!(
+        status, 200,
+        "POST /reviews/{{id}}/finalize through the real proxy: {body}"
+    );
+
+    // ---- poll the debug route's `memory.recall_extra` until the real
+    //      reconciler pump has landed the memory (or the deadline passes) --
+    let dedup_key = format!("review:{review_id}");
+    let recall_body = format!(r#"{{"memory_recall_query":"{dedup_key}"}}"#);
+
+    // T4.4.1 review M4: every matching item this `dedup_key` query returns,
+    // queried against whichever daemon `d` is currently up — used both to
+    // find the FIRST landing (poll loop below) and, after a restart, to
+    // prove the SAME query still returns EXACTLY one match (a local
+    // closure, not a new top-level helper, so this stays entirely inside
+    // this one test).
+    let matches_for = |d: &Daemon, human_key: &str| -> Vec<serde_json::Value> {
+        let (status, body) = http_call(
+            d.port,
+            "POST",
+            "/api/v1/sin90/debug/kernel-roundtrip",
+            Some(&d.token),
+            Some(human_key),
+            Some(&recall_body),
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "no response from the debug kernel-roundtrip route; daemon log:\n{}",
+                d.combined_log()
+            )
+        });
+        assert_eq!(
+            status,
+            200,
+            "POST /debug/kernel-roundtrip through the real proxy: {body}; daemon log:\n{}",
+            d.combined_log()
+        );
+        let result: serde_json::Value = serde_json::from_str(&body).unwrap();
+        result["memory"]["recall_extra"]["items"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no memory.recall_extra.items in response: {result}"))
+            .iter()
+            .filter(|it| it["body"]["dedup_key"] == dedup_key)
+            .cloned()
+            .collect()
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let found = loop {
+        let matches = matches_for(&d2, &human_key);
+        if let Some(item) = matches.first() {
+            break item.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the real reconciler pump never landed the memory.remember row for {dedup_key} \
+             within the deadline; daemon log:\n{}",
+            d2.combined_log()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    };
+
+    // ── exact-id association (this test's own acceptance bar) ──────────────
+    assert_eq!(found["body"]["review_id"], review_id);
+    assert_eq!(found["body"]["review_kind"], "daily");
+    assert_eq!(found["body"]["period"], "2026-09-24");
+    assert_eq!(
+        found["body"]["summary"],
+        "T4.4.1 real-mount acceptance summary"
+    );
+    assert!(
+        found["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("osmem:")),
+        "kernel-minted memory id has an unexpected shape: {found}"
+    );
+
+    // ── T4.4.1 review M4: exactly ONE memory for this dedup_key — not two,
+    //    not more (each poll above also re-ran the debug route's own fixed
+    //    probe, which never touches THIS dedup_key, so it cannot have
+    //    inflated this count). ────────────────────────────────────────────
+    let matches = matches_for(&d2, &human_key);
+    assert_eq!(
+        matches.len(),
+        1,
+        "expected exactly one memory for dedup_key {dedup_key}, found {matches:?}"
+    );
+
+    // ── T4.4.1 review M4: restart sin90 (a fresh process, same `$HOME`/
+    //    packages/keys/`sin90.db` — the Review is already `finalized` and
+    //    its outbox row already `done` from BEFORE the restart, so nothing
+    //    re-enqueues or re-sends `remember`) and prove the SAME query still
+    //    finds EXACTLY one match — a restart must not somehow duplicate the
+    //    memory a previous generation already landed. ─────────────────────
+    drop(d2);
+    let d3 = start_daemon(&home, &agent24d_bin, &[]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if os_list_entry(&d3, "sin90")["state"] == "mounted" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "sin90 never re-mounted after restart; daemon log:\n{}",
+            d3.combined_log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let human_key3 = d3.read_actor_key(&home, "human", Duration::from_secs(10));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some((status, _)) = http_get(d3.port, Some(&d3.token), "/api/v1/sin90/today") {
+            if status == 200 {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "sin90 never answered /today after restart; daemon log:\n{}",
+            d3.combined_log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let matches_after_restart = matches_for(&d3, &human_key3);
+    assert_eq!(
+        matches_after_restart.len(),
+        1,
+        "restart must not duplicate the memory: expected exactly one match for {dedup_key}, \
+         found {matches_after_restart:?}"
+    );
+    assert_eq!(
+        matches_after_restart[0]["id"], found["id"],
+        "same memory, same kernel-minted id"
+    );
+}

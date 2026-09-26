@@ -56,6 +56,10 @@ pub struct RecallPage {
 
 /// Typed `_a24/memory/private/*` client. Only [`MemoryClient::new`] ever
 /// constructs one.
+///
+/// `Clone` (T4.4.1 review M1): cheap — just an `Arc` bump. See
+/// [`super::scheduler::SchedulerClient`]'s own doc for why.
+#[derive(Clone)]
 pub struct MemoryClient {
     clients: Arc<KernelClients>,
 }

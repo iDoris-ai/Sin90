@@ -127,7 +127,28 @@ fn client_err_response(step: &str, err: ClientError) -> Response {
     )
 }
 
-async fn kernel_roundtrip(State(state): State<DebugState>, headers: HeaderMap) -> Response {
+/// T4.4.1: an OPTIONAL extra `_a24/memory/private/recall` call this route
+/// makes on the CALLER's behalf, after its own fixed remember/recall/
+/// approval/scheduler probe above — the shipped binary has no other route
+/// that lets an ordinary HTTP client drive `MemoryClient::recall` with an
+/// arbitrary query at all (same reasoning as this whole route's own module
+/// doc), and `tests/agent24_mount_blackbox.rs`'s T4.4.1 real-mount test
+/// needs exactly that to prove a just-finalized Review's `dedup_key` is
+/// actually findable in the kernel's private memory after the real
+/// reconciler pump lands it. `#[serde(default)]` so the EXISTING
+/// `kernel_clients_roundtrip` test's `"{}"` body (no such field) keeps
+/// working unchanged — this is purely additive.
+#[derive(serde::Deserialize, Default)]
+struct KernelRoundtripRequest {
+    #[serde(default)]
+    memory_recall_query: Option<String>,
+}
+
+async fn kernel_roundtrip(
+    State(state): State<DebugState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
     match state.actor_keys.identify(&headers) {
         Some(Actor::Human) => {}
         Some(Actor::Automation) => {
@@ -135,6 +156,19 @@ async fn kernel_roundtrip(State(state): State<DebugState>, headers: HeaderMap) -
         }
         None => return forbidden("missing or unrecognized actor key"),
     }
+
+    // T4.4.1 review L3: actor auth (above) must win over a malformed/absent
+    // request body. An `axum::Json<KernelRoundtripRequest>` EXTRACTOR
+    // PARAMETER would have parsed (and potentially rejected with an
+    // automatic 400) the body BEFORE this handler's own code — including
+    // the auth check above — ever ran, so an unauthenticated request with a
+    // missing/malformed JSON body would have come back 400 instead of the
+    // 403 every other gated route in this crate answers with. Reading the
+    // raw `Bytes` (an extractor that never fails) and parsing by hand, AFTER
+    // the auth check, fixes that: a missing or malformed body silently falls
+    // back to `KernelRoundtripRequest::default()` (no `memory_recall_query`)
+    // — exactly `kernel_clients_roundtrip`'s own `"{}"` call, unchanged.
+    let req: KernelRoundtripRequest = serde_json::from_slice(&body).unwrap_or_default();
 
     // Cheap to build fresh per call — `Clients::build`'s own doc.
     let clients = Clients::build(&state.clients);
@@ -162,6 +196,24 @@ async fn kernel_roundtrip(State(state): State<DebugState>, headers: HeaderMap) -
         Err(e) => return client_err_response("memory.recall", e),
     };
     let memory_found_in_recall = recall.items.iter().any(|item| item.id == remembered.id);
+
+    // T4.4.1: the caller-supplied extra recall, if any — see
+    // `KernelRoundtripRequest`'s own doc. Only run when asked; leaving it
+    // `None` when the field is absent keeps `kernel_clients_roundtrip`'s own
+    // `"{}"` call exercising exactly what it always has.
+    let memory_recall_extra = match &req.memory_recall_query {
+        Some(query) => match memory.recall(query, 20, None, None).await {
+            Ok(page) => Some(json!({
+                "items": page
+                    .items
+                    .iter()
+                    .map(|item| json!({"id": item.id, "kind": item.kind, "body": item.body}))
+                    .collect::<Vec<_>>(),
+            })),
+            Err(e) => return client_err_response("memory.recall(extra)", e),
+        },
+        None => None,
+    };
 
     // ---- approval: gate the one action in the kernel's closed set -------
     let Some(approval) = &clients.approval else {
@@ -248,6 +300,7 @@ async fn kernel_roundtrip(State(state): State<DebugState>, headers: HeaderMap) -
         "memory": {
             "remembered_id": remembered.id,
             "found_in_recall": memory_found_in_recall,
+            "recall_extra": memory_recall_extra,
         },
         "approval": {
             "approval_id": gate_answer.approval_id,
@@ -262,4 +315,73 @@ async fn kernel_roundtrip(State(state): State<DebugState>, headers: HeaderMap) -
         },
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapter_agent24::clients::test_support::fake_kernel;
+    use crate::http::actor::ActorKeys;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn test_actor_keys() -> Arc<ActorKeys> {
+        Arc::new(
+            ActorKeys::new(
+                "test-human-key-for-l3-xxxxxxxxxxxx".to_string(),
+                "test-automation-key-for-l3-xxxxxxxx".to_string(),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// T4.4.1 review L3: an UNAUTHENTICATED request (no actor key header at
+    /// all) with a body that is not even valid JSON must still come back
+    /// `403 Forbidden` — Sin90's own actor-auth gate — never a
+    /// framework-level `400 Bad Request` from a `Json<T>` extractor parsing
+    /// the body before this handler's own auth check ever runs. Mutation
+    /// target: reverting the request parameter back to
+    /// `Json<KernelRoundtripRequest>` turns this red (403 -> 400, since axum
+    /// itself would answer before `kernel_roundtrip`'s body ever executes).
+    #[tokio::test]
+    async fn l3_unauthenticated_request_with_malformed_body_is_403_not_400() {
+        let (clients, _peer) = fake_kernel(vec![]).await;
+        let app = router(clients, test_actor_keys());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/debug/kernel-roundtrip")
+                    .header("content-type", "application/json")
+                    .body(Body::from("this is not json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// Positive control: a well-formed, but still unauthenticated, request
+    /// is ALSO 403 — proves the fix does not accidentally let a
+    /// well-formed body skip the auth gate either.
+    #[tokio::test]
+    async fn l3_unauthenticated_request_with_well_formed_body_is_still_403() {
+        let (clients, _peer) = fake_kernel(vec![]).await;
+        let app = router(clients, test_actor_keys());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/debug/kernel-roundtrip")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
 }
