@@ -47,6 +47,7 @@ mod frame;
 /// here rather than in `http`.
 #[cfg(feature = "test-hooks")]
 pub mod kernel_roundtrip;
+pub mod reconciler;
 mod transport;
 
 // L-1: only `FatalHook` is re-exported — `main.rs` needs to name it to

@@ -18,8 +18,16 @@ pub mod approval;
 pub mod error;
 pub mod memory;
 pub mod scheduler;
+// `pub(crate)`, not private: T3.3.2's reconciler (`adapter_agent24::reconciler`,
+// a SIBLING of this module, not a descendant) needs the same fake-kernel
+// plumbing this file's own `scheduler`/`memory`/`approval` test suites use —
+// promoting visibility here avoids a second hand-rolled copy of it (the kind
+// of duplication this file's own doc comment already accepts once, for
+// `adapter_agent24::mod`'s pre-existing `clients_over_a_socket_pair`/
+// `noop_hook`; a third copy is not worth it). Still `#[cfg(test)]`-gated, so
+// nothing here ships in a release build.
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 
 pub use approval::ApprovalClient;
 pub use error::ClientError;
