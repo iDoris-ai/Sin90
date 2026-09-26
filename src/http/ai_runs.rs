@@ -256,3 +256,155 @@ pub async fn get_ai_run(
         }
     }
 }
+
+/// L3 (2026-09-26 review): a hard wall-clock backstop on a whole capability
+/// run, shared by `ai_classify`/`ai_summarize`/`ai_propose`'s own trigger
+/// routes — lives HERE, in `http`, not in `ai::ladder`, because `ai/` may
+/// not depend on `tokio` at all (§11.5's dependency arrow;
+/// `tests/ai_boundary.rs`'s `EXTERN_OK` whitelist does not include it).
+///
+/// `ai::ladder::RunState`'s own budget (`RUN_DEADLINE_SECS`) is checked
+/// only BETWEEN items, before starting a new step — it cannot stop a
+/// SINGLE already-in-flight `_a24/model/complete` call (up to 125s,
+/// `adapter_agent24::clients::model::MODEL_CALL_TIMEOUT`) from pushing a
+/// run's real wall-clock time past its intended budget if that call started
+/// right at the internal deadline. Wrapping the WHOLE run future in
+/// `tokio::time::timeout` here closes that gap: if `deadline` elapses, the
+/// wrapped future is DROPPED (cancelling whatever call was mid-flight)
+/// instead of being allowed to keep running.
+///
+/// Takes `deadline` as a parameter — production always passes
+/// [`RUN_HARD_DEADLINE`] — so tests can inject a short one instead of
+/// waiting out a real, multi-minute deadline.
+pub(crate) async fn with_hard_deadline<F: std::future::Future>(
+    deadline: std::time::Duration,
+    fut: F,
+) -> Result<F::Output, tokio::time::error::Elapsed> {
+    tokio::time::timeout(deadline, fut).await
+}
+
+/// M-1 (2026-09-26 review round 2, a bug in THIS commit's own first cut):
+/// the hard backstop must be BIGGER than `ai::RUN_DEADLINE_SECS` alone, not
+/// equal to it. `RunState::deadline` is checked only BETWEEN steps
+/// (`with_hard_deadline`'s own doc) — a run whose LAST permitted model call
+/// starts right at that internal deadline needs up to `MODEL_CALL_TIMEOUT`
+/// MORE real time to reach its own check, record the call's outcome, and
+/// return `Deferred` for whatever items are left. A backstop set to exactly
+/// `RUN_DEADLINE_SECS` fires at (or, depending on scheduling, even slightly
+/// BEFORE — the two deadlines are computed from two different `Instant::
+/// now()` calls a few instructions apart) the same instant as that internal
+/// check, cancelling the run mid-wrap-up instead of after it: every
+/// proposal ALREADY durably committed via `AiSink::submit` earlier in the
+/// SAME run vanishes from `GET /ai/runs/{id}`'s in-memory observation
+/// window (the durable `sin90_proposals`/`sin90_ai_calls` rows are
+/// unaffected — only this view is lost, since the whole `outcomes: Vec<_>`
+/// this function would have returned never makes it back to the caller),
+/// and the interrupted call gets no row at all — not even a failed one,
+/// since `record_call_best_effort` never runs for a call whose future was
+/// dropped mid-`.await`. `MODEL_CALL_TIMEOUT` worth of headroom, plus a 30s
+/// margin for scheduling jitter and the wrap-up's own store write, is
+/// enough for that grace period to always fit inside this backstop — making
+/// it a genuine "this should never actually fire" ceiling, not a second
+/// deadline racing the first one.
+pub(crate) const RUN_HARD_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(crate::ai::RUN_DEADLINE_SECS)
+        .saturating_add(crate::adapter_agent24::clients::model::MODEL_CALL_TIMEOUT)
+        .saturating_add(std::time::Duration::from_secs(30));
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// L3: a future that would take far longer than `deadline` is cancelled
+    /// — `with_hard_deadline` returns `Err` well before the slow future's
+    /// own 5s sleep would have elapsed, proving the future is genuinely
+    /// dropped/abandoned, not merely raced-and-ignored while still running
+    /// in the background. Mutation: replace the body with a bare
+    /// `fut.await` (no timeout at all) — this test would then hang for 5s
+    /// and the `elapsed` assertion would fail (or the test would simply
+    /// take ~5s instead of ~tens of ms, depending on the runner's own
+    /// timeout — either way, red).
+    #[tokio::test]
+    async fn with_hard_deadline_cancels_a_future_that_outruns_it() {
+        let started = Instant::now();
+        let result = with_hard_deadline(Duration::from_millis(20), async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            42
+        })
+        .await;
+        assert!(
+            result.is_err(),
+            "a future slower than the deadline must be cancelled, not awaited to completion"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "must return promptly once the deadline elapses, not wait out the slow future"
+        );
+    }
+
+    /// Positive control for the test above: a future that finishes WELL
+    /// within the deadline completes normally, with its real output.
+    #[tokio::test]
+    async fn with_hard_deadline_positive_control_lets_a_fast_future_finish() {
+        let result = with_hard_deadline(Duration::from_secs(5), async { 42 }).await;
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    /// M-1: pins the RELATIONSHIP `RUN_HARD_DEADLINE` must keep — strictly
+    /// bigger than `ai::RUN_DEADLINE_SECS` alone, by at least a full
+    /// `MODEL_CALL_TIMEOUT`. Mutation: set `RUN_HARD_DEADLINE` back to
+    /// exactly `Duration::from_secs(RUN_DEADLINE_SECS)` (the round-1 bug) —
+    /// both assertions go red.
+    #[test]
+    fn run_hard_deadline_has_at_least_a_full_model_call_timeout_of_headroom() {
+        let inner = Duration::from_secs(crate::ai::RUN_DEADLINE_SECS);
+        assert!(
+            RUN_HARD_DEADLINE > inner,
+            "the hard backstop must be strictly bigger than the inner run deadline alone"
+        );
+        assert!(
+            RUN_HARD_DEADLINE >= inner + crate::adapter_agent24::clients::model::MODEL_CALL_TIMEOUT,
+            "the backstop must have at least a full MODEL_CALL_TIMEOUT of headroom over the \
+             inner deadline, so an in-flight call started right at that deadline can still \
+             finish gracefully"
+        );
+    }
+
+    /// M-1 (behavioral half): simulates a run whose internal budget is hit
+    /// FIRST — the wrapped future here takes longer than a short "inner"
+    /// stand-in deadline but still finishes within the backstop's own
+    /// margin (exactly the shape `RUN_HARD_DEADLINE`'s extra headroom
+    /// exists for) — and must complete NORMALLY, with its FULL result, not
+    /// be cancelled. Mutation: shrink the backstop passed here to less than
+    /// the sleep duration (i.e. reproduce the round-1 bug of "backstop ==
+    /// inner deadline, no headroom") — the future gets cancelled and this
+    /// test's `unwrap()` panics on `Err`, red.
+    #[tokio::test]
+    async fn with_hard_deadline_lets_a_run_finish_when_the_inner_budget_is_hit_first() {
+        // Stand-in for: RunState::deadline reached at t≈20ms, the
+        // already-in-flight last call takes another ~30ms to wrap up
+        // (comfortably less than a real MODEL_CALL_TIMEOUT) — total 50ms,
+        // well inside a backstop with real headroom.
+        let backstop = Duration::from_millis(20) + Duration::from_millis(200); // headroom, not equal
+        let result = with_hard_deadline(backstop, async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            vec![
+                "item-1".to_string(),
+                "item-2".to_string(),
+                "item-3".to_string(),
+            ]
+        })
+        .await;
+        assert_eq!(
+            result.unwrap(),
+            vec![
+                "item-1".to_string(),
+                "item-2".to_string(),
+                "item-3".to_string()
+            ],
+            "a run that finishes within the backstop's headroom must return its FULL result, \
+             not be cancelled"
+        );
+    }
+}

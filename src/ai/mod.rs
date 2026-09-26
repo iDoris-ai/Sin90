@@ -34,18 +34,20 @@
 //! 翻 PR 历史。T5.2.1（classify，本文件同批次）已经关掉了其中两条——保留
 //! 记录，标注关闭状态：
 //!
-//! - **真实 `ModelPort` 适配器（J10，等 `feat/t3.2.1-kernel-clients` 合并
-//!   后）**：`src/adapter_agent24/clients/model.rs` 里 `ModelClient::new` +
-//!   `impl ModelPort for ModelClient`（`call_with_timeout(125s)`，不带
-//!   `request_id`）；`clients/error.rs` 的 `ClientError` 加
-//!   `Unavailable{retryable, cause}` 与 `Cancelled` 两个变体，
-//!   `map_rpc_error` 认 `unavailable`/`cancelled`，
+//! - ~~真实 `ModelPort` 适配器（J10，等 `feat/t3.2.1-kernel-clients` 合并
+//!   后）~~ **T5.1.2 已关闭**：`src/adapter_agent24/clients/model.rs` 落地了
+//!   `ModelClient::new` + `impl ModelPort for ModelClient`
+//!   （`call_with_timeout(125s)`，不带 `request_id`）；`clients/error.rs` 的
+//!   `ClientError` 加了 `Unavailable{retryable, cause}` 与 `Cancelled` 两个
+//!   变体，`map_rpc_error` 认 `unavailable`/`cancelled`，
 //!   `every_spec_error_kind_maps_to_its_documented_variant` 的计数
-//!   17 → 18。**仍未做**：`ai::ports::ModelPort` 今天只有测试用的假实现和
-//!   `NoModelPort`（T5.2.1b 新增的占位类型——没有真实客户端时，调用方仍能
-//!   给引擎梯的泛型参数一个具体类型；`POST /ai/classify` 会是它第一个真正
-//!   的调用方，但那条路由本身不在本分支）；`domain-os.yml`/manifest 相关
-//!   的 J10c 同样未做。
+//!   17 → 18（J10）。`domain-os.yml` 加了 `kernel_capabilities: models`
+//!   （不写 `model_access`，§2 #26 硬约束）；`remote-allowed-manifest` cargo
+//!   feature + `domain-os.remote-allowed.yml`（只给测试包 B）；
+//!   `ai::ports::MODEL_ACCESS` 编译期常量 + `sin90 print-model-access` 子命令
+//!   （J10c、J23b）。`NoModelPort`（T5.2.1b 新增的占位类型）仍在——
+//!   `standalone` 模式下三个 AI 触发路由依旧把它当 `model` 参数的具体类型传
+//!   `None`，只有挂载模式下才换成真实 `ModelClient`（见下）。
 //! - ~~`allowed_ops`（`src/store/ai_port.rs`）随 T5.2.1/T5.3.1 收紧~~
 //!   **T5.2.1 已关闭其中 `Classify` 一半**：`Sin90Op::AssignTaskDirection`
 //!   落地，`allowed_ops(Classify)` 现在回答真实的单元素集合
@@ -60,30 +62,35 @@
 //! - **classify 能力本身**：T5.2.1b 交付了 [`classify`] 模块（
 //!   `normalize_title`、R1/R2、模型 request/schema/parse、
 //!   `classify_one`/`run_classify` 驱动、`select_targets` 输入校验）。
-//!   ~~仍未做，留给上一层的 T5.2.1（http）分支~~ **T5.2.1（顶层）已关闭**：
-//!   `POST /ai/classify` + `GET /ai/runs/{run_id}` 这两条 HTTP 路由、进程内
-//!   run 注册表（内存 LRU 64 近似、`BusyGuard` 保证 panic 时也释放槽位）、
-//!   每能力单飞都已落地（`src/http/ai_classify.rs` + `src/http/ai_runs.rs`）。
-//!   `src/http/ai_classify.rs` 里 `model: Option<&NoModelPort>` 与
-//!   `ModelAccess::LocalOnly` 目前都是硬编码——没有真实 `ModelPort` 适配器
-//!   可传、也没有 `domain-os.yml` 的 `model_access` 可读，这两处都留了
-//!   `TODO(T5.1.2)` 注释，等真实内核客户端接上后才能从硬编码变成真正的
-//!   运行时值。`summarize`/`propose`（T5.3.1/T5.4.1）仍不在这里——
-//!   `ai::ladder::run_item` 这个共享的引擎梯核心已经是它们也要调用的东西，
-//!   但组装它们各自的候选读取/prompt/复核/`ProposalDraft` 还没有对应的
-//!   `src/ai/{summarize,propose}.rs`；进程内模型调用信号量 2（§11.4 公共）
-//!   也还没有实现——现在没有真实并发模型调用需要限流，`model` 参数在
-//!   `POST /ai/classify` 的触发路径上恒为 `None`。
+//!   T5.2.1（顶层）关闭了 `POST /ai/classify` + `GET /ai/runs/{run_id}` 这两
+//!   条 HTTP 路由、进程内 run 注册表（内存 LRU 64 近似、`BusyGuard` 保证
+//!   panic 时也释放槽位）、每能力单飞（`src/http/ai_classify.rs` +
+//!   `src/http/ai_runs.rs`）；T5.3.1/T5.4.1 补上了 `summarize`/`propose`
+//!   （`src/ai/{summarize,propose}.rs` + 对应的 `src/http/ai_{summarize,
+//!   propose}.rs`）。~~`src/http/ai_{classify,summarize,propose}.rs` 里
+//!   `model: Option<&NoModelPort>` 与 `ModelAccess::LocalOnly` 目前都是硬编
+//!   码~~ **T5.1.2 已关闭**：三处都改成挂载模式下经 `Sin90State::model`
+//!   （`Option<Arc<dyn http::ModelCaller>>`——`http` 自己的 `dyn`-safe seam，
+//!   同 `EventSink` 的做法，从不直接命名 `adapter_agent24::clients::model::
+//!   ModelClient`）包出一个 `http::HttpModelPort`（真正实现
+//!   `ai::ModelPort`，泛型参数 `M` 绑定到它）；`standalone` 模式下
+//!   `Sin90State::model` 恒为 `None`，三处仍用 `NoModelPort` 做具体类型。
+//!   `ModelAccess::LocalOnly` 硬编码换成 `ai::MODEL_ACCESS`（编译期常量，两
+//!   种模式都读同一个值——`standalone` 下 `model` 恒 `None`，`plan()` 永远
+//!   不会因为它调度 `Step::Model`，读哪个 `ModelAccess` 值不改变行为）。
+//!   ~~进程内模型调用信号量 2（§11.4 公共）仍未实现~~ **2026-09-26 review
+//!   （M3）已关闭**：三个能力（classify/summarize/propose）各自独立触发、各
+//!   自可能同时有一次模型调用在途，内核对单模块的在途上限是 2——`http::
+//!   SemaphoredModelCaller` 在 `wire_kernel_clients` 里包一层
+//!   `tokio::sync::Semaphore(MODEL_MAX_IN_FLIGHT_PER_MODULE)`，建一次、经同
+//!   一个 `Arc<dyn http::ModelCaller>` 被三个能力共享，第三路在进程内排队而
+//!   不是打到内核换回一个 `busy`。
 //!
-//! What this module does NOT contain: `summarize`/`propose` (T5.3.1/T5.4.1)
-//! and the real `_a24/model/complete` adapter (`ModelPort` here is
-//! implemented only by test fakes and `NoModelPort` — the kernel-callback
-//! client lives on a separate branch, `feat/t3.2.1-kernel-clients`, not yet
-//! merged here). The HTTP trigger routes for `classify` themselves ARE
-//! delivered (see above) — this bullet used to say otherwise when this doc
-//! was written for the T5.2.1b layer alone; updated at the top of the stack
-//! where that claim stopped being true. See "T5.1.2 接线" above for the
-//! full, itemized handoff list.
+//! What this module does NOT contain: nothing this doc used to list here is
+//! still missing — `summarize`/`propose`, the real `_a24/model/complete`
+//! adapter, the HTTP wiring, and the process-wide model-call semaphore have
+//! all landed — see the itemized "T5.1.2 接线" list above for exactly which
+//! task closed which bullet.
 //!
 //! # 已知限制（2026-09-24 评审，接受，不在本轮改）
 //!
