@@ -26,7 +26,7 @@ use serde_json::{json, Map, Value};
 
 use crate::core::{
     direction_is_terminal, task_is_terminal, week_is_open, Alloc, DirectionId, NewTask, Sin90Op,
-    Task, TaskId, TaskStatus, Week, WeekId,
+    Task, TaskId, TaskStatus, Week, WeekId, TRIAGE_DIRECTION_ID,
 };
 
 use super::ladder::{plan, run_item, Outcome, RunState, Step};
@@ -119,6 +119,16 @@ fn keyed_tasks(prefix: &str, tasks: &[Task]) -> Vec<KeyedTask> {
 /// pending `propose.create` proposal — a second, independently-written copy
 /// of "gap" is exactly the kind of drift M5b's own "single source of truth"
 /// posture already rejected for `p_candidates`/`carry_reflex`.
+///
+/// T5.2.2 (design §2 #30): the reserved "待定" Direction (`TRIAGE_DIRECTION_
+/// ID`) is skipped even if `alloc` names it with `pct > 0` — tasks.md
+/// T5.2.2's own requirement ("『待定』不参与配额计算，也不参与缺口计算").
+/// `AdjustRhythm`'s own `check_alloc` does not reject this id today (§2 #30
+/// scopes the enforcement to THIS function, the only place a Direction's
+/// rhythm allocation actually turns into an actionable "gap" today); an
+/// allocation that names 待定 is therefore accepted but functionally inert
+/// — it will simply never surface here, so `propose.create` never targets
+/// it.
 pub async fn gap_directions<R: AiReadModel>(
     read: &R,
     alloc: &[Alloc],
@@ -132,6 +142,7 @@ pub async fn gap_directions<R: AiReadModel>(
     let mut out = Vec::new();
     for a in alloc {
         if a.pct == 0
+            || a.direction_id == TRIAGE_DIRECTION_ID
             || used.contains(a.direction_id.as_str())
             || !seen_direction_ids.insert(a.direction_id.as_str())
         {
@@ -2666,6 +2677,47 @@ mod tests {
             .unwrap();
         assert_eq!(gaps.len(), 1);
         assert_eq!(gaps[0].direction_id, direction.id);
+    }
+
+    /// T5.2.2 (design §2 #30): even a rhythm allocation that names the
+    /// reserved 待定 Direction with `pct > 0` and no week task (i.e. it
+    /// would otherwise look exactly like a real gap) must never surface
+    /// here — tasks.md T5.2.2's "『待定』不参与配额计算，也不参与缺口计
+    /// 算". Mutation target: delete the `a.direction_id ==
+    /// TRIAGE_DIRECTION_ID` guard in `gap_directions` and this goes red
+    /// (待定 comes back as a gap).
+    #[tokio::test]
+    async fn classify_fallback_triage_excluded_from_gap_directions() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let real = store
+            .create_direction("Work", "2026-Q4", None)
+            .await
+            .unwrap();
+        let reader = store.ai_reader();
+        let week = store.create_week("2026-W20").await.unwrap();
+        let week_tasks = reader.week_tasks(&week.id).await.unwrap();
+
+        let alloc = vec![
+            Alloc {
+                direction_id: TRIAGE_DIRECTION_ID.to_string(),
+                pct: 50,
+            },
+            Alloc {
+                direction_id: real.id.clone(),
+                pct: 50,
+            },
+        ];
+
+        let gaps = gap_directions(&reader, &alloc, &week_tasks).await.unwrap();
+        let ids: Vec<String> = gaps.iter().map(|g| g.direction_id.clone()).collect();
+        assert!(
+            !ids.contains(&TRIAGE_DIRECTION_ID.to_string()),
+            "the reserved 待定 Direction must NEVER surface as a gap: {ids:?}"
+        );
+        assert!(
+            ids.contains(&real.id),
+            "a real, rhythm-allocated Direction with no week task IS a gap (positive control): {ids:?}"
+        );
     }
 
     /// L2 (2026-09-24 review): design's own wording is "W 里没有任何任务" —

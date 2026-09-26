@@ -19,12 +19,12 @@ use std::collections::HashSet;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
-use crate::core::{DirectionId, Sin90Op, Task, TaskId};
+use crate::core::{DirectionId, Sin90Op, Task, TaskId, TRIAGE_DIRECTION_ID};
 
 use super::ladder::{plan, run_item, Outcome, RunState, Step};
 use super::ports::{
-    AiReadModel, AiSink, Capability, Complexity, DirectionCandidate, Engine, ModelAccess,
-    ModelMessage, ModelPort, ModelReply, ModelRequest, ProposalDraft, Role, SinkError,
+    AiCallRecord, AiReadModel, AiSink, Capability, Complexity, DirectionCandidate, Engine,
+    ModelAccess, ModelMessage, ModelPort, ModelReply, ModelRequest, ProposalDraft, Role, SinkError,
 };
 
 // ---------------------------------------------------------------- normalize
@@ -420,10 +420,19 @@ pub fn parse_classify_reply(
         return Err("bad_output");
     }
     if parsed.choice == "none" {
+        // Coordinator review (H1, 2026-09-26 round 2): this used to hardcode
+        // `low_confidence: false` regardless of `confidence` — a model that
+        // says "none" AND reports `low` confidence about that "none" is
+        // EXACTLY the case Q8 exists for ("没把握就不要提"), so it must be
+        // tagged `low_confidence` the same way a low-confidence real pick
+        // is. T5.2.2's 待定 fallback is scoped to "the model had medium+
+        // confidence about its `none`" — anything below threshold stays a
+        // bare `nothing` (never reaches the fallback), same threshold the
+        // real-key branch below already applies.
         return Ok(ClassifyDecision {
             direction_id: None,
             reason: parsed.reason,
-            low_confidence: false,
+            low_confidence: confidence < CLASSIFY_CONFIDENCE_THRESHOLD,
             confidence: Some(confidence.as_str()),
             choice: Some(parsed.choice.clone()),
         });
@@ -543,11 +552,82 @@ pub struct ClassifyItem {
     pub reason: Option<&'static str>,
 }
 
-/// One task through the full classify ladder (§11.4.1): §11.4's public
-/// "候选为空" short circuit happens here — with zero non-terminal Directions
-/// in the whole system, R1 can never be decisive either (its own history is
-/// filtered to non-terminal Directions too), so skipping the ladder entirely
-/// writes no call row and produces no proposal, exactly as designed.
+/// T5.2.2 (design §2 #30): shared by every classify arm that ends in
+/// `AssignTaskDirection` — a REAL match (the `Some(direction_id)` arm) or
+/// the 待定 fallback (a decisive non-match, or the ladder producing nothing
+/// at all) — so the "decision failed submit's dry run, state moved between
+/// planning and submit" handling (§11.3.5) exists exactly once, not once
+/// per call site. `rec` must already be the `ok=1` row this decision is
+/// linked to; this function only clones it for the failure path.
+async fn submit_direction_assignment<S: AiSink>(
+    task_id: &TaskId,
+    direction_id: DirectionId,
+    rationale: String,
+    rec: AiCallRecord,
+    sink: &S,
+) -> (ItemResult, Option<&'static str>) {
+    let draft = ProposalDraft {
+        id: format!("ai-classify-{}", crate::core::ulid()),
+        ops: vec![Sin90Op::AssignTaskDirection {
+            task_id: task_id.clone(),
+            direction_id,
+        }],
+        rationale: Some(rationale),
+    };
+    let draft_id = draft.id.clone();
+    // 2026-09-24 review (M1): a decision that fails `submit`'s dry run (state
+    // moved between planning and submit — e.g. the task got classified by
+    // something else in the same run's window) is not a dropped call — it
+    // still gets a row, via `record_call`, since `submit` never wrote one.
+    // `rec` is cloned BEFORE `submit` consumes it so there is something left
+    // to record on the error path (§11.3.5: the model/rule did its job; the
+    // STATE changed, not the call).
+    let rec_on_failure = rec.clone();
+    match sink.submit(Capability::Classify, draft, rec).await {
+        Ok(()) => (ItemResult::Proposed(draft_id), None),
+        Err(e) => {
+            tracing::warn!(error = %e, task_id = %task_id, "classify: a decision failed submit's dry run (state moved)");
+            let mut failed = rec_on_failure;
+            failed.ok = false;
+            failed.proposal_id = None;
+            failed.error_kind = Some(match &e {
+                // §11.3.5's own name for this case.
+                SinkError::Invalid(_) => "rejected_by_precheck",
+                // An infra failure says nothing about the decision's
+                // validity — a distinct kind so it is never confused with a
+                // real precheck rejection.
+                SinkError::Store(_) => "submit_store_error",
+            });
+            if let Err(record_err) = sink.record_call(failed).await {
+                tracing::warn!(error = %record_err, task_id = %task_id, "classify: failed to record a rejected-at-submit call (R6, not fatal)");
+            }
+            (ItemResult::Rejected, None)
+        }
+    }
+}
+
+/// One task through the full classify ladder (§11.4.1). T5.2.2 (design §2
+/// #30, Q4, narrowed by the coordinator's 2026-09-26 round-2 review):
+/// "没有合适的 Direction 时" means the task is assigned to the reserved 待定
+/// Direction ONLY when a MODEL step actually ran, replied, and decisively
+/// said `"none"` at `medium`-or-above confidence (the `None if
+/// !low_confidence` arm below) — every other "nothing decided" shape stays a
+/// bare `Nothing`, retried on the NEXT trigger, never a proposal:
+/// - candidates empty from the start (no non-terminal Direction exists at
+///   all — a brand-new user) → `reason = "undetermined"` (M1).
+/// - the whole ladder ran and NOT ONE step produced anything at all
+///   (`Outcome::Nothing`: R1 undecided, R2 no_match, no model reachable or
+///   every model step degraded away — offline, circuit open, standalone
+///   with no model configured) → also `reason = "undetermined"` (H3). This
+///   is deliberately NOT the same as a model explicitly answering "none":
+///   here nothing ever looked at the task with enough information to decide
+///   anything, so treating it as a confident non-match would overclaim.
+/// - low confidence (T5.2.3, Q8 "没把握就不要提") stays `reason =
+///   "low_confidence"`, unaffected — this now ALSO covers a low-confidence
+///   `"none"` (H1: `parse_classify_reply`'s "none" branch used to hardcode
+///   `low_confidence: false` regardless of the model's own reported
+///   confidence; fixed to apply the SAME threshold the real-key branch
+///   already used).
 #[allow(clippy::too_many_arguments)]
 async fn classify_one<M, S, R>(
     run_id: &str,
@@ -565,7 +645,15 @@ where
     R: AiReadModel,
 {
     if candidates.is_empty() {
-        return (ItemResult::Nothing, None);
+        // M1 (coordinator review, 2026-09-26 round 2): no non-terminal
+        // Direction to offer as a candidate at all (a brand-new user with
+        // zero Directions) — the ladder is skipped entirely, same as before
+        // T5.2.2 ever existed. NOT a 待定 fallback: no model ever ran, so
+        // there is nothing "decisive" to fall back FROM. `reason =
+        // "undetermined"` so a caller can tell this apart from a genuine
+        // low-confidence model answer; retried on the next trigger once a
+        // Direction exists.
+        return (ItemResult::Nothing, Some("undetermined"));
     }
     let normalized = normalize_title(&task.title);
     let history = match read.title_history(&normalized).await {
@@ -623,58 +711,44 @@ where
             let choice = value.choice.clone();
             let (result, reason) = match value.direction_id {
                 Some(direction_id) => {
-                    let draft = ProposalDraft {
-                        id: format!("ai-classify-{}", crate::core::ulid()),
-                        ops: vec![Sin90Op::AssignTaskDirection {
-                            task_id: task.id.clone(),
-                            direction_id,
-                        }],
-                        rationale: Some(build_rationale(engine, &value.reason)),
-                    };
-                    let draft_id = draft.id.clone();
-                    // 2026-09-24 review (M1): a decision that fails `submit`'s
-                    // dry run (state moved between planning and submit — e.g. the
-                    // task got classified by something else in the same run's
-                    // window) is not a dropped call — it still gets a row, via
-                    // `record_call`, since `submit` never wrote one. `rec` is
-                    // cloned BEFORE `submit` consumes it so there is something
-                    // left to record on the error path (§11.3.5: the model/rule
-                    // did its job; the STATE changed, not the call).
-                    let rec_on_failure = rec.clone();
-                    match sink.submit(Capability::Classify, draft, rec).await {
-                        Ok(()) => (ItemResult::Proposed(draft_id), None),
-                        Err(e) => {
-                            tracing::warn!(error = %e, task_id = %task.id, "classify: a decision failed submit's dry run (state moved)");
-                            let mut failed = rec_on_failure;
-                            failed.ok = false;
-                            failed.proposal_id = None;
-                            failed.error_kind = Some(match &e {
-                                // §11.3.5's own name for this case.
-                                SinkError::Invalid(_) => "rejected_by_precheck",
-                                // An infra failure says nothing about the
-                                // decision's validity — a distinct kind so it is
-                                // never confused with a real precheck rejection.
-                                SinkError::Store(_) => "submit_store_error",
-                            });
-                            if let Err(record_err) = sink.record_call(failed).await {
-                                tracing::warn!(error = %record_err, task_id = %task.id, "classify: failed to record a rejected-at-submit call (R6, not fatal)");
-                            }
-                            (ItemResult::Rejected, None)
-                        }
-                    }
+                    submit_direction_assignment(
+                        &task.id,
+                        direction_id,
+                        build_rationale(engine, &value.reason),
+                        rec,
+                        sink,
+                    )
+                    .await
                 }
-                None => {
-                    // A decisive non-match is still `ok = 1` (§11.4.1) — record
-                    // it as a plain call, not a proposal.
+                // T5.2.3 (Q8 "没把握就不要提"): a LOW-CONFIDENCE non-match
+                // stays a bare `Nothing` — it must NOT fall back to 待定
+                // either (that would still be "proposing something the
+                // model wasn't sure about", just wearing a different
+                // Direction). A decisive non-match is still `ok = 1`
+                // (§11.4.1) — record it as a plain call, not a proposal.
+                None if low_confidence => {
                     if let Err(e) = sink.record_call(rec).await {
                         tracing::warn!(error = %e, task_id = %task.id, "classify: failed to record a decisive no-match call (R6, not fatal)");
                     }
-                    // T5.2.3: tag WHY this is `Nothing` only when it was the
-                    // confidence check that produced it — `choice == "none"`
-                    // (or R1/R2/no-candidates/bad_output-with-nothing-left)
-                    // all still fold into a bare `Nothing` with no reason.
-                    let reason = low_confidence.then_some("low_confidence");
-                    (ItemResult::Nothing, reason)
+                    (ItemResult::Nothing, Some("low_confidence"))
+                }
+                // T5.2.2 (design §2 #30, Q4): the model looked and decisively
+                // said "none" — fall back to 待定 instead of leaving the task
+                // in the inbox. Reuses the SAME `ok=1` call row the model
+                // step already produced: the model genuinely did its job
+                // here (§11.4.1's "记 ok = 1"), it just found nothing, so the
+                // resulting proposal's `source` is still derived from this
+                // engine/tier (§11.4 公共's `source_for`) — not hardcoded to
+                // `rule` — exactly like a real match would be.
+                None => {
+                    submit_direction_assignment(
+                        &task.id,
+                        TRIAGE_DIRECTION_ID.to_string(),
+                        build_rationale(engine, &value.reason),
+                        rec,
+                        sink,
+                    )
+                    .await
                 }
             };
             // T5.2.3 review M2: confidence isn't persisted anywhere yet — log
@@ -698,7 +772,19 @@ where
             }
             (result, reason)
         }
-        Outcome::Nothing => (ItemResult::Nothing, None),
+        // H3 (coordinator review, 2026-09-26 round 2): every step ran (R1
+        // undecided, R2 no_match, no model reachable or every model step
+        // degraded away — offline, circuit open, standalone with no model
+        // configured) without a SINGLE step producing a value at all. This
+        // is NOT the same as a model decisively saying "none" — nothing here
+        // ever actually looked at the task with enough information to
+        // decide anything, so it must NOT fall back to 待定 (that would
+        // silently launder "we never got an answer" into "the answer is
+        // no"). Stays a bare `Nothing`, `reason = "undetermined"`, retried
+        // whole on the next trigger. Every failed step already wrote its own
+        // non-producing call row inside `run_item`; nothing extra to record
+        // here.
+        Outcome::Nothing => (ItemResult::Nothing, Some("undetermined")),
         Outcome::Deferred => (ItemResult::Deferred, None),
         Outcome::Aborted => (ItemResult::Aborted, None),
     }
@@ -1127,6 +1213,37 @@ mod tests {
         }
     }
 
+    /// H2's own helper: picks whichever candidate KEY the request's own
+    /// `candidates` array offers for a given title, instead of hardcoding
+    /// `"d1"` — `direction_candidates`'s `updated_at DESC` ordering is not
+    /// guaranteed stable across two Directions created in the same test with
+    /// second-resolution timestamps, so a hardcoded key is fragile.
+    struct PicksCandidateByTitle(&'static str);
+    impl ModelPort for PicksCandidateByTitle {
+        async fn complete(&self, req: ModelRequest) -> Result<ModelReply, ModelFailure> {
+            let user = req
+                .messages
+                .iter()
+                .find(|m| m.role == crate::ai::ports::Role::User)
+                .expect("classify request always has a user message");
+            let parsed: Value =
+                serde_json::from_str(&user.content).expect("classify user message is JSON");
+            let key = parsed["candidates"]
+                .as_array()
+                .expect("candidates is an array")
+                .iter()
+                .find(|c| c["title"].as_str() == Some(self.0))
+                .unwrap_or_else(|| panic!("no candidate titled {:?} in {parsed}", self.0))["key"]
+                .as_str()
+                .expect("key is a string")
+                .to_string();
+            Ok(reply(&format!(
+                r#"{{"choice":"{key}","confidence":"high","reason":"matches {}"}}"#,
+                self.0
+            )))
+        }
+    }
+
     /// Answers differently by `complexity` — `executive`'s `Model(Executive)`
     /// step requests `Complexity::Complex`, `local`'s `Model(Local)` step
     /// requests `Complexity::Simple` (`build_classify_request`'s own
@@ -1245,11 +1362,14 @@ mod tests {
         );
     }
 
-    /// J12: an invented/real-id key degrades (bad_output) past the single
-    /// `local` model step to R2, which also has nothing to match — the item
-    /// ends `Nothing`; a call row for the model step is recorded via
-    /// `record_call`. Positive control: a valid key on the same fixture
-    /// produces a proposal.
+    /// J12 (coordinator review, 2026-09-26 round 2, H3): an invented/real-id
+    /// key degrades (bad_output) past the single `local` model step to R2,
+    /// which also has nothing to match (`Outcome::Nothing`) — this is NOT a
+    /// model decisively saying "none" (the model's own answer was rejected
+    /// as malformed), so it must NOT fall back to 待定 either: the item ends
+    /// `Nothing`, `reason = "undetermined"`, a call row for the model step is
+    /// recorded via `record_call`. Positive control: a valid key on the same
+    /// fixture produces a proposal into the real Direction.
     #[tokio::test]
     async fn classify_rejects_invented_keys_and_degrades() {
         let store = Sin90Store::open_memory().await.unwrap();
@@ -1273,6 +1393,7 @@ mod tests {
         )
         .await;
         assert_eq!(items[0].result, ItemResult::Nothing);
+        assert_eq!(items[0].reason, Some("undetermined"));
 
         let calls: Vec<(String, bool, Option<String>)> = sqlx::query_as(
             "SELECT engine, ok, error_kind FROM sin90_ai_calls WHERE run_id = 'run-classify-2'",
@@ -1283,6 +1404,12 @@ mod tests {
         assert!(calls.iter().any(|(engine, ok, kind)| engine == "local"
             && !ok
             && kind.as_deref() == Some("bad_output")));
+        assert!(
+            !calls
+                .iter()
+                .any(|(engine, ok, _)| engine == "reflex" && *ok),
+            "H3: no ladder-exhausted case may synthesize an extra ok=1 row: {calls:?}"
+        );
         // Exactly one model call for the one item — degrading to R2 does not
         // re-try the model.
         assert_eq!(bad_model.calls(), 1);
@@ -1301,6 +1428,326 @@ mod tests {
         )
         .await;
         assert!(matches!(items2[0].result, ItemResult::Proposed(_)));
+    }
+
+    // ---- T5.2.2: classify 兜底到「待定」(design §2 #30, J28) --------------
+
+    /// J28 (design §2 #30, Q4): no candidate Direction is a good match (the
+    /// model decisively says `"none"`) → the task is assigned to the
+    /// reserved 待定 Direction via a NORMAL `AssignTaskDirection` proposal —
+    /// not left in the inbox, and NOT a proposal to create a new Direction.
+    /// Mutation target: delete the `None => submit_direction_assignment(...,
+    /// TRIAGE_DIRECTION_ID, ...)` arm in `classify_one` (fall through to a
+    /// bare `Nothing` again) — this goes red.
+    #[tokio::test]
+    async fn classify_fallback_no_match_assigns_triage_direction() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        // A real candidate DOES exist (proves the model had a genuine
+        // choice available and still decisively said "none" — this is not
+        // just "candidates.is_empty()" in disguise, see the M1 test below
+        // for that separate case).
+        let _real_direction = store
+            .create_direction("Finance", "2026-Q4", None)
+            .await
+            .unwrap();
+        let task = inbox_task(&store, "Something that fits nothing on offer").await;
+        let reader = store.ai_reader();
+
+        let model = StubModel::always(Ok(reply(
+            r#"{"choice":"none","confidence":"high","reason":"nothing fits"}"#,
+        )));
+        let items = run_classify(
+            "run-fallback-triage",
+            std::slice::from_ref(&task),
+            ModelAccess::LocalOnly,
+            Some(&model),
+            &store,
+            &reader,
+        )
+        .await;
+
+        let proposal_id = match &items[0].result {
+            ItemResult::Proposed(id) => id.clone(),
+            other => panic!("expected a 待定 fallback Proposed, got {other:?}"),
+        };
+        let stored = store.get_proposal(&proposal_id).await.unwrap();
+        assert_eq!(
+            stored.ops,
+            vec![Sin90Op::AssignTaskDirection {
+                task_id: task.id.clone(),
+                direction_id: TRIAGE_DIRECTION_ID.to_string(),
+            }],
+            "a decisive non-match must assign 待定, never propose a new Direction"
+        );
+        // L1 (coordinator review, 2026-09-26 round 2): an `assert_ne!`
+        // comparing this to `real_direction.id` used to sit here — always
+        // true regardless of correctness, since a freshly-minted ULID can
+        // never equal the fixed literal `TRIAGE_DIRECTION_ID` either way.
+        // Removed; the `assert_eq!` above is the only assertion that can
+        // actually fail.
+
+        // Human accept works exactly like a real classification — 待定 is an
+        // ordinary, non-terminal Direction as far as `AssignTaskDirection`'s
+        // validate is concerned (§2 #30: protected by its fixed id, not by
+        // any special-cased validate rule).
+        let outcome = store.apply_proposal(&proposal_id).await.unwrap();
+        assert!(!outcome.receipt.event_ids.is_empty());
+        let after_inbox = reader.inbox(50).await.unwrap();
+        assert!(!after_inbox.iter().any(|t| t.id == task.id));
+    }
+
+    /// J28 positive control for the whole T5.2.2 fallback: on the SAME kind
+    /// of fixture, a REAL match still lands on the REAL Direction, never on
+    /// 待定 — the fallback only ever fires on a decisive non-match, not on
+    /// every classify run. Mirrors J11's own assertion shape.
+    #[tokio::test]
+    async fn classify_fallback_real_match_assigns_real_direction() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let real_direction = store
+            .create_direction("Finance", "2026-Q4", None)
+            .await
+            .unwrap();
+        let task = inbox_task(&store, "Reconcile the Q4 budget").await;
+        let reader = store.ai_reader();
+
+        let model = StubModel::always(Ok(reply(
+            r#"{"choice":"d1","confidence":"high","reason":"matches Finance"}"#,
+        )));
+        let items = run_classify(
+            "run-fallback-real-match",
+            std::slice::from_ref(&task),
+            ModelAccess::LocalOnly,
+            Some(&model),
+            &store,
+            &reader,
+        )
+        .await;
+
+        let proposal_id = match &items[0].result {
+            ItemResult::Proposed(id) => id.clone(),
+            other => panic!("expected Proposed into the real Direction, got {other:?}"),
+        };
+        let stored = store.get_proposal(&proposal_id).await.unwrap();
+        assert_eq!(
+            stored.ops,
+            vec![Sin90Op::AssignTaskDirection {
+                task_id: task.id.clone(),
+                direction_id: real_direction.id.clone(),
+            }],
+            "a real match must assign the REAL Direction, not 待定"
+        );
+    }
+
+    /// H1 (coordinator review, 2026-09-26 round 2): the model decisively
+    /// says `"none"` but reports `confidence: "low"` about it — this is
+    /// EXACTLY the Q8 case ("没把握就不要提"), so it must NOT reach the 待定
+    /// fallback: `result = Nothing`, `reason = Some("low_confidence")`, same
+    /// posture as a low-confidence REAL pick. `parse_classify_reply` used to
+    /// hardcode `low_confidence: false` for `choice == "none"` regardless of
+    /// the model's own reported confidence. Mutation target: revert
+    /// `parse_classify_reply`'s `"none"` branch to `low_confidence: false` —
+    /// this goes red (`result` becomes `Proposed` into 待定).
+    #[tokio::test]
+    async fn classify_fallback_none_with_low_confidence_stays_nothing() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let _direction = store
+            .create_direction("Finance", "2026-Q4", None)
+            .await
+            .unwrap();
+        let task = inbox_task(&store, "Something unrelated to any candidate").await;
+        let reader = store.ai_reader();
+
+        let model = StubModel::always(Ok(reply(
+            r#"{"choice":"none","confidence":"low","reason":"probably nothing but not sure"}"#,
+        )));
+        let items = run_classify(
+            "run-h1-none-low-confidence",
+            std::slice::from_ref(&task),
+            ModelAccess::LocalOnly,
+            Some(&model),
+            &store,
+            &reader,
+        )
+        .await;
+        assert_eq!(items[0].result, ItemResult::Nothing);
+        assert_eq!(items[0].reason, Some("low_confidence"));
+
+        let proposal_count: i64 = sqlx::query_scalar("SELECT count(*) FROM sin90_proposals")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            proposal_count, 0,
+            "no proposal — not even into 待定 — may be produced"
+        );
+    }
+
+    /// H3 (coordinator review, 2026-09-26 round 2): the WHOLE ladder runs
+    /// out (both engines down here — offline/circuit-open/standalone are the
+    /// same shape) without a single step ever producing a decision at all.
+    /// This is NOT a model decisively saying "none" — nothing ever looked at
+    /// the task with enough information to decide anything — so it must stay
+    /// `Nothing`, `reason = "undetermined"`, and produce NO proposal.
+    /// Mutation target: restore `Outcome::Nothing`'s old
+    /// `submit_direction_assignment(..., TRIAGE_DIRECTION_ID, ...)` arm in
+    /// `classify_one` — this goes red (a 待定 proposal appears).
+    #[tokio::test]
+    async fn classify_fallback_ladder_exhausted_stays_undetermined() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let _direction = store
+            .create_direction("Finance", "2026-Q4", None)
+            .await
+            .unwrap();
+        let task = inbox_task(&store, "Totally unrelated errand").await;
+        let reader = store.ai_reader();
+
+        let both_down = ByEngine {
+            exec: Err(ModelFailure::Unavailable {
+                retryable: true,
+                cause: crate::ai::ports::UnavailableCause::NoProvider,
+            }),
+            local: Err(ModelFailure::Timeout),
+        };
+        let items = run_classify(
+            "run-h3-ladder-exhausted",
+            std::slice::from_ref(&task),
+            ModelAccess::RemoteAllowed,
+            Some(&both_down),
+            &store,
+            &reader,
+        )
+        .await;
+        assert_eq!(items[0].result, ItemResult::Nothing);
+        assert_eq!(items[0].reason, Some("undetermined"));
+
+        let proposal_count: i64 = sqlx::query_scalar("SELECT count(*) FROM sin90_proposals")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(proposal_count, 0);
+    }
+
+    /// M1 (coordinator review, 2026-09-26 round 2): a brand-new user with
+    /// ZERO non-terminal Directions — the ladder is skipped entirely (no
+    /// candidates for R1/R2/the model to work with), stays `Nothing`,
+    /// `reason = "undetermined"`, no call row, no proposal — same as
+    /// T5.2.2's original design line, just with the new `reason` tag added.
+    /// Mutation target: restore `candidates.is_empty()`'s old
+    /// `submit_direction_assignment(...)` call — this goes red.
+    #[tokio::test]
+    async fn classify_fallback_no_candidates_stays_undetermined() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let task = inbox_task(&store, "Anything at all").await;
+        let reader = store.ai_reader();
+
+        let items = run_classify(
+            "run-m1-no-candidates",
+            std::slice::from_ref(&task),
+            ModelAccess::LocalOnly,
+            Some(&PanicModel),
+            &store,
+            &reader,
+        )
+        .await;
+        assert_eq!(items[0].result, ItemResult::Nothing);
+        assert_eq!(items[0].reason, Some("undetermined"));
+
+        let call_count: i64 = sqlx::query_scalar("SELECT count(*) FROM sin90_ai_calls")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            call_count, 0,
+            "an empty candidate set must not write any call row either"
+        );
+    }
+
+    /// H2 (coordinator review, 2026-09-26 round 2): repro straight from the
+    /// review — "walk the dog" falls back to 待定 (decisive high-confidence
+    /// "none"), the human accepts it, THEN the user creates the perfect real
+    /// Direction "Dog walking", THEN a second "Walk the dog" arrives. R1's
+    /// history must NOT count the first (待定-classified) task as evidence —
+    /// if it did, R1 would decisively re-route the second task straight to
+    /// 待定 too, and the model (which WOULD have picked "Dog walking") would
+    /// never even be asked. Mutation target: delete the `AND d.id != ?`
+    /// clause (or its bind) from `AiReadModel::title_history` — this goes
+    /// red (the second task is wrongly routed to 待定 by R1 alone).
+    #[tokio::test]
+    async fn classify_fallback_title_history_excludes_triage_assignments() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        // An unrelated real candidate must exist so the model actually runs
+        // (M1: an empty candidate set short-circuits to `Nothing` before
+        // ever reaching the model — this test is about R1's history, not
+        // that separate case).
+        let _unrelated = store
+            .create_direction("Finance", "2026-Q4", None)
+            .await
+            .unwrap();
+        let task1 = inbox_task(&store, "walk the dog").await;
+        let reader = store.ai_reader();
+
+        let none_model = StubModel::always(Ok(reply(
+            r#"{"choice":"none","confidence":"high","reason":"nothing fits yet"}"#,
+        )));
+        let items1 = run_classify(
+            "run-h2-first",
+            std::slice::from_ref(&task1),
+            ModelAccess::LocalOnly,
+            Some(&none_model),
+            &store,
+            &reader,
+        )
+        .await;
+        let proposal_id1 = match &items1[0].result {
+            ItemResult::Proposed(id) => id.clone(),
+            other => panic!("expected the 待定 fallback for task1, got {other:?}"),
+        };
+        store.apply_proposal(&proposal_id1).await.unwrap();
+        let after1: String =
+            sqlx::query_scalar("SELECT direction_id FROM sin90_tasks WHERE id = ?")
+                .bind(&task1.id)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(after1, TRIAGE_DIRECTION_ID);
+
+        // The user now creates the Direction that genuinely fits.
+        let dog_walking = store
+            .create_direction("Dog walking", "2026-Q4", None)
+            .await
+            .unwrap();
+
+        let task2 = inbox_task(&store, "Walk the dog").await; // same normalized title as task1
+                                                              // Picks whichever candidate key the request ACTUALLY offers for
+                                                              // "Dog walking" — not a hardcoded "d1" — because candidate ordering
+                                                              // (`direction_candidates`'s `updated_at DESC`) is not guaranteed
+                                                              // stable when "Finance" and "Dog walking" share the same
+                                                              // second-resolution timestamp in a fast test run.
+        let real_match_model = PicksCandidateByTitle("Dog walking");
+        let items2 = run_classify(
+            "run-h2-second",
+            std::slice::from_ref(&task2),
+            ModelAccess::LocalOnly,
+            Some(&real_match_model),
+            &store,
+            &reader,
+        )
+        .await;
+        let proposal_id2 = match &items2[0].result {
+            ItemResult::Proposed(id) => id.clone(),
+            other => {
+                panic!("expected task2 to reach the model and match Dog walking, got {other:?}")
+            }
+        };
+        let stored2 = store.get_proposal(&proposal_id2).await.unwrap();
+        assert_eq!(
+            stored2.ops,
+            vec![Sin90Op::AssignTaskDirection {
+                task_id: task2.id.clone(),
+                direction_id: dog_walking.id.clone(),
+            }],
+            "R1 must not have shortcut task2 to 待定 using task1's history"
+        );
     }
 
     // ---- T5.2.3: classify 低置信度不出提议 (J27) --------------------------
@@ -1430,15 +1877,20 @@ mod tests {
         assert_eq!(items[0].reason, None);
     }
 
-    /// J27: an explicit `choice == "none"` (the model confidently says
-    /// nothing fits) must NOT be tagged `"low_confidence"` even though it
-    /// also ends `Nothing` — the two causes are different (§11.4.1: "none"
-    /// is a decisive non-match on its own; low confidence is "wasn't sure
-    /// enough about a real pick") and only one of them should carry the new
-    /// reason. Mutation target: make `classify_one` tag `Nothing` as
-    /// `Some("low_confidence")` whenever `direction_id` is `None`, regardless
-    /// of `ClassifyDecision::low_confidence` — this test goes red (the
-    /// `"none"` case would wrongly get the reason too).
+    /// J27/T5.2.2: an explicit `choice == "none"` (the model confidently says
+    /// nothing fits) must NOT be tagged `"low_confidence"` — the two causes
+    /// are different (§11.4.1: "none" is a decisive non-match on its own;
+    /// low confidence is "wasn't sure enough about a real pick") and only
+    /// one of them should carry the reason. Since T5.2.2 the two also
+    /// diverge on `result` itself: a decisive "none" now falls back to the
+    /// reserved 待定 Direction (`Proposed`, `reason: None`), while low
+    /// confidence stays a bare `Nothing` with `reason: Some("low_confidence")`
+    /// — see `classify_low_confidence_below_threshold_is_nothing_and_records_
+    /// ok1_call` for that half. Mutation target: make `classify_one` tag the
+    /// fallback proposal's reason as `Some("low_confidence")` whenever
+    /// `direction_id` was `None`, regardless of `ClassifyDecision::
+    /// low_confidence` — this test goes red (the `"none"` case would wrongly
+    /// get the reason too).
     #[tokio::test]
     async fn classify_low_confidence_explicit_none_is_not_tagged_low_confidence() {
         let store = Sin90Store::open_memory().await.unwrap();
@@ -1461,8 +1913,19 @@ mod tests {
             &reader,
         )
         .await;
-        assert_eq!(items[0].result, ItemResult::Nothing);
+        let proposal_id = match &items[0].result {
+            ItemResult::Proposed(id) => id.clone(),
+            other => panic!("expected a 待定 fallback Proposed, got {other:?}"),
+        };
         assert_eq!(items[0].reason, None);
+        let stored = store.get_proposal(&proposal_id).await.unwrap();
+        assert_eq!(
+            stored.ops,
+            vec![Sin90Op::AssignTaskDirection {
+                task_id: task.id.clone(),
+                direction_id: TRIAGE_DIRECTION_ID.to_string(),
+            }]
+        );
     }
 
     /// J27: the confidence threshold is a MODEL-step concern only — reflex
@@ -1513,13 +1976,20 @@ mod tests {
         assert_eq!(stored.source, ProposalSource::Rule);
     }
 
-    /// J27: an INVENTED key paired with `confidence: "low"` must still be
-    /// `bad_output` (a real parsing/validity failure), NOT quietly reclassified
-    /// as a low-confidence `nothing` — the invented-key check in
-    /// `parse_classify_reply` runs BEFORE the confidence check specifically so
-    /// this combination is never misdiagnosed as "the model looked and wasn't
-    /// sure" when it actually named a key that does not exist. Mutation
-    /// target: reorder `parse_classify_reply` to check `confidence` before the
+    /// J27 (coordinator review, 2026-09-26 round 2, H3): an INVENTED key
+    /// paired with `confidence: "low"` must still be `bad_output` (a real
+    /// parsing/validity failure), NOT quietly reclassified as a
+    /// low-confidence `nothing` — the invented-key check in
+    /// `parse_classify_reply` runs BEFORE the confidence check specifically
+    /// so this combination is never misdiagnosed as "the model looked and
+    /// wasn't sure" when it actually named a key that does not exist.
+    /// `bad_output` degrades to R2 (no match either, `Outcome::Nothing`) —
+    /// the item ends `Nothing`, `reason = "undetermined"`, NOT
+    /// `"low_confidence"` (that positively confirms this went through the
+    /// `bad_output`/R2 path, not the confidence-threshold path) and NOT a
+    /// 待定 fallback either (H3: the ladder never produced an actual
+    /// decision to fall back from). Mutation target: reorder
+    /// `parse_classify_reply` to check `confidence` before the
     /// candidate-membership check — the `bad_output` row disappears and
     /// `items[0].reason` would (wrongly) become `Some("low_confidence")`.
     #[tokio::test]
@@ -1546,8 +2016,9 @@ mod tests {
         .await;
         assert_eq!(items[0].result, ItemResult::Nothing);
         assert_eq!(
-            items[0].reason, None,
-            "an invented key degrades via bad_output, not the low-confidence path"
+            items[0].reason,
+            Some("undetermined"),
+            "an invented key degrades via bad_output/R2 exhaustion, not the low-confidence path"
         );
 
         let calls: Vec<(String, bool, Option<String>)> = sqlx::query_as(
@@ -1568,8 +2039,11 @@ mod tests {
     /// (`Complexity::Simple`), which succeeds and produces a proposal whose
     /// `source` is derived from the SERVED tier (`local`), i.e.
     /// `local_brain`, not from the fact that `executive` was REQUESTED.
-    /// Positive control: when `local` ALSO fails, the item ends `Nothing`
-    /// (R2 has nothing to match "unrelated task" against) and the `local`
+    /// Positive control: when `local` ALSO fails, R2 has nothing to match
+    /// "unrelated task" against (`Outcome::Nothing`) — H3 (coordinator
+    /// review, 2026-09-26 round 2): this is a ladder-exhausted case, NOT a
+    /// model decisively saying "none", so it stays `Nothing` (`reason =
+    /// "undetermined"`), it does NOT fall back to 待定 — and the `local`
     /// step's own `ok=0` row still exists (the failure was recorded, not
     /// swallowed).
     #[tokio::test]
@@ -1645,7 +2119,12 @@ mod tests {
             &reader,
         )
         .await;
-        assert_eq!(items2[0].result, ItemResult::Nothing);
+        assert_eq!(
+            items2[0].result,
+            ItemResult::Nothing,
+            "H3: both engines down + R2 no-match is a ladder-exhausted case, NOT a 待定 fallback"
+        );
+        assert_eq!(items2[0].reason, Some("undetermined"));
         let local_row_exists: bool = sqlx::query_scalar(
             "SELECT count(*) > 0 FROM sin90_ai_calls \
              WHERE run_id = 'run-remote-down-2' AND engine = 'local' AND ok = 0",

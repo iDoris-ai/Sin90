@@ -5479,11 +5479,13 @@ mod ai_classify {
         assert_eq!(items[0]["reason"], "low_confidence");
     }
 
-    /// T5.2.3 review (M1) positive control: an explicit `choice == "none"`
-    /// (at high confidence) must end `Nothing` WITHOUT the `reason` field on
-    /// the wire at all — not `null`, the key must be absent entirely
-    /// (`#[serde(skip_serializing_if = "Option::is_none")]`). Same harness as
-    /// the test above, swapping in [`ExplicitNoneModel`].
+    /// T5.2.3 review (M1) positive control, updated for T5.2.2: an explicit
+    /// `choice == "none"` (at high confidence) is no longer `Nothing` at all
+    /// — it falls back to the reserved 待定 Direction (`result: "proposed"`)
+    /// — but must still carry NO `reason` key on the wire (not `null`, the
+    /// key absent entirely, `#[serde(skip_serializing_if = "Option::is_
+    /// none")]`), the same way a real match never carries one. Same harness
+    /// as the test above, swapping in [`ExplicitNoneModel`].
     #[tokio::test]
     async fn get_ai_run_has_no_reason_key_for_explicit_none() {
         let store = Sin90Store::open_memory().await.unwrap();
@@ -5539,10 +5541,10 @@ mod ai_classify {
         .await;
         let items = body["items"].as_array().unwrap();
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0]["result"], "nothing");
+        assert_eq!(items[0]["result"], "proposed");
         assert!(
             !items[0].as_object().unwrap().contains_key("reason"),
-            "an explicit choice==\"none\" must not carry a reason key at all: {items:?}"
+            "an explicit choice==\"none\" 待定 fallback must not carry a reason key at all: {items:?}"
         );
     }
 
