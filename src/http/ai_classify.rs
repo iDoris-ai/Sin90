@@ -256,17 +256,19 @@ pub async fn trigger_classify(
 /// calls this directly with hand-built `ClassifyItem`s (from a REAL
 /// `run_classify` call against a stub `ModelPort`) to pin the wire shape.
 pub(crate) fn build_classify_run_items(
-    skipped: Vec<TaskId>,
+    skipped: Vec<(TaskId, &'static str)>,
     outcomes: Vec<ClassifyItem>,
 ) -> Vec<AiRunItem> {
     let mut items: Vec<AiRunItem> = skipped
         .into_iter()
-        .map(|task_id| AiRunItem {
+        .map(|(task_id, reason)| AiRunItem {
             target: task_id,
             result: "skipped".to_string(),
-            // M2 (2026-09-26 review): this run never even tried — a
-            // still-valid pending proposal already covers it.
-            reason: Some("dedup"),
+            // M2 (2026-09-26 review): this run never even tried — either a
+            // still-valid pending proposal already covers it (`"dedup"`) or
+            // (T5.7.2, design §2 #31) a rejected one does, unchanged since
+            // (`"suppressed_rejected"`).
+            reason: Some(reason),
         })
         .collect();
     items.extend(outcomes.into_iter().map(|o| AiRunItem {
@@ -345,6 +347,19 @@ pub(crate) async fn auto_select_targets(
     reader: &crate::store::AiReader,
 ) -> Vec<Task> {
     use crate::ai::AiReadModel;
+    // M5 (review round 2): fetched ONCE, outside the page-doubling loop
+    // below — see `dedup_targets_with_rejected`'s own doc for why re-reading
+    // it on every doubled page was pure waste, not a correctness safeguard.
+    // A failed read degrades to "treat as no known rejections" (same
+    // fail-open posture the loop's own `dedup_targets_with_rejected` error
+    // arm already has), logged so it is not silent.
+    let rejected = store
+        .list_rejected_ops(Capability::Classify.as_str())
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "classify: auto-select list_rejected_ops read failed; treating as empty");
+            Vec::new()
+        });
     let mut page = classify::MAX_CLASSIFY_TASK_IDS as u32;
     loop {
         let candidates = match reader.inbox(page).await {
@@ -355,7 +370,9 @@ pub(crate) async fn auto_select_targets(
             }
         };
         let exhausted = (candidates.len() as u32) < page;
-        let (kept, _skipped) = match dedup_targets(store, &candidates).await {
+        let (kept, _skipped) = match dedup_targets_with_rejected(store, &candidates, &rejected)
+            .await
+        {
             Ok(x) => x,
             Err(e) => {
                 tracing::warn!(error = %e, "classify: auto-select dedup failed; using undeduped candidates");
@@ -376,15 +393,53 @@ pub(crate) async fn auto_select_targets(
 
 /// §11.4 公共's "去重": skip targets that already have a still-PENDING
 /// `AssignTaskDirection` proposal that re-runs `AiSink::precheck`'s dry run
-/// successfully ("仍然有效"). Lives here, not in `ai::classify`, because it
-/// needs `Sin90Store::list_pending_proposals` — a plain store method, not
-/// part of `AiReadModel`/`AiSink`'s deliberately narrow surface (design
-/// §11.5). `pub(crate)` (not private): exercised directly from
-/// `http::tests` (J14) without standing up a full background run.
+/// successfully ("仍然有效") — `reason` `"dedup"` — **or** (T5.7.2, design §2
+/// #31) a REJECTED one whose "situation" has not changed since — `reason`
+/// `"suppressed_rejected"`. Lives here, not in `ai::classify`, because both
+/// halves need `Sin90Store` methods (`list_pending_proposals`/
+/// `list_rejected_ops`) that are not part of `AiReadModel`/`AiSink`'s
+/// deliberately narrow surface (design §11.5). `pub(crate)` (not private):
+/// exercised directly from `http::tests` (J14) without standing up a full
+/// background run.
 pub(crate) async fn dedup_targets(
     store: &Sin90Store,
     targets: &[Task],
-) -> Result<(Vec<Task>, Vec<TaskId>), StoreError> {
+) -> Result<(Vec<Task>, Vec<(TaskId, &'static str)>), StoreError> {
+    // T5.7.2 review round 3: a `list_rejected_ops` failure degrades to "no
+    // known rejections" (same fail-open posture `auto_select_targets`'s own
+    // copy of this read already uses) instead of aborting the whole call —
+    // the pending-proposal dedup half computed inside
+    // `dedup_targets_with_rejected` does not depend on this read at all and
+    // must not go down with it.
+    let rejected = store
+        .list_rejected_ops(Capability::Classify.as_str())
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                error = %e,
+                "dedup_targets: list_rejected_ops failed; treating as empty, pending-dedup unaffected"
+            );
+            Vec::new()
+        });
+    dedup_targets_with_rejected(store, targets, &rejected).await
+}
+
+/// M5 (review round 2): the `list_rejected_ops` read factored out of
+/// [`dedup_targets`] itself so [`auto_select_targets`]'s page-doubling loop
+/// can fetch it ONCE, up front, and pass the SAME snapshot into every page's
+/// dedup call, instead of re-querying it fresh on every doubled page. The
+/// set of REJECTED proposals cannot meaningfully change between this run's
+/// own page-doubling attempts — it only grows via a human `POST /proposals/
+/// {id}/reject`, an action this same in-flight background run cannot itself
+/// trigger — so the repeated re-fetch was pure waste, not a correctness
+/// safeguard `auto_select_targets` depended on. [`dedup_targets`] itself
+/// (the pending, single-call test surface most of `http::tests` exercises)
+/// stays a thin wrapper that fetches its own `rejected` snapshot.
+async fn dedup_targets_with_rejected(
+    store: &Sin90Store,
+    targets: &[Task],
+    rejected: &[crate::store::RejectedOpsRow],
+) -> Result<(Vec<Task>, Vec<(TaskId, &'static str)>), StoreError> {
     let target_ids: std::collections::HashSet<&str> =
         targets.iter().map(|t| t.id.as_str()).collect();
     // 2026-09-24 review (M3): pending-only at the SQL level, not
@@ -407,24 +462,131 @@ pub(crate) async fn dedup_targets(
             }
         }
     }
-    if drafts.is_empty() {
-        return Ok((targets.to_vec(), Vec::new()));
+    let mut skip: std::collections::HashMap<TaskId, &'static str> =
+        std::collections::HashMap::new();
+    if !drafts.is_empty() {
+        let valid = AiSink::precheck(store, Capability::Classify, &drafts).await;
+        for (id, ok) in draft_task_ids.into_iter().zip(valid) {
+            if ok {
+                skip.insert(id, "dedup");
+            }
+        }
     }
-    let valid = AiSink::precheck(store, Capability::Classify, &drafts).await;
-    let skip: std::collections::HashSet<TaskId> = draft_task_ids
-        .into_iter()
-        .zip(valid)
-        .filter_map(|(id, ok)| ok.then_some(id))
+
+    // T5.7.2 review round 2 (H1): rejection-based suppression now applies to
+    // EVERY target, not just a target still literally `direction_id IS
+    // NULL` — the ORIGINAL scoping missed the exact case a 待定-parked
+    // task's OWN reclassify-to-D proposal gets rejected: with the scoping in
+    // place, that rejection was NEVER consulted again (`rejectable` never
+    // contained the task at all, since its `direction_id` is `sin90-triage`,
+    // not `NULL`), so the moment the 待定 retry gate
+    // (`AiReadModel::inbox`/`inbox_task`'s own, separate SQL, `store/
+    // ai_port.rs`) re-qualified the task, classify recommended the SAME
+    // already-rejected D again, forever, for as long as nothing else about
+    // the task's situation changed. The two mechanisms stay independent
+    // (the gate decides WHETHER a triage task is even considered a target
+    // this run; this one decides whether a PARTICULAR recommendation for it
+    // stays suppressed) — only the scoping restriction that used to keep
+    // them from ever interacting for the same task is gone.
+    let rejectable: Vec<&Task> = targets
+        .iter()
+        .filter(|t| !skip.contains_key(&t.id))
         .collect();
+    if !rejectable.is_empty() {
+        // Fingerprint reduces to `task_id` alone here (design §2 #31): this
+        // runs BEFORE the ladder decides which Direction it would recommend,
+        // so there is nothing yet to compare a rejected `direction_id`
+        // against — "same task, situation unchanged" already implies "same
+        // recommendation" (R1/R2/the model are pure functions of current
+        // state). `list_rejected_ops` is oldest-first, so plain overwriting
+        // insert keeps the MOST RECENT rejection per task — its OWN
+        // `proposed_at` (review round 2, M2: the "situation changed" time
+        // basis moved from `rejected_at` to `proposed_at` — a new eligible
+        // Direction that appeared between drafting and rejecting already
+        // made that proposal stale by the time it was rejected).
+        let mut latest_reject: std::collections::HashMap<TaskId, String> =
+            std::collections::HashMap::new();
+        for r in rejected {
+            for op in &r.ops {
+                if let Sin90Op::AssignTaskDirection { task_id, .. } = op {
+                    if target_ids.contains(task_id.as_str()) {
+                        latest_reject.insert(task_id.clone(), r.proposed_at.clone());
+                    }
+                }
+            }
+        }
+        if !latest_reject.is_empty() {
+            // The "新 Direction" leg (§2 #31): one read, shared by every
+            // rejected task this call is considering — a Direction created
+            // after ANY of their `proposed_at` values un-suppresses them.
+            //
+            // T5.7.2 review round 3: this read (and `task_modified_since`
+            // below) used to propagate a failure with `?`, which aborted
+            // this WHOLE function — throwing away the pending-proposal
+            // dedup (`skip` entries already inserted above) along with the
+            // rejection-suppression half that actually failed. Only the
+            // rejection-suppression half is degraded here (fail-open: a
+            // rejected task whose "situation changed" check could not be
+            // answered is simply left un-suppressed, i.e. shown to the
+            // human again rather than silently hidden) — `skip`'s existing
+            // `"dedup"` entries, and every OTHER rejectable task's own
+            // check, are unaffected.
+            let max_new_direction = match store
+                .ai_reader()
+                .max_eligible_direction_created_at()
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "dedup_targets: max_eligible_direction_created_at failed; degrading rejection-suppression only, pending-dedup unaffected"
+                    );
+                    None
+                }
+            };
+            for t in rejectable {
+                let Some(proposed_at) = latest_reject.get(&t.id) else {
+                    continue;
+                };
+                // The "task 被修改过" leg — review round 2 (M1): a real,
+                // `sin90_events`-backed check (`Sin90Store::
+                // task_modified_since`'s own doc has the full story),
+                // replacing a direct `t.updated_at > proposed_at` compare —
+                // that used to be safe ONLY while this branch stayed scoped
+                // to `direction_id IS NULL` tasks (H1 above removed that
+                // scoping) and was ALSO fooled by an accepted `ReorderTasks`
+                // bumping `updated_at` for every task in a week regardless
+                // of Direction, human edit or not.
+                let task_modified = match store.task_modified_since(&t.id, proposed_at).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            task_id = %t.id,
+                            "dedup_targets: task_modified_since failed; degrading rejection-suppression for this task only"
+                        );
+                        continue;
+                    }
+                };
+                let new_direction = max_new_direction
+                    .as_deref()
+                    .is_some_and(|c| c > proposed_at.as_str());
+                if !task_modified && !new_direction {
+                    skip.insert(t.id.clone(), "suppressed_rejected");
+                }
+            }
+        }
+    }
+
     let kept = targets
         .iter()
-        .filter(|t| !skip.contains(&t.id))
+        .filter(|t| !skip.contains_key(&t.id))
         .cloned()
         .collect();
     let skipped = targets
         .iter()
-        .filter(|t| skip.contains(&t.id))
-        .map(|t| t.id.clone())
+        .filter_map(|t| skip.get(&t.id).map(|reason| (t.id.clone(), *reason)))
         .collect();
     Ok((kept, skipped))
 }
