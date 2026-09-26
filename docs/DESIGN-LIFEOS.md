@@ -769,7 +769,7 @@ T5.1.1 对 `ClientError` 的配套改动（在 adapter 里）：加 `Unavailable
 
 **公共部分**：
 - **触发**：三条路由，全部 `require_any_actor`（触发本身只写 `sin90_proposals` 的 `pending` 行与 `sin90_ai_calls`，不改业务状态），返回 `202 {"run_id", "capability"}`，run 在后台跑：
-  `POST /ai/classify {"task_ids"?: [...]}`、`POST /ai/summarize {"review_id"}`、`POST /ai/propose {"week_id"}`；`GET /ai/runs/{run_id}` 返回 `{run_id, capability, state: running|done|aborted|unknown, items: [{target, result: proposed|nothing|deferred|rejected|skipped|aborted, reason?: human_text|dedup}], calls: [...]}`（运行态在进程内存，上限 64 条 LRU ⚖️；重启后只剩 `calls`，`state = unknown`）。*T5.2.1 实现时补*：`aborted` = 该条目因 run 中止（绊线/总时限/panic）未处理，与去重导致的 `skipped` 区分；淘汰只淘汰非 `running` 的 run（`running` 的由 `BusyGuard` 的 `Drop` 保证最终 `finish`，不另设超时）。*T5.3.1 实现时补（2026-09-26 review M2）*：`reason` 只在 `result = "skipped"` 时出现，区分「去重挡住」（`dedup`）与「summarize 自己的 Q7 人写文字门」（`human_text`）；其它 `result` 一律不带这个字段（序列化时整个省略，不是 `null`）。
+  `POST /ai/classify {"task_ids"?: [...]}`、`POST /ai/summarize {"review_id"}`、`POST /ai/propose {"week_id"}`；`GET /ai/runs/{run_id}` 返回 `{run_id, capability, state: running|done|aborted|unknown, items: [{target, result: proposed|nothing|deferred|rejected|skipped|aborted, reason?: human_text|dedup|low_confidence}], calls: [...]}`（运行态在进程内存，上限 64 条 LRU ⚖️；重启后只剩 `calls`，`state = unknown`）。*T5.2.1 实现时补*：`aborted` = 该条目因 run 中止（绊线/总时限/panic）未处理，与去重导致的 `skipped` 区分；淘汰只淘汰非 `running` 的 run（`running` 的由 `BusyGuard` 的 `Drop` 保证最终 `finish`，不另设超时）。*T5.3.1 实现时补（2026-09-26 review M2），T5.2.3 修订*：`reason` 只在 `result = "skipped"`，以及 classify 的 `result = "nothing"` 且是置信度不足导致时（`low_confidence`）出现——区分「去重挡住」（`dedup`，`skipped`）、「summarize 自己的 Q7 人写文字门」（`human_text`，`skipped`）、「classify 的模型步置信度低于阈值」（`low_confidence`，`nothing`：梯子确实试过，只是没自信到能出提议，所以落在「无结果」而不是「跳过」这个桶里，§11.4.1）；其它情况一律不带这个字段（序列化时整个省略，不是 `null`）。`propose` 的 `items` 今天不区分逐项原因，只有 `dedup` 这一种。
   standalone 模式同样注册（port 为 `None`，只有 reflex）。**不在** `/_a24/*` 下。
 - **为什么后台跑、不绑 `request_id`**：被代理请求的总时限是 30s（§11.1 第 12 条），一次本地推理可以到 120s；绑上就会被截断（`RequestNotInFlight`）。所以模型调用**不带 `request_id`**，run 属于 Sin90 进程；进程退出时在途 run 丢弃（已提交的提议与已写的调用记录保留）。
 - **限流（Sin90 这一侧）**：每个能力**单飞**（再触发 → `409 {"code":"ai_busy","run_id"}`）；进程内模型调用信号量 = 2（= 内核每模块在途上限）；`_a24/model/complete` 用 `call_with_timeout(125s)` ⚖️；每 run 调用预算 20、总时限 600s（§11.3.4）。
@@ -798,7 +798,8 @@ T5.1.1 对 `ClientError` 的配套改动（在 adapter 里）：加 `Unavailable
   - 候选以**不透明短键** `d1…dn` 呈现（scratch `candidate_keys`），模型看不到、也就造不出 ULID。
   - messages：`system` = 固定指令（「从候选里选一个最合适的方向；都不合适就选 none；只输出 JSON」）；`user` = JSON `{"item": {"title": …}, "candidates": [{"key":"d1","title":…,"area":…}, …]}`。
   - `response_format`：`{"type":"json_schema","json_schema":{"name":"sin90_classify","strict":true,"schema": <scratch classify::schema>}}`——`{choice: enum[d1…dn, none], confidence: enum[low, medium, high], reason: string ≤ 200}`，`additionalProperties: false`。`max_tokens: 256` ⚖️。
-  - 程序复核（scratch `classify::parse`）：容忍一层 ```` ```json ```` 围栏；`deny_unknown_fields`；`choice` 必须在本次键集内（否则 `bad_output`）；`none` 或 `low` → 本条 `nothing`（记 `ok = 1`——模型认真地说了「不知道」）🟡 Q8。
+  - 程序复核（scratch `classify::parse`）：容忍一层 ```` ```json ```` 围栏；`deny_unknown_fields`；`choice` 必须在本次键集内（否则 `bad_output`，且这个检查在置信度检查**之前**——一个造出来的键即使配上低置信度也仍是 `bad_output`，不会被误判成"低置信度"）；`choice == "none"` → 本条 `nothing`（记 `ok = 1`——模型认真地说了「不知道」）。
+  - **T5.2.3（用户拍板 Q8「没把握就不要提」）**：`confidence` 序数化（`low < medium < high`）后低于 `CLASSIFY_CONFIDENCE_THRESHOLD`（`src/ai/classify.rs` 常量）→ 同样 `nothing`、`ok = 1`（调用行照记，只是不出提议），但 `AiRunItem.reason = "low_confidence"`——与 `choice == "none"`（模型主动说不知道，`reason` 不带这个标记）区分开，两者虽然都落到 `direction_id = None`，但成因不同。🟡 占位阈值 = `medium`（即只拒 `low`）：这是 Q8 表格里"评审给的技术输入"的直接后果——小模型自报置信度校准很差，真实阈值应等 T5.5.1（J26）按各档命中率来定，现在只给一个保守占位、不做先验拍板；阈值目前是一个 Rust 常量，没有接进 `sin90_settings`/`/settings/ai`（那需要复制 `ai.executive_enabled` 那一整套读写+路由+测试，在有真实数值可调之前不值得），一旦 J26 出数据、需要用户可调，照抄 `ai.executive_enabled` 的形状接入即可。
 - **reflex R2（兜底，仅在模型步全部失败/熔断或不存在时；延后不走）**：任务标题与「候选 Direction 标题 + Area 标题」的重合度——ASCII 按长度 ≥ 3 的词、CJK 按字二元组；**唯一最高分**且 ≥ 2 个二元组或 ≥ 1 个词 ⚖️ → 提议；否则 `no_match`。R2 是弱规则，产出的提议 `source = rule`，人一眼能看出不是模型给的。
 - **输出**：每个条目至多一条提议，`ops = [AssignTaskDirection]`，条目之间独立。
 
@@ -989,6 +990,12 @@ CREATE TABLE sin90_settings (
 | J24 | 来源一致 | `SELECT count(*) FROM sin90_proposals p JOIN sin90_ai_calls c ON c.proposal_id = p.id AND c.ok = 1 WHERE p.source NOT IN ('local_brain','executive','rule') OR p.source != CASE WHEN c.engine = 'reflex' THEN 'rule' WHEN c.served_tier = 'remote' THEN 'executive' ELSE 'local_brain' END` = 0，且 AI run 期间产生的每条提议都能 join 到恰好一行 | 在库的副本里改掉一行 `source` → 同一查询 = 1 |
 | J25 | AI 期间无直写 | 挂载模式经 daemon 真实端口触发三个能力，跑 J8 的表快照 | accept 正对照。注：tasks.md 原句「直写路由调用数 0」在进程内 AI 下恒真，不构成判据，故以表快照代替 |
 | J26 | 真 oMLX 冒烟 | `#[ignore]` 手动：`~/.omlx/models` 下的模型，三个能力各一次，记录 `model_id`、延迟、`bad_output` 率**及其按 `NarrativeError` 分类的构成**（尤其「汉字数词 + 量词」误杀引起的降级比例，v2.1 M3）、classify 各置信度档的命中情况（给 Q8 定阈值） | —— |
+
+**T5.2.3 classify 低置信度不出提议（用户拍板 Q8）**
+
+| # | 测试 | 断言 | 正对照 / 变异 |
+|---|---|---|---|
+| J27 | `classify_low_confidence_` | 模型选真实候选键但 `confidence: "low"`（低于 `CLASSIFY_CONFIDENCE_THRESHOLD = medium`）→ 该条目 `nothing`；调用行仍是 `ok=1`、`error_kind=NULL`、`proposal_id=NULL`（模型认真给了答案，只是不够自信）；`sin90_proposals` 计数为 0；`ClassifyItem.reason == Some("low_confidence")`。`choice == "none"`（即使 `confidence: "high"`）同样 `nothing` 但 `reason == None`——两种「没结果」成因不同，不能混标。造出来的键（`"d9"`）配低置信度仍是 `bad_output`（检查顺序：先查键是否存在，再查置信度），不会被误判成低置信度。reflex（R1）命中时模型桩用 `PanicModel`（被调用即 panic）——命中即证明置信度阈值只作用于模型步，不影响 reflex | 正对照：同一夹具下 `confidence: "medium"`（阈值本身，含）或 `"high"` → 都出提议、`reason == None`；`confidence: "medium"` 单独钉住阈值是「严格小于」而不是「小于等于」 |
 
 ### 11.8 自审
 
