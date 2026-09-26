@@ -18,6 +18,7 @@
 //!   cargo test --test agent24_mount_blackbox -- --ignored --test-threads=1
 #![cfg(unix)]
 
+use std::collections::BTreeMap;
 use std::io::{BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -639,6 +640,222 @@ fn wait_for_port_open(port: u16, timeout: Duration) {
             "standalone sin90 never started listening on 127.0.0.1:{port}"
         );
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T5.5.1 — M5 (AI v1) real-mount acceptance additions. Everything below this
+// point (down to `t551_ai_v1_m5_real_mount_acceptance` itself) is shared
+// ONLY by that one test.
+// ---------------------------------------------------------------------------
+
+/// A minimal, single-purpose OpenAI-compat HTTP stub standing in for a local
+/// oMLX server: Agent24's own `agent24-models::OpenAiCompatProvider` posts
+/// to `{base}/v1/chat/completions` regardless of which local backend is
+/// configured (`ai::ports::MODEL_ACCESS` is compiled-in `LocalOnly` for the
+/// OFFICIAL binary this test mounts — `ai_classify::trigger_classify` reads
+/// that constant, not an env var, T5.1.2's own doc), so answering that one
+/// path is enough to stand in for "`OMLX_URL` 指向本地桩" (the task's own
+/// wording). Always replies with the SAME fixed `choices[0].message.content`
+/// regardless of the request body — this test controls its own fixture (one
+/// real Direction candidate, `"d1"`), so the reply never needs to depend on
+/// what was actually asked — and counts how many requests actually arrived,
+/// so a test can assert the local model was genuinely DIALED, not merely
+/// configured. Mirrors Agent24's own `agent24-models::router::tests::
+/// thread_stub` (same single-`read`-then-reply shape, same justification: a
+/// real loopback HTTP client's one small JSON POST arrives in a single
+/// `read()` in practice).
+struct ModelStub {
+    port: u16,
+    hits: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ModelStub {
+    fn start(content: &str) -> Self {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        let body = serde_json::json!({
+            "model": "stub-model",
+            "choices": [{"message": {"role": "assistant", "content": content}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        })
+        .to_string();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                hits2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = s.set_read_timeout(Some(Duration::from_millis(2000)));
+                let mut buf = [0u8; 65536];
+                let _ = Read::read(&mut s, &mut buf);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                     connection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = Write::write_all(&mut s, resp.as_bytes());
+            }
+        });
+        Self { port, hits }
+    }
+
+    fn hits(&self) -> usize {
+        self.hits.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// A throwaway READ-ONLY connection pool straight at a mounted daemon's OWN
+/// `sin90.db` (located via `find_file`, the same technique
+/// `Daemon::read_actor_key` already uses for `actor-keys.json`) — SQLite's
+/// WAL mode lets any number of readers see committed data alongside the
+/// daemon's own live writer connection, so this needs no coordination with
+/// the daemon process at all, and `read_only(true)` guarantees this side of
+/// the test can never itself corrupt the live db. A tiny dedicated
+/// single-thread runtime: `sqlx` is async, this whole file is otherwise
+/// synchronous (mirrors `spawn_ws_subscriber`'s own justification).
+///
+/// This does the SAME "snapshot every table" job as `store::test_hooks::
+/// snapshot_all_tables` (`src/store/mod.rs`) — deliberately re-implemented
+/// here rather than imported: that module is gated behind `#[cfg(any(test,
+/// feature = "test-hooks"))]` on the LIBRARY, and this acceptance run's own
+/// command (`cargo test --test agent24_mount_blackbox -- --ignored
+/// --test-threads=1`, the task's own text) does not pass `--features
+/// test-hooks`, so the library this integration test links against was
+/// built WITHOUT that cfg — `sin90::store::test_hooks` is simply not there
+/// to import. Kept in exact lockstep with that function's own logic
+/// (including the `sin90_events` entity=proposal/¬proposal split) so both
+/// copies encode the identical "只这三样能变" judgment.
+struct Db {
+    rt: tokio::runtime::Runtime,
+    pool: sqlx::SqlitePool,
+}
+
+impl Db {
+    fn open_readonly(home: &Path) -> Self {
+        let path = find_file(home, "sin90.db")
+            .unwrap_or_else(|| panic!("sin90.db not found anywhere under {}", home.display()));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let pool = rt.block_on(async {
+            let opts = sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&path)
+                .read_only(true);
+            sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(opts)
+                .await
+                .unwrap_or_else(|e| panic!("could not open {} read-only: {e}", path.display()))
+        });
+        Self { rt, pool }
+    }
+
+    fn scalar_i64(&self, sql: &str) -> i64 {
+        let pool = &self.pool;
+        self.rt
+            .block_on(async move {
+                let row: (i64,) = sqlx::query_as(sql).fetch_one(pool).await?;
+                Ok::<_, sqlx::Error>(row.0)
+            })
+            .unwrap()
+    }
+
+    /// Every table in the db, snapshotted as one ordered `Vec<String>` of
+    /// every-column-quoted rows — see this struct's own doc for why this is
+    /// a re-implementation of `store::test_hooks::snapshot_all_tables`
+    /// rather than an import of it.
+    fn snapshot_all_tables(&self) -> BTreeMap<String, Vec<String>> {
+        let pool = &self.pool;
+        self.rt.block_on(async move {
+            let tables: Vec<String> = sqlx::query_scalar(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+                 ORDER BY name",
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap();
+            let mut out = BTreeMap::new();
+            for t in tables {
+                let cols: Vec<String> =
+                    sqlx::query_scalar(&format!("SELECT name FROM pragma_table_info('{t}')"))
+                        .fetch_all(pool)
+                        .await
+                        .unwrap();
+                let expr = cols
+                    .iter()
+                    .map(|c| format!("quote({c})"))
+                    .collect::<Vec<_>>()
+                    .join(" || '|' || ");
+                if t == "sin90_events" {
+                    for (key, where_clause) in [
+                        ("sin90_events(entity=proposal)", "WHERE entity = 'proposal'"),
+                        (
+                            "sin90_events(entity<>proposal)",
+                            "WHERE entity <> 'proposal'",
+                        ),
+                    ] {
+                        let rows: Vec<String> = sqlx::query_scalar(&format!(
+                            "SELECT {expr} AS r FROM {t} {where_clause} ORDER BY rowid"
+                        ))
+                        .fetch_all(pool)
+                        .await
+                        .unwrap();
+                        out.insert(key.to_string(), rows);
+                    }
+                    continue;
+                }
+                let rows: Vec<String> =
+                    sqlx::query_scalar(&format!("SELECT {expr} AS r FROM {t} ORDER BY rowid"))
+                        .fetch_all(pool)
+                        .await
+                        .unwrap();
+                out.insert(t, rows);
+            }
+            out
+        })
+    }
+}
+
+/// Which snapshot keys changed, `before` -> `after` — a plain `BTreeMap`
+/// compare, factored out as its own function so its discriminating power can
+/// be exercised directly against hand-built maps (this file's own mutation
+/// verification of the CHECK itself), not just implicitly through one real
+/// run that happens to produce no diff.
+fn diff_snapshot_keys(
+    before: &BTreeMap<String, Vec<String>>,
+    after: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    before
+        .keys()
+        .filter(|k| before.get(*k) != after.get(*k))
+        .cloned()
+        .collect()
+}
+
+/// Polls `GET /ai/runs/{run_id}` until it reaches a terminal state
+/// (`"done"`/`"aborted"`) — `"running"`/`"unknown"` keep waiting.
+fn wait_for_ai_run_done(d: &Daemon, run_id: &str, timeout: Duration) -> serde_json::Value {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some((status, body)) = http_get(
+            d.port,
+            Some(&d.token),
+            &format!("/api/v1/sin90/ai/runs/{run_id}"),
+        ) {
+            if status == 200 {
+                let rec: serde_json::Value = serde_json::from_str(&body).unwrap();
+                let state = rec["state"].as_str().unwrap_or("unknown");
+                if state == "done" || state == "aborted" {
+                    return rec;
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "ai run {run_id} never reached a terminal state within {timeout:?}; daemon log:\n{}",
+            d.combined_log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -1377,18 +1594,45 @@ fn routine_m3_real_mount_acceptance() {
     .unwrap();
     assert_eq!(status, 200, "force-upsert: {body}");
     let force_result: serde_json::Value = serde_json::from_str(&body).unwrap();
-    for outcome_field in ["first_outcome", "second_outcome"] {
-        let outcome = force_result[outcome_field].as_str().unwrap();
-        assert!(
-            outcome == "Updated" || outcome == "Unchanged",
-            "expected a real upsert outcome (Updated or Unchanged) for {outcome_field}, got \
-             {outcome}: {force_result}"
-        );
-    }
-    // The actual assertion: still exactly one row for this key — panics
-    // inside `wait_for_one_schedule_row` if the double upsert ever produced a
-    // second row.
-    wait_for_one_schedule_row(&d3, &key_a, sync_timeout);
+    // `first_outcome` may legitimately be either: this debug route's own
+    // upsert call (a plain `ModuleSpec::Cron`/`enabled`/no `label`) is not
+    // necessarily byte-identical to whatever the reconcile-on-restart path
+    // above (§2) already wrote for this same key, so the kernel may still
+    // see a real field-level change on the FIRST of these two calls.
+    let first_outcome = force_result["first_outcome"].as_str().unwrap();
+    assert!(
+        first_outcome == "Updated" || first_outcome == "Unchanged",
+        "expected a real upsert outcome (Updated or Unchanged) for first_outcome, got \
+         {first_outcome}: {force_result}"
+    );
+    // T3.5.1 review (PR #63, Low 1/2): `second_outcome` must NOT be allowed
+    // to also read `Updated` — it is the SECOND of two back-to-back calls
+    // with the EXACT SAME key/spec/enabled/label/request_id, no time and no
+    // other write in between, so the kernel's own idempotent-by-key `upsert`
+    // has nothing left to change. Allowing `Updated` here would have let a
+    // regression that made `upsert` non-idempotent (re-writing on every call
+    // regardless of whether anything differs) slip through as if it were
+    // the harmless "first call still had something to fix" case above.
+    assert_eq!(
+        force_result["second_outcome"], "Unchanged",
+        "the second of two immediately-repeated upserts for an UNCHANGED Routine must be a \
+         true no-op (Unchanged), not Updated: {force_result}"
+    );
+    // T3.5.1 review (PR #63, Low 2/2): "内核侧幂等" must compare the SAME
+    // kernel schedule id across the double upsert, not merely "still exactly
+    // one row" — the row-count check alone would not catch a bug where the
+    // kernel silently deleted-and-recreated a row under the same key on a
+    // redundant upsert (still exactly 1 row, but a DIFFERENT id, i.e. NOT
+    // actually idempotent by the design's own "行数不变" reading of "幂等").
+    // `schedule_a` here is §2's own already-fetched row for this key — no
+    // extra round trip needed to capture the "before" id.
+    let before_id = schedule_a["id"].clone();
+    let after = wait_for_one_schedule_row(&d3, &key_a, sync_timeout);
+    assert_eq!(
+        after["id"], before_id,
+        "kernel-side idempotency must preserve the SAME schedule id across a redundant \
+         double upsert, not just \"still exactly one row\": before {before_id}, after {after}"
+    );
 
     // ── §4: Routine B, cron pinned to a real near-future minute, waited out
     //    with a real tick — no `At`, per the task's own instruction.
@@ -1844,5 +2088,455 @@ fn t441_finalized_review_summary_is_recallable_from_kernel_memory() {
     assert_eq!(
         matches_after_restart[0]["id"], found["id"],
         "same memory, same kernel-minted id"
+    );
+}
+
+/// **T5.5.1 — M5 real-mount acceptance** (DESIGN-LIFEOS.md §6 M5 / §11.7's
+/// J23-J25 spirit, narrowed to the task's own literal text since the
+/// OFFICIAL binary this test mounts is compiled `ai::ports::MODEL_ACCESS ==
+/// LocalOnly` unconditionally — `domain-os.yml` never declares
+/// `model_access: remote_allowed`, §2 #26's hard constraint — so there is no
+/// `executive` path to exercise here at all; that is package B's job,
+/// J16/J23, out of scope for this task).
+///
+/// Two generations of the SAME mounted daemon, sharing one Direction
+/// candidate fixture (`"Quarterly Budget Review"`, no Area) but each its own
+/// inbox Task and its own `OMLX_URL`/`OLLAMA_URL`, so each is a genuine,
+/// independent trigger of the real `POST /ai/classify` -> real `_a24/model/
+/// complete` -> real local model provider path — through the real
+/// `agent24d` proxy end to end, not an in-process fake `ModelPort`:
+///
+/// - **generation "up"**: `OMLX_URL` points at a real local HTTP stub
+///   ([`ModelStub`]) that answers the classify schema with the fixture's
+///   only candidate key (`"d1"`) — task's own wording "在挂载黑盒里把
+///   `OMLX_URL` 指向本地桩". `OLLAMA_URL` points at a SECOND, also-reachable
+///   stub that would happily answer too, standing in for "a remote-ish
+///   second provider" — asserting it receives ZERO hits is this run's own
+///   "远端桩收到的请求数为 0" positive-path proof: even with a second live
+///   endpoint configured, the ladder's own provider order (`agent24-models::
+///   ModelRouter::from_env`: oMLX before Ollama) means it is never dialed
+///   once the first Local-tier provider already answered.
+/// - **generation "down"**: BOTH `OMLX_URL`/`OLLAMA_URL` point at ports
+///   nothing listens on (`pick_free_port()`, dropped — task's own "环境变量
+///   指向 127.0.0.1 的一个关闭端口") — every `_a24/model/complete` call this
+///   generation makes therefore comes back `ModelError::Unavailable` (a
+///   connect failure), which `model_callback::map_model_error` (Agent24)
+///   maps to the wire's `{cause: no_provider, retryable: true}` closed set
+///   (verified by reading that function directly, not assumed) — i.e. this
+///   generation is the task's own explicit mutation instruction ("让
+///   ModelClient 永远返回 Unavailable") realized as a real, running
+///   scenario, not a hypothetical: `ai::ladder::ModelFailure::action()`
+///   degrades `Unavailable` to the next step (§11.3.4), which for `classify`
+///   is reflex fallback R2 — the fixture's task title is chosen to overlap
+///   the ONE candidate's title unambiguously (`r2_reflex`'s own "unique
+///   winner" rule) so R2 is guaranteed decisive, proving "classify 仍产出
+///   提议" (task's own wording) genuinely holds when the network is down,
+///   not merely that nothing crashed.
+///
+/// Both generations' produced proposal must additionally satisfy, checked
+/// directly against the real mounted daemon's OWN `sin90.db` file (not the
+/// HTTP-serialized view — the task's own literal SQL):
+/// `SELECT count(*) FROM sin90_proposals WHERE source NOT IN
+/// ('local_brain','executive','rule')` = 0 — plus a table-snapshot diff
+/// bracketing each classify run (this test's own stand-in for the task's
+/// "AI 运行期间，直写路由的调用次数为 0": DESIGN-LIFEOS.md §11.7's own J25
+/// entry notes that literal call-count is vacuously true for an in-process
+/// AI module and prescribes the table-snapshot instead — this test brings
+/// that judgment to the REAL mount, not just the in-process unit test
+/// `store::ai_port::ai_boundary_tables_unchanged` already covers).
+///
+/// Non-vacuousness (task's own "不能是永真断言"): the very end of this test
+/// deliberately corrupts a COPY of the real data (a `sqlite` `TEMP TABLE`,
+/// opened only after every daemon here has already exited — DESIGN-LIFEOS.md
+/// §11.7's own J24 prescribes exactly this "在库的副本里改掉一行 source ->
+/// 同一查询 = 1" technique) and re-runs the SAME SQL, and separately proves
+/// [`diff_snapshot_keys`] genuinely detects a changed table against
+/// hand-built maps — both checks are shown capable of failing, not just
+/// shown to currently pass.
+#[test]
+#[ignore = "needs a sibling Agent24 checkout; run explicitly: cargo test --test agent24_mount_blackbox -- --ignored --test-threads=1"]
+fn t551_ai_v1_m5_real_mount_acceptance() {
+    let checkout = agent24_checkout().unwrap_or_else(|| {
+        panic!(
+            "no Agent24 checkout found (set AGENT24_CHECKOUT or place it at ../Agent24) — this \
+             test must FAIL, not silently skip, when its prerequisite is missing"
+        )
+    });
+    let agent24d_bin = build_agent24d(&checkout);
+    let sin90_bin = PathBuf::from(env!("CARGO_BIN_EXE_sin90"));
+
+    let classify_choice_d1 =
+        serde_json::json!({"choice": "d1", "confidence": "high", "reason": "matches Finance"})
+            .to_string();
+
+    let home = tmp_home("m5-ai");
+
+    // Same "nothing already mounted" guard every other test in this file
+    // uses (T11 context — see `sin90_mounts_under_a_real_agent24_daemon`'s
+    // own doc).
+    let d0 = start_daemon(&home, &agent24d_bin, &[]);
+    let (status, body) = http_get(d0.port, Some(&d0.token), "/api/v1/os").unwrap();
+    assert_eq!(status, 200, "{body}");
+    let before: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        before["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["name"] != "sin90"),
+        "cannot run this test: agent24d still has an in-process \"sin90\" module compiled in: \
+         {body}"
+    );
+    drop(d0);
+
+    install_sin90(&home.join(".agent24/packages"), &sin90_bin);
+
+    // ── generation "up": OMLX_URL -> a real local stub ──────────────────────
+    let omlx_up = ModelStub::start(&classify_choice_d1);
+    // A second, ALSO reachable stub (would answer if ever asked) standing in
+    // for "a remote-ish second provider" — see this test's own doc for why
+    // asserting zero hits on THIS is the real, positive-path half of "远端桩
+    // 收到的请求数为 0".
+    let ollama_up = ModelStub::start(&classify_choice_d1);
+    let omlx_up_url = format!("http://127.0.0.1:{}", omlx_up.port);
+    let ollama_up_url = format!("http://127.0.0.1:{}", ollama_up.port);
+    let d_up = start_daemon(
+        &home,
+        &agent24d_bin,
+        &[
+            ("OMLX_URL", omlx_up_url.as_str()),
+            ("OLLAMA_URL", ollama_up_url.as_str()),
+        ],
+    );
+    wait_for_sin90_ready(&d_up, Duration::from_secs(30));
+    let human_key = d_up.read_actor_key(&home, "human", Duration::from_secs(10));
+
+    // One shared Direction candidate for BOTH generations (same `home`, same
+    // `sin90.db` — a real restart of the SAME data, same convention every
+    // other multi-generation test in this file already uses).
+    let (status, body) = http_call(
+        d_up.port,
+        "POST",
+        "/api/v1/sin90/directions",
+        Some(&d_up.token),
+        Some(&human_key),
+        Some(r#"{"title":"Quarterly Budget Review","target_window":"2026-Q4"}"#),
+    )
+    .unwrap();
+    assert_eq!(status, 201, "POST /directions: {body}");
+    let direction: serde_json::Value = serde_json::from_str(&body).unwrap();
+    // Not read back directly (the fixture only needs the candidate to
+    // EXIST — `classify` resolves it internally via `AiReadModel::
+    // direction_candidates`); kept named, not `_`, so a future assertion
+    // that DOES want to check the accepted op's `direction_id` has an
+    // obvious variable to reach for instead of re-parsing `direction` again.
+    let _direction_id = direction["id"].as_str().unwrap().to_owned();
+
+    // Task 1: R2's own "unique winner" fixture (`ai::classify::tests::
+    // r2_reflex_ascii_word_overlap_picks_unique_winner`) — "quarterly"/
+    // "budget" both length >= 3 with a letter, both appear in the ONE
+    // candidate's title, so reflex R2 (used by generation "down" below)
+    // would ALSO decide this one correctly; generation "up"'s stub answers
+    // regardless of title, so this fixture serves both generations without
+    // needing two different Direction candidates.
+    let (status, body) = http_call(
+        d_up.port,
+        "POST",
+        "/api/v1/sin90/tasks",
+        Some(&d_up.token),
+        Some(&human_key),
+        Some(r#"{"title":"Draft the quarterly budget numbers","direction_id":null,"parent_task_id":null}"#),
+    )
+    .unwrap();
+    assert_eq!(status, 201, "POST /tasks (task 1): {body}");
+    let task1: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let task1_id = task1["id"].as_str().unwrap().to_owned();
+
+    // Snapshot brackets ONLY the classify run itself — fixture creation
+    // above (Direction + Task) is real, EXPECTED direct writes and must not
+    // be counted against "AI 运行期间直写路由调用数为 0".
+    let db = Db::open_readonly(&home);
+    let before_up = db.snapshot_all_tables();
+
+    let (status, body) = http_call(
+        d_up.port,
+        "POST",
+        "/api/v1/sin90/ai/classify",
+        Some(&d_up.token),
+        Some(&human_key),
+        Some(&format!(r#"{{"task_ids":["{task1_id}"]}}"#)),
+    )
+    .unwrap();
+    assert_eq!(status, 202, "POST /ai/classify (task 1): {body}");
+    let run1: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let run1_id = run1["run_id"].as_str().unwrap().to_owned();
+
+    let rec1 = wait_for_ai_run_done(&d_up, &run1_id, Duration::from_secs(30));
+    assert_eq!(rec1["state"], "done", "{rec1}");
+    assert_eq!(rec1["items"][0]["target"], task1_id, "{rec1}");
+    assert_eq!(
+        rec1["items"][0]["result"], "proposed",
+        "classify with a reachable local stub must produce a proposal: {rec1}"
+    );
+    let calls1 = rec1["calls"].as_array().unwrap();
+    // `plan()` always schedules `Step::ReflexDecisive` FIRST for `classify`
+    // regardless of model presence (`ai::ladder::plan`'s own doc) — with no
+    // prior classification history for this brand-new title, R1 is
+    // "undecided" (`ok=0`, not a hard failure, §11.3.5 L5), THEN the
+    // reachable local model step actually decides it. Two rows, not one.
+    assert_eq!(
+        calls1.len(),
+        2,
+        "reflex-decisive (undecided) + one reachable model step -> exactly two call rows: \
+         {calls1:?}"
+    );
+    assert_eq!(calls1[0]["engine"], "reflex", "{calls1:?}");
+    assert_eq!(calls1[0]["ok"], false, "{calls1:?}");
+    assert_eq!(calls1[0]["error_kind"], "undecided", "{calls1:?}");
+    assert_eq!(calls1[1]["ok"], true, "{calls1:?}");
+    assert_eq!(calls1[1]["engine"], "local", "{calls1:?}");
+    assert_eq!(calls1[1]["served_tier"], "local", "{calls1:?}");
+    let proposal1_id = calls1[1]["proposal_id"].as_str().unwrap().to_owned();
+
+    let after_up = db.snapshot_all_tables();
+
+    // ── "OMLX_URL 指向本地桩" was genuinely dialed, not just configured ────
+    assert!(
+        omlx_up.hits() > 0,
+        "the local model stub must have received at least one request"
+    );
+    // ── the positive-path half of "远端桩收到的请求数为 0" ──────────────────
+    assert_eq!(
+        ollama_up.hits(),
+        0,
+        "the second (reachable) stub must never be dialed once the first Local-tier provider \
+         already answered"
+    );
+
+    // ── source check (task's own literal SQL) ───────────────────────────────
+    assert_eq!(
+        db.scalar_i64(
+            "SELECT count(*) FROM sin90_proposals \
+             WHERE source NOT IN ('local_brain','executive','rule')"
+        ),
+        0
+    );
+    // `scalar_i64` takes no bind params of its own — inline the id directly;
+    // a proposal id is this crate's own `ulid()`-derived string (see
+    // `core::ulid`), never attacker-controlled input in this test.
+    assert_eq!(
+        db.scalar_i64(&format!(
+            "SELECT count(*) FROM sin90_proposals WHERE id = '{proposal1_id}' AND source = \
+             'local_brain'"
+        )),
+        1,
+    );
+
+    // ── table-snapshot stand-in for "直写路由调用数为 0" ─────────────────────
+    let allowed_up: std::collections::HashSet<&str> = [
+        "sin90_proposals",
+        "sin90_ai_calls",
+        "sin90_events(entity=proposal)",
+    ]
+    .into_iter()
+    .collect();
+    let diff_up = diff_snapshot_keys(&before_up, &after_up);
+    assert!(
+        !diff_up.is_empty(),
+        "the classify run must have changed SOMETHING (a proposal + a call row) — an empty \
+         diff here would mean the snapshot itself never actually saw the run's writes"
+    );
+    assert!(
+        diff_up.iter().all(|k| allowed_up.contains(k.as_str())),
+        "classify (generation \"up\") touched a table outside {{sin90_proposals, \
+         sin90_ai_calls, sin90_events(entity=proposal)}} — a direct write, not a Proposal: \
+         {diff_up:?}"
+    );
+
+    drop(db);
+    drop(d_up);
+
+    // ── generation "down": both providers genuinely unreachable ────────────
+    let dead_omlx = pick_free_port();
+    let dead_ollama = pick_free_port();
+    let dead_omlx_url = format!("http://127.0.0.1:{dead_omlx}");
+    let dead_ollama_url = format!("http://127.0.0.1:{dead_ollama}");
+    let d_down = start_daemon(
+        &home,
+        &agent24d_bin,
+        &[
+            ("OMLX_URL", dead_omlx_url.as_str()),
+            ("OLLAMA_URL", dead_ollama_url.as_str()),
+        ],
+    );
+    wait_for_sin90_ready(&d_down, Duration::from_secs(30));
+    let human_key = d_down.read_actor_key(&home, "human", Duration::from_secs(10));
+
+    // Task 2: a DIFFERENT title, same "unique winner" property against the
+    // SAME one Direction candidate (`direction_id` from generation "up",
+    // persisted in the same `sin90.db`) — "budget" is the shared word.
+    let (status, body) = http_call(
+        d_down.port,
+        "POST",
+        "/api/v1/sin90/tasks",
+        Some(&d_down.token),
+        Some(&human_key),
+        Some(r#"{"title":"Second look at the budget plan","direction_id":null,"parent_task_id":null}"#),
+    )
+    .unwrap();
+    assert_eq!(status, 201, "POST /tasks (task 2): {body}");
+    let task2: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let task2_id = task2["id"].as_str().unwrap().to_owned();
+
+    let db = Db::open_readonly(&home);
+    let before_down = db.snapshot_all_tables();
+
+    let (status, body) = http_call(
+        d_down.port,
+        "POST",
+        "/api/v1/sin90/ai/classify",
+        Some(&d_down.token),
+        Some(&human_key),
+        Some(&format!(r#"{{"task_ids":["{task2_id}"]}}"#)),
+    )
+    .unwrap();
+    assert_eq!(status, 202, "POST /ai/classify (task 2): {body}");
+    let run2: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let run2_id = run2["run_id"].as_str().unwrap().to_owned();
+
+    let rec2 = wait_for_ai_run_done(&d_down, &run2_id, Duration::from_secs(30));
+    assert_eq!(rec2["state"], "done", "{rec2}");
+    assert_eq!(rec2["items"][0]["target"], task2_id, "{rec2}");
+    assert_eq!(
+        rec2["items"][0]["result"], "proposed",
+        "the task's own acceptance bar — classify must STILL produce a proposal with both \
+         local providers unreachable (falls back to reflex R2): {rec2}"
+    );
+    let calls2 = rec2["calls"].as_array().unwrap();
+    // Reflex-decisive (undecided, same reasoning as generation "up") + one
+    // degraded model step (ok=0) + one successful reflex FALLBACK (ok=1):
+    // three rows, not two.
+    assert_eq!(
+        calls2.len(),
+        3,
+        "reflex-decisive (undecided) + one degraded model step (ok=0) + one successful reflex \
+         fallback (ok=1): {calls2:?}"
+    );
+    assert_eq!(calls2[0]["engine"], "reflex", "{calls2:?}");
+    assert_eq!(calls2[0]["ok"], false, "{calls2:?}");
+    assert_eq!(calls2[0]["error_kind"], "undecided", "{calls2:?}");
+    assert_eq!(calls2[1]["engine"], "local", "{calls2:?}");
+    assert_eq!(calls2[1]["ok"], false, "{calls2:?}");
+    assert_eq!(
+        calls2[1]["error_kind"], "unavailable.no_provider",
+        "a genuine connect failure to BOTH local providers must map to the SAME closed-set \
+         wire cause J1's own in-process fixture uses: {calls2:?}"
+    );
+    assert_eq!(calls2[2]["engine"], "reflex", "{calls2:?}");
+    assert_eq!(calls2[2]["fallback_from"], "local", "{calls2:?}");
+    assert_eq!(calls2[2]["ok"], true, "{calls2:?}");
+    let proposal2_id = calls2[2]["proposal_id"].as_str().unwrap().to_owned();
+
+    let after_down = db.snapshot_all_tables();
+
+    assert_eq!(
+        db.scalar_i64(
+            "SELECT count(*) FROM sin90_proposals \
+             WHERE source NOT IN ('local_brain','executive','rule')"
+        ),
+        0
+    );
+    // Sharper than the aggregate NOT-IN check above: `source_for(Reflex, _)`
+    // (`ai::ladder`) must specifically derive `'rule'`, not merely
+    // "something in the allowed set" — a bug that mapped a reflex-produced
+    // proposal to `'local_brain'` instead would still pass the aggregate
+    // check above but must fail THIS one (verified by hand: flipping that
+    // arm and re-running this test turns exactly this assertion red, see
+    // the PR notes).
+    assert_eq!(
+        db.scalar_i64(&format!(
+            "SELECT count(*) FROM sin90_proposals WHERE id = '{proposal2_id}' AND source = 'rule'"
+        )),
+        1,
+        "the reflex-fallback-produced proposal must have source = 'rule', not just some \
+         allowed value"
+    );
+
+    let diff_down = diff_snapshot_keys(&before_down, &after_down);
+    assert!(!diff_down.is_empty());
+    assert!(
+        diff_down.iter().all(|k| allowed_up.contains(k.as_str())),
+        "classify (generation \"down\", reflex-only) touched a table outside the allowed set: \
+         {diff_down:?}"
+    );
+
+    drop(db);
+    drop(d_down);
+
+    // ── non-vacuousness (task's own "不能是永真断言") ────────────────────────
+    //
+    // (1) diff_snapshot_keys against hand-built maps: proves the comparison
+    //     itself can see a real difference, not just "always empty".
+    let mut fake_before = BTreeMap::new();
+    fake_before.insert("sin90_tasks".to_string(), vec!["row-1".to_string()]);
+    let mut fake_after = fake_before.clone();
+    fake_after.insert("sin90_tasks".to_string(), vec!["row-1-mutated".to_string()]);
+    assert_eq!(
+        diff_snapshot_keys(&fake_before, &fake_before),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        diff_snapshot_keys(&fake_before, &fake_after),
+        vec!["sin90_tasks".to_string()]
+    );
+
+    // (2) the source-membership SQL against a corrupted COPY of the REAL
+    //     data — DESIGN-LIFEOS.md §11.7's own J24 technique. Opened only
+    //     AFTER every daemon above has already exited: a plain (non-
+    //     read-only) connection to the SAME file, but every write below
+    //     lands in a `TEMP TABLE` — SQLite's temp storage is a private,
+    //     separate database even on an ordinary connection, so this can
+    //     never touch `sin90.db`'s own real tables.
+    let db_path = find_file(&home, "sin90.db").unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let pool = rt.block_on(async {
+        let opts = <sqlx::sqlite::SqliteConnectOptions as std::str::FromStr>::from_str(&format!(
+            "sqlite://{}",
+            db_path.display()
+        ))
+        .unwrap();
+        sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap()
+    });
+    rt.block_on(async {
+        sqlx::query("CREATE TEMP TABLE mut_proposals AS SELECT * FROM sin90_proposals")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Corrupt exactly the row this test itself created in generation
+        // "up" — known-good before mutation (already asserted `source =
+        // 'local_brain'` above), so this is a controlled, single-row flip.
+        sqlx::query("UPDATE mut_proposals SET source = 'bogus_source' WHERE id = ?")
+            .bind(&proposal1_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    });
+    let bad_count: (i64,) = rt
+        .block_on(
+            sqlx::query_as(
+                "SELECT count(*) FROM mut_proposals \
+                 WHERE source NOT IN ('local_brain','executive','rule')",
+            )
+            .fetch_one(&pool),
+        )
+        .unwrap();
+    assert_eq!(
+        bad_count.0, 1,
+        "the source-membership query must be able to see a real violation on a corrupted copy, \
+         not just always answer 0"
     );
 }
