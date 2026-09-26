@@ -257,9 +257,13 @@ pub(super) async fn dedup_propose(
         .week_tasks(&week.id)
         .await
         .map_err(|e| StoreError::Internal(e.to_string()))?;
-    let current_non_terminal_ids: HashSet<TaskId> = week_tasks_all
+    let week_tasks_non_terminal: Vec<Task> = week_tasks_all
         .iter()
         .filter(|t| !crate::core::task_is_terminal(t.status))
+        .cloned()
+        .collect();
+    let current_non_terminal_ids: HashSet<TaskId> = week_tasks_non_terminal
+        .iter()
         .map(|t| t.id.clone())
         .collect();
 
@@ -392,10 +396,24 @@ pub(super) async fn dedup_propose(
     // without leaving the non-terminal set does not by itself invalidate a
     // pending reorder that still names it; that is intentionally accepted
     // (§11.4.3), not a gap.
+    // Low (2026-09-26 review): once `skip_reorder` is already decided,
+    // further reorder_drafts can't change it back — but `valid` is a SINGLE
+    // shared iterator, positionally aligned with `all_drafts` (carry, THEN
+    // reorder, THEN create); a bare `break` here would leave any remaining
+    // reorder_drafts' precheck results undrained and misalign every create
+    // draft's `valid.next()` below. So `valid.next()` is drained for EVERY
+    // reorder draft unconditionally first (`reorder_valid`, order preserved),
+    // and only the decision loop over the now-decoupled results gets to
+    // `break` early.
+    let reorder_valid: Vec<bool> = reorder_drafts
+        .iter()
+        .map(|_| valid.next().unwrap_or(false))
+        .collect();
     let mut skip_reorder = false;
-    for (_, order_set) in &reorder_drafts {
-        if valid.next().unwrap_or(false) && order_set == &current_non_terminal_ids {
+    for (ok, (_, order_set)) in reorder_valid.iter().zip(&reorder_drafts) {
+        if *ok && order_set == &current_non_terminal_ids {
             skip_reorder = true;
+            break;
         }
     }
     // M-b (2026-09-24 review round 4): create's dedup is PER-DIRECTION, like
@@ -485,6 +503,11 @@ pub(super) async fn dedup_propose(
         // actually needs it — avoids the extra `gap_directions` read on a
         // propose run with no create-shaped rejection at all.
         let mut current_gap_ids: Option<HashSet<crate::core::DirectionId>> = None;
+        // Same lazy-cache posture for reorder's own `rhythm_alloc` read
+        // (below) — avoids the read entirely on a propose run with no
+        // reorder-shaped rejection at all, and re-reading it once covers
+        // every rejected reorder this loop happens to see.
+        let mut current_alloc: Option<Vec<crate::core::Alloc>> = None;
         for r in &rejected {
             if r.ops.is_empty() || !situation_unchanged(&r.proposed_at) {
                 continue;
@@ -504,31 +527,50 @@ pub(super) async fn dedup_propose(
                 }
             }
             if let [Sin90Op::ReorderTasks { week_id, order }] = r.ops.as_slice() {
-                if week_id == &week.id
-                    && order.iter().cloned().collect::<HashSet<TaskId>>()
-                        == current_non_terminal_ids
-                {
-                    // T5.7.2 review round 2 (M3): reorder now ALSO accepts
-                    // the "task 被修改过" leg (M1's same judgement,
-                    // `Sin90Store::task_modified_since`) — any task in the
-                    // week whose status changed or content was edited AFTER
-                    // this rejected reorder was proposed means the situation
-                    // changed, even with no new Direction in sight. Checked
-                    // over EVERY task currently in the week (not just the
-                    // ones the rejected `order` named): a task added to the
-                    // week after the rejection, or one removed from it,
-                    // already fails the order-covering check above and never
-                    // reaches here, but a genuine status/content edit on any
-                    // task still in the CURRENT non-terminal set is exactly
-                    // the signal this leg exists to catch.
-                    let mut any_modified = false;
-                    for t in &week_tasks_all {
-                        if store.task_modified_since(&t.id, &r.proposed_at).await? {
-                            any_modified = true;
-                            break;
+                if week_id == &week.id {
+                    // 2026-09-26 external review (blocking): the OLD
+                    // judgement here was "task set unchanged" + `task_
+                    // modified_since` (M3) — but `reorder_reflex` (`ai::
+                    // propose`) ranks by `status_tier` THEN by the task's
+                    // Direction's rhythm-alloc `pct`, and `task_modified_
+                    // since` deliberately EXCLUDES `direction_assigned`
+                    // events (correct for its OTHER caller — see that
+                    // method's own doc — but blind here): reassigning a
+                    // task's Direction, or a quota change on `sin90_
+                    // rhythms`, changes reflex's ranking WITHOUT tripping
+                    // either the set-coverage check or `task_modified_
+                    // since`. Fixed by asking reflex itself, right now:
+                    // recompute `reorder_reflex` over the CURRENT
+                    // non-terminal set and the CURRENT quota, and only keep
+                    // suppressing if that recomputed order is IDENTICAL to
+                    // the rejected `order`. This subsumes the old set-
+                    // coverage check for free — `reorder_reflex` only ever
+                    // returns a full permutation of `week_tasks_non_
+                    // terminal`, so a task added to/removed from the
+                    // current non-terminal set already makes the two
+                    // `Vec<TaskId>` different lengths, let alone content —
+                    // and a plain status change (M3's own `transitioned`
+                    // leg) still lifts it too, since `status_tier` is
+                    // reflex's OWN primary sort key. The `task_modified_
+                    // since` leg is gone: content edits that leave both
+                    // status and Direction (hence `pct`) untouched cannot
+                    // change reflex's output either, so there is nothing
+                    // left for that leg to catch that this one doesn't
+                    // already subsume.
+                    let alloc = match &current_alloc {
+                        Some(a) => a,
+                        None => {
+                            let a = reader.rhythm_alloc().await.unwrap_or_else(|e| {
+                                tracing::warn!(error = %e, "propose: dedup (rejected reorder) rhythm_alloc read failed, treating as empty");
+                                Vec::new()
+                            });
+                            current_alloc = Some(a);
+                            current_alloc.as_ref().unwrap()
                         }
-                    }
-                    if !any_modified {
+                    };
+                    let recomputed_order =
+                        crate::ai::propose::reorder_reflex(&week_tasks_non_terminal, alloc);
+                    if &recomputed_order == order {
                         skip_reorder = true;
                     }
                 }
