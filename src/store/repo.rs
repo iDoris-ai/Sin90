@@ -417,6 +417,67 @@ fn review_markdown_relpath(kind: ReviewKind, period: &str) -> Result<String> {
     Ok(format!("reviews/{kind_str}/{period}.md"))
 }
 
+/// T4.4.1 (design DESIGN-LIFEOS.md §2 #24, §4.1): the `sin90_outbox.dedup_key`
+/// for a Review's `memory.remember` row — mirrors [`routine_dedup_key`]'s own
+/// `<entity>:<id>` convention. `finalize_review` is the ONLY caller that ever
+/// enqueues under this key; `adapter_agent24::reconciler` re-derives the same
+/// string from the row it already carries rather than reconstructing it
+/// independently (same posture that module's own `kernel_key` doc takes
+/// toward `routine_dedup_key`).
+fn review_remember_dedup_key(id: &str) -> String {
+    format!("review:{id}")
+}
+
+/// T4.4.1: the character cap on [`review_remember_desired`]'s `summary`
+/// field — a Review's `body` can be arbitrarily long free text, but the
+/// kernel-side memory this feeds is a courtesy copy for an AI's CONTEXT
+/// (design §2 #24: "M5 用内核私有记忆... 做 AI 上下文"), not a second full copy
+/// of the Review (SQLite stays the one true full copy, this crate's own
+/// `body`/`body_ref` doc comment on [`Review`]). 500 **characters** (not
+/// bytes — counted with `.chars().count()`/`.chars().take()`, so one Chinese
+/// character costs the same "1" as one ASCII letter; Sin90's own Review
+/// bodies are routinely CJK text) comfortably covers a few sentences of
+/// summary while keeping every `remember` payload small and cheap to `recall`
+/// back later.
+const REVIEW_SUMMARY_MAX_CHARS: usize = 500;
+
+/// Truncates `body` to at most [`REVIEW_SUMMARY_MAX_CHARS`] **characters**
+/// (never splitting a multi-byte character — `char`-counted, not
+/// byte-counted, see that constant's own doc), appending `…` when it
+/// actually cut something off so a reader of the stored memory can tell a
+/// truncation happened from an exactly-500-character Review that was not.
+fn truncate_review_summary(body: &str) -> String {
+    let mut chars = body.chars();
+    let head: String = chars.by_ref().take(REVIEW_SUMMARY_MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
+/// T4.4.1: the `desired` payload for a `memory.remember` outbox row — a
+/// DERIVED, already-truncated summary of a just-finalized Review, destined
+/// for `_a24/memory/private/remember` (design §2 #24/§4.1: SQLite stays the
+/// source of truth; this is a courtesy copy for M5's future kernel-side AI
+/// context, not read back by v1 — see design §2 #24's own "v1 不用" entry).
+/// `dedup_key` is embedded in the payload itself (not just the outbox row's
+/// own `dedup_key` column) because `adapter_agent24::reconciler`'s
+/// idempotency check needs it inside the memory's OWN `body` too — see
+/// `reconciler::remember_review_summary`'s doc for why `_a24/memory/private/
+/// remember` cannot be trusted to dedup on Sin90's behalf the way
+/// `_a24/scheduler/upsert` does.
+fn review_remember_desired(review: &Review, finalized_at: &str) -> serde_json::Value {
+    json!({
+        "dedup_key": review_remember_dedup_key(&review.id),
+        "review_id": review.id,
+        "review_kind": review.kind,
+        "period": review.period,
+        "summary": truncate_review_summary(&review.body),
+        "finalized_at": finalized_at,
+    })
+}
+
 /// Write `body` to `<data_dir>/<relpath>` atomically (T4.2.1): a temp file in
 /// the SAME directory as the final path (so the final `rename` is a same-
 /// filesystem rename, atomic on every OS Sin90 ships on — never true across
@@ -2327,13 +2388,27 @@ impl Sin90Store {
     /// it `done` now would incorrectly claim the NEW state landed when only
     /// the old one did. The next pump pass picks the (still-`pending`, now
     /// newer-version) row back up on its own — nothing else to do here.
-    pub async fn outbox_mark_done(&self, id: &str, expected_version: i64) -> Result<()> {
+    ///
+    /// `result_ref` (T4.4.1 review L5, migration `0013_outbox_result_ref.sql`):
+    /// an optional kernel-minted identifier this row's successful call
+    /// produced — e.g. `memory.remember`'s `Remembered::id`
+    /// (`adapter_agent24::reconciler::remember_review_summary`).
+    /// `scheduler.upsert`/`.delete` have no comparable "fresh identity" to
+    /// record and pass `None`, same as every row from before this column
+    /// existed.
+    pub async fn outbox_mark_done(
+        &self,
+        id: &str,
+        expected_version: i64,
+        result_ref: Option<&str>,
+    ) -> Result<()> {
         let now = now_iso8601();
         sqlx::query(
-            "UPDATE sin90_outbox SET status = 'done', done_at = ? \
+            "UPDATE sin90_outbox SET status = 'done', done_at = ?, result_ref = ? \
              WHERE id = ? AND status = 'pending' AND version = ?",
         )
         .bind(&now)
+        .bind(result_ref)
         .bind(id)
         .bind(expected_version)
         .execute(self.pool())
@@ -3395,7 +3470,38 @@ impl Sin90Store {
             &now,
         )
         .await?;
+        // T4.4.1 (design §2 #24, §4.1): enqueue the derived-summary
+        // `memory.remember` outbox row in the SAME transaction as the
+        // `finalized` flip above — `check_review_transition` above already
+        // guarantees `draft -> finalized` happens AT MOST ONCE per Review
+        // ever (no un-finalize path exists, `core::transitions::
+        // review_transition_allowed`), so unlike the Routine outbox helpers
+        // (`outbox_enqueue_upsert_for_routine` et al.), there is no
+        // "already pending, don't clobber" check to make here: this is the
+        // one and only time this dedup_key is ever enqueued for this Review.
+        // `current.body` (read at the top of this function, BEFORE any
+        // write) is what gets summarized — the same body this call is about
+        // to freeze into `finalized`, never a value read after the fact.
+        //
+        // T4.4.1 review L2: skip the enqueue entirely when the body is empty
+        // or whitespace-only (most commonly: a Review finalized without ever
+        // being given a body at all — a fresh Review's `body` starts `""`).
+        // There is nothing worth summarizing into the kernel's memory, and
+        // writing one anyway would occupy this Review's `dedup_key` with a
+        // useless empty entry forever (recall would always match "found",
+        // so there is no later fix-up path once the row is skipped this
+        // way).
+        if !current.body.trim().is_empty() {
+            upsert_outbox(
+                &mut tx,
+                "memory.remember",
+                &review_remember_dedup_key(id),
+                &review_remember_desired(&current, &now),
+            )
+            .await?;
+        }
         tx.commit().await?;
+        self.notify.notify_one(); // a fresh pending row just landed (mirrors the Routine outbox writers).
         Ok(Review {
             status: ReviewStatus::Finalized,
             body_ref,
@@ -5045,6 +5151,151 @@ mod review_tests {
         assert!(matches!(err, StoreError::Transition(_)), "{err:?}");
     }
 
+    // ----- T4.4.1: finalize enqueues a `memory.remember` outbox row ---------
+
+    /// `finalize_review` must enqueue exactly one `memory.remember` outbox
+    /// row, `dedup_key = "review:<id>"`, whose `desired` payload carries
+    /// enough identity for `adapter_agent24::reconciler` to both send the
+    /// memory AND recognize it on a later `recall` (design §2 #24).
+    /// Mutation target: deleting the `upsert_outbox("memory.remember", ...)`
+    /// call from `finalize_review` turns this red (zero rows instead of
+    /// one); getting any field wrong (e.g. `review_kind` instead of
+    /// `review.kind`, or forgetting to truncate `summary`) turns the field
+    /// assertions red.
+    #[tokio::test]
+    async fn review_finalize_enqueues_memory_remember_outbox_row_with_summary() {
+        let store = new_store().await;
+        let review = create_ok(&store, ReviewKind::Weekly, "2026-W39").await;
+        store
+            .update_review_body(&review.id, "did great this week")
+            .await
+            .unwrap();
+
+        let before = now_iso8601();
+        let finalized = store.finalize_review(&review.id).await.unwrap();
+        assert_eq!(finalized.status, ReviewStatus::Finalized);
+
+        let dedup_key = format!("review:{}", review.id);
+        let rows = test_hooks::outbox_rows_for(&store, &dedup_key)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "exactly one outbox row for this Review");
+        let row = &rows[0];
+        assert_eq!(row.kind, "memory.remember");
+        assert_eq!(row.status, "pending");
+        assert_eq!(row.desired["dedup_key"], dedup_key);
+        assert_eq!(row.desired["review_id"], review.id);
+        assert_eq!(row.desired["review_kind"], "weekly");
+        assert_eq!(row.desired["period"], "2026-W39");
+        assert_eq!(row.desired["summary"], "did great this week");
+        let finalized_at = row.desired["finalized_at"].as_str().unwrap();
+        assert!(
+            finalized_at >= before.as_str(),
+            "finalized_at {finalized_at} should be at/after the call's own start {before}"
+        );
+    }
+
+    /// A summary longer than `REVIEW_SUMMARY_MAX_CHARS` (500) **characters**
+    /// is cut to exactly that many characters plus a trailing `…` marker —
+    /// counted in `char`s, not bytes, so a body made entirely of 3-byte CJK
+    /// characters is not truncated three times too early. Mutation target:
+    /// switching the cap to count bytes (or dropping the cap entirely) turns
+    /// the length assertion red; dropping the `…` suffix turns the marker
+    /// assertion red.
+    #[tokio::test]
+    async fn review_finalize_truncates_long_cjk_summary_to_max_chars_with_ellipsis() {
+        let store = new_store().await;
+        let review = create_ok(&store, ReviewKind::Daily, "2026-09-24").await;
+        let long_body: String = "复".repeat(600); // 600 CJK chars, well past the 500-char cap.
+        store
+            .update_review_body(&review.id, &long_body)
+            .await
+            .unwrap();
+
+        store.finalize_review(&review.id).await.unwrap();
+
+        let dedup_key = format!("review:{}", review.id);
+        let rows = test_hooks::outbox_rows_for(&store, &dedup_key)
+            .await
+            .unwrap();
+        let summary = rows[0].desired["summary"].as_str().unwrap();
+        assert_eq!(
+            summary.chars().count(),
+            REVIEW_SUMMARY_MAX_CHARS + 1,
+            "500 kept characters + one trailing ellipsis marker"
+        );
+        assert!(summary.ends_with('…'));
+        assert_eq!(
+            summary
+                .chars()
+                .take(REVIEW_SUMMARY_MAX_CHARS)
+                .collect::<String>(),
+            "复".repeat(REVIEW_SUMMARY_MAX_CHARS)
+        );
+    }
+
+    /// Positive control for the test above: a body AT the cap (exactly 500
+    /// characters) is stored verbatim, no `…` appended — proves the cap is
+    /// "more than 500", not "500 or more".
+    #[tokio::test]
+    async fn review_finalize_summary_at_exactly_the_cap_is_not_truncated() {
+        let store = new_store().await;
+        let review = create_ok(&store, ReviewKind::Daily, "2026-09-24").await;
+        let exact_body: String = "x".repeat(REVIEW_SUMMARY_MAX_CHARS);
+        store
+            .update_review_body(&review.id, &exact_body)
+            .await
+            .unwrap();
+
+        store.finalize_review(&review.id).await.unwrap();
+
+        let dedup_key = format!("review:{}", review.id);
+        let rows = test_hooks::outbox_rows_for(&store, &dedup_key)
+            .await
+            .unwrap();
+        assert_eq!(rows[0].desired["summary"], exact_body);
+    }
+
+    /// T4.4.1 review L2: a Review finalized with NO body at all (never
+    /// `PATCH`ed — a fresh Review's `body` starts `""`) must enqueue ZERO
+    /// `memory.remember` outbox rows — nothing worth summarizing. Mutation
+    /// target: removing the `!current.body.trim().is_empty()` guard from
+    /// `finalize_review` turns this red (1 row instead of 0).
+    #[tokio::test]
+    async fn review_finalize_with_empty_body_does_not_enqueue_memory_remember() {
+        let store = new_store().await;
+        let review = create_ok(&store, ReviewKind::Daily, "2026-09-24").await;
+        assert_eq!(review.body, "", "a fresh Review starts with an empty body");
+
+        store.finalize_review(&review.id).await.unwrap();
+
+        let dedup_key = format!("review:{}", review.id);
+        let rows = test_hooks::outbox_rows_for(&store, &dedup_key)
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "no outbox row for an empty-body Review");
+    }
+
+    /// Same, for a body that is present but WHITESPACE-ONLY — `trim()`, not
+    /// a plain emptiness check, is what `finalize_review` must use.
+    #[tokio::test]
+    async fn review_finalize_with_whitespace_only_body_does_not_enqueue_memory_remember() {
+        let store = new_store().await;
+        let review = create_ok(&store, ReviewKind::Daily, "2026-09-24").await;
+        store
+            .update_review_body(&review.id, "   \n\t  ")
+            .await
+            .unwrap();
+
+        store.finalize_review(&review.id).await.unwrap();
+
+        let dedup_key = format!("review:{}", review.id);
+        let rows = test_hooks::outbox_rows_for(&store, &dedup_key)
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "no outbox row for a whitespace-only body");
+    }
+
     // ----- exact event sequence: create -> update -> finalize ---------------
 
     #[tokio::test]
@@ -5886,7 +6137,7 @@ mod outbox_reconciler_tests {
         // Simulate the initial upsert having already landed successfully.
         let rows = test_hooks::outbox_rows_for(&store, &key).await.unwrap();
         store
-            .outbox_mark_done(&rows[0].id, rows[0].version)
+            .outbox_mark_done(&rows[0].id, rows[0].version, None)
             .await
             .unwrap();
 
@@ -5910,7 +6161,7 @@ mod outbox_reconciler_tests {
             .find(|r| r.status == "pending")
             .expect("the retire's own delete row");
         store
-            .outbox_mark_done(&delete_row.id, delete_row.version)
+            .outbox_mark_done(&delete_row.id, delete_row.version, None)
             .await
             .unwrap();
 
@@ -5970,7 +6221,7 @@ mod outbox_reconciler_tests {
         let key = dedup_key(&routine.id);
         let rows = test_hooks::outbox_rows_for(&store, &key).await.unwrap();
         store
-            .outbox_mark_done(&rows[0].id, rows[0].version)
+            .outbox_mark_done(&rows[0].id, rows[0].version, None)
             .await
             .unwrap();
 
@@ -5996,7 +6247,7 @@ mod outbox_reconciler_tests {
         let key = dedup_key(&routine.id);
         let rows = test_hooks::outbox_rows_for(&store, &key).await.unwrap();
         store
-            .outbox_mark_done(&rows[0].id, rows[0].version)
+            .outbox_mark_done(&rows[0].id, rows[0].version, None)
             .await
             .unwrap();
         store
@@ -6010,7 +6261,7 @@ mod outbox_reconciler_tests {
             .find(|r| r.status == "pending")
             .unwrap();
         store
-            .outbox_mark_done(&delete_row.id, delete_row.version)
+            .outbox_mark_done(&delete_row.id, delete_row.version, None)
             .await
             .unwrap();
 
@@ -6085,7 +6336,7 @@ mod outbox_reconciler_tests {
             .unwrap();
 
         store
-            .outbox_mark_done(&stale.id, stale.version)
+            .outbox_mark_done(&stale.id, stale.version, None)
             .await
             .unwrap();
 
@@ -6202,7 +6453,10 @@ mod outbox_reconciler_tests {
             .unwrap());
 
         // Right version, but no longer `pending`.
-        store.outbox_mark_done(&row.id, row.version).await.unwrap();
+        store
+            .outbox_mark_done(&row.id, row.version, None)
+            .await
+            .unwrap();
         assert!(!store
             .outbox_row_is_current(&row.id, row.version)
             .await
@@ -6242,7 +6496,7 @@ mod outbox_reconciler_tests {
 
         // `done` rows are never due, however far `now` is pushed.
         store
-            .outbox_mark_done(&row.id, due[0].version)
+            .outbox_mark_done(&row.id, due[0].version, None)
             .await
             .unwrap();
         let due = store

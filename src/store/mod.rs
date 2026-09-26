@@ -426,6 +426,9 @@ pub mod test_hooks {
         pub version: i64,
         /// T3.3.2 review L1 — see [`crate::store::repo::OutboxRow`]'s doc.
         pub other_bucket_attempts: i64,
+        /// T4.4.1 review L5, migration `0013_outbox_result_ref.sql` — see
+        /// [`crate::store::Sin90Store::outbox_mark_done`]'s own doc.
+        pub result_ref: Option<String>,
     }
 
     /// All `sin90_outbox` rows for a `dedup_key`, oldest first. Production
@@ -439,7 +442,7 @@ pub mod test_hooks {
     ) -> Result<Vec<OutboxTestRow>> {
         let rows = sqlx::query(
             "SELECT id, kind, dedup_key, desired, status, attempts, failure_kind, \
-                    last_error, next_attempt_at, version, other_bucket_attempts
+                    last_error, next_attempt_at, version, other_bucket_attempts, result_ref
              FROM sin90_outbox WHERE dedup_key = ? ORDER BY created_at ASC, rowid ASC",
         )
         .bind(dedup_key)
@@ -459,6 +462,7 @@ pub mod test_hooks {
                     next_attempt_at: r.get("next_attempt_at"),
                     version: r.get("version"),
                     other_bucket_attempts: r.get("other_bucket_attempts"),
+                    result_ref: r.get("result_ref"),
                 })
             })
             .collect()

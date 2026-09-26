@@ -326,13 +326,13 @@ async fn apply_one(
 
     match result {
         Ok(()) => {
-            store.outbox_mark_done(&row.id, row.version).await?;
+            store.outbox_mark_done(&row.id, row.version, None).await?;
             Ok(RowOutcome::Continue)
         }
         // `delete` + `NotFound` = the kernel already agrees this key is
         // gone — success, not a failure to classify further.
         Err(ClientError::NotFound(_)) if is_delete => {
-            store.outbox_mark_done(&row.id, row.version).await?;
+            store.outbox_mark_done(&row.id, row.version, None).await?;
             Ok(RowOutcome::Continue)
         }
         Err(e @ ClientError::Revoked(_)) => {
