@@ -25,7 +25,7 @@ use crate::core::transitions::{
 };
 use crate::core::types::{
     Alloc, AreaId, DirectionId, DirectionStatus, Energy, ProposalStatus, ReviewId, ReviewStatus,
-    RhythmId, TaskId, TaskKind, TaskStatus, WeekId, WeekStatus,
+    RhythmId, TaskId, TaskKind, TaskStatus, WeekId, WeekStatus, TRIAGE_DIRECTION_ID,
 };
 
 /// A new task to create inside a week (fields the AI proposes; ids/timestamps
@@ -227,6 +227,25 @@ pub trait ValidationCtx {
     /// New (design §11.2.3, T5.2.1): does this Direction id exist, and if so
     /// what's its current status? Used by `AssignTaskDirection`'s A4/A5.
     fn direction_status(&self, id: &str) -> Option<DirectionStatus>;
+    /// T5.7.2 review round 2 (M6): was task `id`'s CURRENT 待定 parking
+    /// produced by an ACCEPTED classify-capability proposal (the T5.2.2
+    /// fallback), as opposed to a human/automation client directly
+    /// submitting `AssignTaskDirection(t, 待定)` via `POST /proposals`
+    /// (`capability_source = "direct"`, same domain `reject_proposal`
+    /// already reports)? Only ever consulted when the task's current
+    /// Direction IS the reserved 待定 id (A3's reclassify-out-of-triage
+    /// branch below) — meaningless otherwise, so implementors need not
+    /// answer it correctly for a task not currently parked in 待定.
+    /// `false` for every task that has never been AI-fallback-parked (the
+    /// common case, and every `MockCtx` test fixture that doesn't opt in).
+    /// Used to narrow A3's "待定→真实 Direction" carve-out to ONLY the
+    /// cases T5.2.2's own design intended it for — a task a human
+    /// deliberately filed into 待定 by hand must NOT be silently
+    /// reclassifiable out from under them by a later AI run (Q7: "用户的
+    /// 东西不覆盖"), and must not be offered to classify's retry inbox
+    /// either (`AiReadModel::inbox`/`inbox_task`, `store/ai_port.rs`, share
+    /// the SAME narrowing via their own equivalent check).
+    fn task_triage_via_classify(&self, id: &str) -> bool;
     /// New (design §11.2.3, T5.2.1): outer `None` = the task does not exist;
     /// inner `None` = the task exists and is currently "in the inbox" (no
     /// Direction assigned yet). Used by `AssignTaskDirection`'s A1/A3.
@@ -396,24 +415,21 @@ impl<'c> Working<'c> {
 /// op; the store rejects the whole proposal — apply is all-or-nothing.
 /// Relational invariants are the store's job (see [`ValidationCtx`]).
 ///
-/// `capability_source` (T5.7.2 review round 2, M-a): THIS proposal's own
+/// `capability_source` (M-a, T5.7.2 review round 2): THIS proposal's own
 /// `"classify"`/`"direct"` provenance — the same vocabulary
 /// `Sin90Store::reject_proposal` already resolves (a matching `ok=1`
 /// `sin90_ai_calls` row ⇒ `"classify"`, none ⇒ `"direct"`, since
 /// `AssignTaskDirection` is the only op `Capability::Classify` ever
 /// produces). Not a per-entity fact `ValidationCtx` could answer (it is
 /// scoped to THIS call's proposal, not to any task/direction), so it is
-/// passed alongside `ctx` instead of widening that trait.
-///
-/// ① (T5.7.2 review round 3, stacked-PR split): this branch carries ONLY the
-/// mechanical signature change (every caller now threads `capability_source`
-/// through) — `validate_op` does not read it yet (see its own doc), so A3's
-/// `AssignTaskDirection` carve-out below is UNCHANGED from before this
-/// branch: a task currently parked in any Direction (待定 included) still
-/// unconditionally refuses reassignment (`NotInInbox`). The M6/M-a carve-out
-/// that DOES read `capability_source` (§2 #31/#32) lands in the next branch
-/// up the stack, once `ValidationCtx::task_triage_via_classify` exists for
-/// it to consult.
+/// passed alongside `ctx` instead of widening that trait. Only
+/// `AssignTaskDirection`'s A3 carve-out reads it: a human/automation client
+/// moving their OWN task out of 待定 (`capability_source == "direct"`) is
+/// always allowed, regardless of who parked it there (Q7 "用户的东西不覆
+/// 盖" cuts both ways — it must not lock the user out of their own task
+/// either); an AI (`"classify"`) run may only reclassify OUT of 待定 what
+/// `w.ctx.task_triage_via_classify` says classify itself put there (M6,
+/// unaffected by this change).
 pub fn validate(
     p: &Sin90Proposal,
     ctx: &dyn ValidationCtx,
@@ -432,10 +448,7 @@ pub fn validate(
 fn validate_op(
     op: &Sin90Op,
     w: &mut Working<'_>,
-    // ① (T5.7.2 review round 3): not read yet in this branch — see
-    // `validate`'s own doc for why the parameter exists here at all before
-    // any arm consults it.
-    _capability_source: &str,
+    capability_source: &str,
 ) -> Result<(), ProposalError> {
     match op {
         Sin90Op::CreateArea { title } => {
@@ -563,18 +576,38 @@ fn validate_op(
             // can't assign, it's already assigned to X", and X is
             // `current_direction`, not `direction_id`.
             //
-            // ① (T5.7.2 review round 3, stacked-PR split): the T5.2.2
-            // followup ②/M6/M-a carve-out that loosens this for a 待定-
-            // parked task (§2 #31/#32) is NOT in this branch yet — see
-            // `validate_op`'s own doc. Every task already assigned to ANY
-            // Direction, 待定 included, still unconditionally refuses
-            // reassignment here, unchanged from before this whole review
-            // round.
+            // T5.7.2 (design §2 #31, T5.2.2 followup ②): a task parked in
+            // the reserved 待定 Direction is still reclassifiable —
+            // assigning it to any OTHER Direction is allowed (falls through
+            // to A4/A5 below), mirroring `AiReadModel::inbox`/`inbox_task`'s
+            // own loosened membership. Re-"assigning" it to 待定 AGAIN is
+            // NOT allowed (§2 #30's own "不放宽待定→待定"): that case, and
+            // every other already-classified task, still hits the same
+            // `NotInInbox` this arm always returned.
             if let Some(existing_direction_id) = current_direction {
-                return Err(ProposalError::NotInInbox {
-                    task_id: task_id.clone(),
-                    direction_id: existing_direction_id,
-                });
+                // T5.7.2 review round 2 (M6, narrowed by round 3's M-a): the
+                // carve-out asks "is the CURRENT proposal itself the user's
+                // own doing, or an AI run?" — `capability_source == "direct"`
+                // (a human/automation client submitting `AssignTaskDirection`
+                // straight via `POST /proposals`) always may move their own
+                // task OUT of 待定, regardless of who parked it there in the
+                // first place (M-a: a task the human filed into 待定 by hand
+                // must remain movable BY THAT SAME HUMAN — Q7 "用户的东西不
+                // 覆盖" protects the user's placement from AI, it must not
+                // also lock the user out of it). An AI (`"classify"`) run may
+                // only reclassify OUT of 待定 what classify's own fallback
+                // put there (`task_triage_via_classify`, M6's original
+                // scope, unaffected) — a human's direct placement stays put
+                // unless the human themselves moves it.
+                let reclassifiable_from_triage = existing_direction_id == TRIAGE_DIRECTION_ID
+                    && direction_id != TRIAGE_DIRECTION_ID
+                    && (capability_source == "direct" || w.ctx.task_triage_via_classify(task_id));
+                if !reclassifiable_from_triage {
+                    return Err(ProposalError::NotInInbox {
+                        task_id: task_id.clone(),
+                        direction_id: existing_direction_id,
+                    });
+                }
             }
             // A4: the target Direction must exist.
             let dstatus = w.ctx.direction_status(direction_id).ok_or_else(|| {
@@ -755,6 +788,10 @@ mod tests {
         /// Outer presence = task exists; `None` inner = task is in the inbox.
         task_directions: HashMap<TaskId, Option<DirectionId>>,
         reviews: HashMap<ReviewId, ReviewSnap>,
+        /// T5.7.2 review round 2 (M6): task ids whose 待定 parking this
+        /// fixture wants `task_triage_via_classify` to report `true` for —
+        /// every other id (the default) reports `false`.
+        triage_via_classify: HashSet<TaskId>,
     }
 
     impl ValidationCtx for MockCtx {
@@ -781,6 +818,9 @@ mod tests {
         }
         fn review_snap(&self, id: &str) -> Option<ReviewSnap> {
             self.reviews.get(id).cloned()
+        }
+        fn task_triage_via_classify(&self, id: &str) -> bool {
+            self.triage_via_classify.contains(id)
         }
     }
 
@@ -1553,6 +1593,66 @@ mod tests {
             },
         ]);
         assert!(validate(&p, &ctx, "direct").is_ok());
+    }
+
+    // ---- M-a (T5.7.2 review round 2): 待定→真实 Direction, capability_source
+    // 一律放行 direct -----------------------------------------------------
+
+    /// A task currently in 待定 whose parking is NOT classify's own
+    /// (`task_triage_via_classify` reports `false` — a human filed it there
+    /// directly) can still be moved to a real Direction by the SAME kind of
+    /// caller: `capability_source == "direct"` bypasses the
+    /// `task_triage_via_classify` check entirely (M-a: the user must not be
+    /// locked out of their own placement). Mutation target: drop the
+    /// `capability_source == "direct" ||` leg from `reclassifiable_from_
+    /// triage` and this goes red (`NotInInbox` instead of `Ok`).
+    #[test]
+    fn assign_task_direction_direct_source_moves_own_triage_task_out() {
+        let mut ctx = inbox_ctx();
+        ctx.task_directions
+            .insert("t1".into(), Some(TRIAGE_DIRECTION_ID.into()));
+        // Deliberately NOT in `ctx.triage_via_classify` — a direct/human
+        // placement, exactly the case M6 alone would still refuse.
+        let p = proposal(vec![assign("t1", "d1")]);
+        assert!(
+            validate(&p, &ctx, "direct").is_ok(),
+            "a direct-sourced proposal must be able to move the user's OWN 待定 task out"
+        );
+    }
+
+    /// Negative control for the test above: the identical fixture (task in
+    /// 待定, NOT classify-parked) but `capability_source == "classify"` —
+    /// an AI run must still be refused, unchanged from M6's original scope.
+    /// Mutation target: same leg as above, but this positive-error
+    /// assertion is what catches an overly BROAD fix (e.g. dropping the
+    /// `task_triage_via_classify` check entirely instead of gating it on
+    /// `capability_source`).
+    #[test]
+    fn assign_task_direction_classify_source_still_blocked_by_human_triage() {
+        let mut ctx = inbox_ctx();
+        ctx.task_directions
+            .insert("t1".into(), Some(TRIAGE_DIRECTION_ID.into()));
+        let p = proposal(vec![assign("t1", "d1")]);
+        assert_eq!(
+            validate(&p, &ctx, "classify"),
+            Err(ProposalError::NotInInbox {
+                task_id: "t1".into(),
+                direction_id: TRIAGE_DIRECTION_ID.into(),
+            })
+        );
+    }
+
+    /// Positive control: `capability_source == "classify"` CAN still move a
+    /// task out of 待定 when `task_triage_via_classify` says classify itself
+    /// put it there (M6's original carve-out, unaffected by M-a).
+    #[test]
+    fn assign_task_direction_classify_source_moves_its_own_triage_task_out() {
+        let mut ctx = inbox_ctx();
+        ctx.task_directions
+            .insert("t1".into(), Some(TRIAGE_DIRECTION_ID.into()));
+        ctx.triage_via_classify.insert("t1".into());
+        let p = proposal(vec![assign("t1", "d1")]);
+        assert!(validate(&p, &ctx, "classify").is_ok());
     }
 
     // NOTE (2026-09-24 review, M6): a stray field on `AssignTaskDirection`

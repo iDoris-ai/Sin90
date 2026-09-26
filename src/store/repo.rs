@@ -3689,6 +3689,13 @@ pub(crate) struct DbSnapshot {
     task_directions: HashMap<String, Option<String>>,
     /// New (design §11.2.3, T5.2.1): outer presence = the Review exists.
     reviews: HashMap<String, ReviewSnap>,
+    /// T5.7.2 review round 2 (M6): tasks whose CURRENT 待定 parking was
+    /// produced by an accepted classify-capability proposal — see
+    /// [`ValidationCtx::task_triage_via_classify`]'s doc. Only ever
+    /// populated for a task [`load_task_direction`] found currently at
+    /// [`crate::core::TRIAGE_DIRECTION_ID`]; absence means "false" (either
+    /// not currently in 待定, or in 待定 by direct/manual placement).
+    triage_via_classify: std::collections::HashSet<String>,
 }
 
 impl ValidationCtx for DbSnapshot {
@@ -3715,6 +3722,9 @@ impl ValidationCtx for DbSnapshot {
     }
     fn review_snap(&self, id: &str) -> Option<ReviewSnap> {
         self.reviews.get(id).cloned()
+    }
+    fn task_triage_via_classify(&self, id: &str) -> bool {
+        self.triage_via_classify.contains(id)
     }
 }
 
@@ -3746,6 +3756,14 @@ pub(crate) async fn build_snapshot(tx: &mut Tx<'_>, ops: &[Sin90Op]) -> Result<D
                 load_task(tx, task_id, &mut snap).await?; // A2's task_status
                 load_task_direction(tx, task_id, &mut snap).await?; // A1/A3
                 load_direction_status(tx, direction_id, &mut snap).await?; // A4/A5
+                                                                           // M6: only meaningful (and only queried) when this task's
+                                                                           // CURRENT Direction is 待定 — `load_task_direction` above
+                                                                           // just populated exactly that fact.
+                if snap.task_directions.get(task_id).map(|d| d.as_deref())
+                    == Some(Some(crate::core::TRIAGE_DIRECTION_ID))
+                {
+                    load_task_triage_via_classify(tx, task_id, &mut snap).await?;
+                }
             }
             Sin90Op::DraftReviewBody { review_id, .. } => {
                 load_review_snap(tx, review_id, &mut snap).await?; // D4-D6
@@ -3802,6 +3820,39 @@ async fn load_task_direction(tx: &mut Tx<'_>, id: &str, snap: &mut DbSnapshot) -
     {
         let direction_id: Option<String> = row.get("direction_id");
         snap.task_directions.insert(id.to_string(), direction_id);
+    }
+    Ok(())
+}
+
+/// T5.7.2 review round 2 (M6): was task `id`'s CURRENT 待定 parking produced
+/// by an ACCEPTED `capability_source = "classify"` proposal?
+///
+/// N-H1 (T5.7.2 review round 2 follow-up): reads `sin90_tasks.triage_via`
+/// directly — this used to JOIN `sin90_ai_calls`/`sin90_proposals`/
+/// `json_each(p.ops)` back to the ONE proposal that ever put this task into
+/// 待定 (a task enters 待定 through exactly one `AssignTaskDirection(t, 待定)`
+/// ever, per the CAS `AssignTaskDirection`'s apply uses), but that JOIN is
+/// keyed on `json_extract(je.value, '$.task_id') = id` — the CURRENT task
+/// id, which `CarryOverTask` changes (it mints a brand-new id for the
+/// carried row, only copying `direction_id`). A carried-over 待定 task's
+/// JOIN therefore matched NOTHING under its new id, silently reporting
+/// `false` regardless of the actual history (this migration's own motivating
+/// bug). `AssignTaskDirection`'s apply now stamps `triage_via` directly, and
+/// `CarryOverTask`'s apply copies it forward under the new id — a plain
+/// column read replaces the JOIN entirely (also fixing the JOIN's own
+/// per-read cost, M-d).
+async fn load_task_triage_via_classify(
+    tx: &mut Tx<'_>,
+    id: &str,
+    snap: &mut DbSnapshot,
+) -> Result<()> {
+    let via: Option<String> = sqlx::query_scalar("SELECT triage_via FROM sin90_tasks WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .flatten();
+    if via.as_deref() == Some("classify") {
+        snap.triage_via_classify.insert(id.to_string());
     }
     Ok(())
 }

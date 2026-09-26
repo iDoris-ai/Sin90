@@ -398,6 +398,49 @@ pub mod test_hooks {
         Ok(())
     }
 
+    /// Backdate a task's `triage_entered_at` (T5.7.2 review round 2, H2; N-H1
+    /// follow-up moved this from a `sin90_events` lookup to a plain
+    /// `sin90_tasks` column) — the 待定 retry gate's "entered-待定-at" floor,
+    /// used once no `sin90_classify_evals` row exists yet. Lets a test put
+    /// real clock distance between "entered 待定" and a Direction's
+    /// `created_at` without sleeping past `now_iso8601()`'s second-
+    /// resolution boundary (mirrors `set_task_started_at`'s identical need
+    /// for a different backdated fact).
+    pub async fn set_task_triage_entered_at(
+        store: &Sin90Store,
+        task_id: &str,
+        at: &str,
+    ) -> Result<()> {
+        sqlx::query("UPDATE sin90_tasks SET triage_entered_at = ? WHERE id = ?")
+            .bind(at)
+            .bind(task_id)
+            .execute(store.pool())
+            .await?;
+        Ok(())
+    }
+
+    /// Force a task's classify-evaluation timestamp
+    /// (`sin90_classify_evals.evaluated_at`) via raw SQL (T5.7.2 review
+    /// round 2, H2) — upserts, same shape `AiSink::record_classify_eval`
+    /// itself uses, but lets a test put real clock distance between "classify
+    /// last evaluated this 待定 task" and a Direction's `created_at` without
+    /// sleeping past `now_iso8601()`'s second-resolution boundary.
+    pub async fn set_classify_eval_at(
+        store: &Sin90Store,
+        task_id: &str,
+        evaluated_at: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO sin90_classify_evals (task_id, evaluated_at) VALUES (?, ?)
+             ON CONFLICT(task_id) DO UPDATE SET evaluated_at = excluded.evaluated_at",
+        )
+        .bind(task_id)
+        .bind(evaluated_at)
+        .execute(store.pool())
+        .await?;
+        Ok(())
+    }
+
     pub async fn proposal_status(store: &Sin90Store, id: &str) -> Result<Option<String>> {
         Ok(
             sqlx::query("SELECT status FROM sin90_proposals WHERE id = ?")

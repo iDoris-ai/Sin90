@@ -559,13 +559,19 @@ pub struct ClassifyItem {
 /// planning and submit" handling (§11.3.5) exists exactly once, not once
 /// per call site. `rec` must already be the `ok=1` row this decision is
 /// linked to; this function only clones it for the failure path.
+/// Third element (M-b, T5.7.2 review round 2 follow-up): `true` only when
+/// the failure was `SinkError::Store` — an infra hiccup that says NOTHING
+/// about whether the model/rule actually looked at this task, as opposed to
+/// `SinkError::Invalid` ("rejected_by_precheck": state moved, but a real
+/// decision WAS reached). `classify_one`'s H2 eval-write gate below reads
+/// this to decide whether a 待定-parked task's re-evaluation is genuine.
 async fn submit_direction_assignment<S: AiSink>(
     task_id: &TaskId,
     direction_id: DirectionId,
     rationale: String,
     rec: AiCallRecord,
     sink: &S,
-) -> (ItemResult, Option<&'static str>) {
+) -> (ItemResult, Option<&'static str>, bool) {
     let draft = ProposalDraft {
         id: format!("ai-classify-{}", crate::core::ulid()),
         ops: vec![Sin90Op::AssignTaskDirection {
@@ -584,9 +590,10 @@ async fn submit_direction_assignment<S: AiSink>(
     // STATE changed, not the call).
     let rec_on_failure = rec.clone();
     match sink.submit(Capability::Classify, draft, rec).await {
-        Ok(()) => (ItemResult::Proposed(draft_id), None),
+        Ok(()) => (ItemResult::Proposed(draft_id), None, false),
         Err(e) => {
             tracing::warn!(error = %e, task_id = %task_id, "classify: a decision failed submit's dry run (state moved)");
+            let is_store_err = matches!(e, SinkError::Store(_));
             let mut failed = rec_on_failure;
             failed.ok = false;
             failed.proposal_id = None;
@@ -601,7 +608,7 @@ async fn submit_direction_assignment<S: AiSink>(
             if let Err(record_err) = sink.record_call(failed).await {
                 tracing::warn!(error = %record_err, task_id = %task_id, "classify: failed to record a rejected-at-submit call (R6, not fatal)");
             }
-            (ItemResult::Rejected, None)
+            (ItemResult::Rejected, None, is_store_err)
         }
     }
 }
@@ -638,6 +645,7 @@ async fn classify_one<M, S, R>(
     model: Option<&M>,
     sink: &S,
     read: &R,
+    run_started_at: &str,
 ) -> (ItemResult, Option<&'static str>)
 where
     M: ModelPort,
@@ -699,7 +707,14 @@ where
     )
     .await;
 
-    match outcome {
+    // M2 (T5.7.2 review round 3): third element renamed `skip_eval` — it now
+    // means "do not write an H2 `sin90_classify_evals` row for this outcome"
+    // in general, not only "this was a `SinkError::Store` submit failure".
+    // `submit_direction_assignment`'s own `is_store_err` (its narrower,
+    // correctly-named local meaning) flows straight into it unchanged; the
+    // `Outcome::Nothing { deterministic }` arm below is the new source of a
+    // `false` here that ISN'T a store error.
+    let (result, reason, skip_eval) = match outcome {
         Outcome::Produced { value, engine, rec } => {
             // T5.2.3: read BEFORE `value.direction_id` is matched on below —
             // that match only moves the `direction_id` field out of `value`
@@ -709,7 +724,7 @@ where
             let low_confidence = value.low_confidence;
             let confidence = value.confidence;
             let choice = value.choice.clone();
-            let (result, reason) = match value.direction_id {
+            let (result, reason, is_store_err) = match value.direction_id {
                 Some(direction_id) => {
                     submit_direction_assignment(
                         &task.id,
@@ -730,7 +745,7 @@ where
                     if let Err(e) = sink.record_call(rec).await {
                         tracing::warn!(error = %e, task_id = %task.id, "classify: failed to record a decisive no-match call (R6, not fatal)");
                     }
-                    (ItemResult::Nothing, Some("low_confidence"))
+                    (ItemResult::Nothing, Some("low_confidence"), false)
                 }
                 // T5.2.2 (design §2 #30, Q4): the model looked and decisively
                 // said "none" — fall back to 待定 instead of leaving the task
@@ -770,7 +785,7 @@ where
                     "classify: model step confidence (not persisted, see followup)"
                 );
             }
-            (result, reason)
+            (result, reason, is_store_err)
         }
         // H3 (coordinator review, 2026-09-26 round 2): every step ran (R1
         // undecided, R2 no_match, no model reachable or every model step
@@ -784,10 +799,74 @@ where
         // whole on the next trigger. Every failed step already wrote its own
         // non-producing call row inside `run_item`; nothing extra to record
         // here.
-        Outcome::Nothing => (ItemResult::Nothing, Some("undetermined")),
-        Outcome::Deferred => (ItemResult::Deferred, None),
-        Outcome::Aborted => (ItemResult::Aborted, None),
+        //
+        // M2 (T5.7.2 review round 3), narrowed by PR#69 review round 1 (Low):
+        // `skip_eval = !deterministic` — a genuine bad-output-rejected model
+        // reply DOES count as "classify looked at this" (write the eval,
+        // `skip_eval = false`); a ladder that never got a reply at all
+        // (Timeout/Unavailable/Busy/circuit-open/no model configured/R1+R2
+        // alone), OR one the privacy `tripwire` discarded before `parse`
+        // ever read it, must NOT (`skip_eval = true`) — see
+        // `Outcome::Nothing`'s own doc in `ladder.rs`.
+        Outcome::Nothing { deterministic } => {
+            (ItemResult::Nothing, Some("undetermined"), !deterministic)
+        }
+        Outcome::Deferred => (ItemResult::Deferred, None, false),
+        Outcome::Aborted => (ItemResult::Aborted, None, false),
+    };
+
+    // T5.7.2 review round 2 (H2), narrowed by M-b (review round 2 follow-up):
+    // a task CURRENTLY parked in 待定 that this evaluation did NOT move to a
+    // real Direction records "classify just looked at this and found nothing
+    // new" so `AiReadModel::inbox`/`inbox_task`'s retry gate (`store/
+    // ai_port.rs`) advances past this evaluation instead of re-selecting the
+    // SAME task on every future run for as long as the same newest Direction
+    // stays the newest one (the bug the gate's own exit condition fixes).
+    //
+    // M-b (T5.7.2 review round 2 follow-up), extended by M2 (review round 3),
+    // narrowed again by PR#69 review round 1 (Low): this must ONLY fire when
+    // the MODEL truly replied — a decisive `none`, a low-confidence
+    // non-match, a decisive-none rejected at submit because the task was
+    // already accounted for, OR (M2) a reply that came back but was rejected
+    // as `bad_output` (`Outcome::Nothing { deterministic: true }`, folded
+    // into `skip_eval = false` above) — NOT for a `Nothing` the ladder never
+    // got a reply for at all (`deterministic: false`: R1/R2 alone, no model
+    // reachable, every step degraded on the TRANSPORT —
+    // Timeout/Unavailable/Busy/RateLimited/NotReady/circuit-open/no model
+    // configured — `skip_eval = true`), and — Low, PR#69 review round 1 —
+    // ALSO not for a reply the privacy `tripwire` discarded before `parse`
+    // ever read it (`deterministic: false` there too now: the reply was
+    // never actually looked at, so it must not count as "classify examined
+    // this task" either), so the `(ItemResult::Nothing, Some("undetermined"))`
+    // arm below only ever writes when `skip_eval` is already `false`, and NOT
+    // for a `SinkError::Store` submit failure (`skip_eval` via
+    // `is_store_err` — an infra hiccup that says nothing about whether the
+    // model examined the task, unlike a `rejected_by_precheck` state-moved
+    // rejection, which still counts: `core::proposal::validate`'s A3 always
+    // refuses `None`'s repeated `AssignTaskDirection(t, 待定)` for a task
+    // ALREADY in 待定, surfacing as `Rejected` — that IS a genuine "classify
+    // looked, found nothing new" outcome). Mutation target: drop the
+    // `(ItemResult::Nothing, Some("undetermined"))` arm from this `matches!`
+    // and `classify_bad_output_for_a_triage_task_records_eval` goes red;
+    // drop `!skip_eval` (or hardcode `deterministic` to `true` in
+    // `ladder.rs`) and
+    // `classify_degrade_does_not_record_eval_but_new_direction_still_lifts_
+    // retry` goes red instead.
+    if task.direction_id.as_deref() == Some(TRIAGE_DIRECTION_ID)
+        && !skip_eval
+        && matches!(
+            (&result, reason),
+            (ItemResult::Nothing, Some("low_confidence"))
+                | (ItemResult::Nothing, Some("undetermined"))
+                | (ItemResult::Rejected, _)
+        )
+    {
+        if let Err(e) = sink.record_classify_eval(&task.id, run_started_at).await {
+            tracing::warn!(error = %e, task_id = %task.id, "classify: failed to record a 待定 retry evaluation (H2, not fatal)");
+        }
     }
+
+    (result, reason)
 }
 
 /// Runs every task in `tasks` through the classify ladder, one after another
@@ -795,6 +874,18 @@ where
 /// whole run, not per item). `candidates`/`settings` are read ONCE for the
 /// whole run (§11.4.1's "候选集" — up to 40 non-terminal Directions by
 /// `updated_at DESC`).
+///
+/// PR#69 review round 1 (blocking): `run_started_at` is captured HERE,
+/// before `direction_candidates` is read — not inside `AiSink::
+/// record_classify_eval` at write time — and threaded down to every
+/// `classify_one` call as the H2 eval-write gate's `evaluated_at`. Every
+/// task in this batch shares the SAME frozen `candidates` snapshot, so a
+/// Direction the model itself creates mid-batch (or one that lands between
+/// this snapshot and a later item's eval write) was never actually shown to
+/// any of these classifications; stamping the eval with a fresh `now_
+/// iso8601()` at write time would date it AFTER that Direction's own
+/// `created_at`, permanently masking it from the 待定 retry gate (`store::
+/// ai_port::triage_retry_gate_sql`) even though this run never evaluated it.
 pub async fn run_classify<M, S, R>(
     run_id: &str,
     tasks: &[Task],
@@ -808,6 +899,7 @@ where
     S: AiSink,
     R: AiReadModel,
 {
+    let run_started_at = crate::core::now_iso8601();
     let settings = read.settings().await.unwrap_or_else(|e| {
         tracing::warn!(error = %e, "classify: settings read failed, defaulting to executive disabled");
         Default::default()
@@ -833,6 +925,7 @@ where
                 model,
                 sink,
                 read,
+                &run_started_at,
             )
             .await
         };
@@ -1450,6 +1543,20 @@ mod tests {
             .create_direction("Finance", "2026-Q4", None)
             .await
             .unwrap();
+        // PR#69 review round 1: pinned safely in the past — otherwise this
+        // Direction's real wall-clock `created_at` and the task's own
+        // (post-fallback) `triage_entered_at`, stamped moments later by
+        // `apply_proposal` below, risk landing in the SAME second, and the
+        // gate's widened `>=` would then wrongly count this pre-existing
+        // Direction as "new since the fallback", putting the task straight
+        // back in the inbox this test asserts it left.
+        crate::store::test_hooks::set_direction_created_at(
+            &store,
+            &_real_direction.id,
+            "2020-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
         let task = inbox_task(&store, "Something that fits nothing on offer").await;
         let reader = store.ai_reader();
 
@@ -1747,6 +1854,516 @@ mod tests {
                 direction_id: dog_walking.id.clone(),
             }],
             "R1 must not have shortcut task2 to 待定 using task1's history"
+        );
+    }
+
+    // ---- M-b (T5.7.2 review round 2 follow-up): H2's eval-write gate only
+    // ---- fires when the model actually replied, never for a Degrade ------
+
+    /// A sink whose `submit` always fails with a given `SinkError` — a
+    /// minimal fake, not a real `Sin90Store`, purely to unit-test
+    /// `submit_direction_assignment`'s `is_store_err` derivation directly
+    /// without needing to engineer a real race/infra failure through a live
+    /// store.
+    struct AlwaysFailsSubmit(fn() -> SinkError);
+    impl AiSink for AlwaysFailsSubmit {
+        async fn submit(
+            &self,
+            _cap: Capability,
+            _draft: ProposalDraft,
+            _rec: AiCallRecord,
+        ) -> Result<(), SinkError> {
+            Err((self.0)())
+        }
+        async fn record_call(&self, _rec: AiCallRecord) -> Result<(), SinkError> {
+            Ok(())
+        }
+        async fn record_classify_eval(
+            &self,
+            _task_id: &str,
+            _evaluated_at: &str,
+        ) -> Result<(), SinkError> {
+            Ok(())
+        }
+        async fn precheck(&self, _cap: Capability, drafts: &[ProposalDraft]) -> Vec<bool> {
+            vec![false; drafts.len()]
+        }
+    }
+
+    fn any_call_rec() -> AiCallRecord {
+        AiCallRecord {
+            id: "c-any".into(),
+            run_id: "run-any".into(),
+            task_kind: Capability::Classify,
+            engine: crate::ai::Engine::Local,
+            fallback_from: None,
+            served_tier: None,
+            model_id: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            latency_ms: 0,
+            ok: true,
+            error_kind: None,
+            proposal_id: None,
+            at: "2026-09-26T00:00:00Z".into(),
+        }
+    }
+
+    /// `submit_direction_assignment`'s third return value is `true` ONLY for
+    /// `SinkError::Store` — the infra-hiccup bucket M-b's H2 eval-write gate
+    /// must never advance on. Mutation target: change `matches!(e,
+    /// SinkError::Store(_))` to always return `false` (or delete the
+    /// `is_store_err` plumbing entirely) and this goes red.
+    #[tokio::test]
+    async fn submit_direction_assignment_flags_store_errors_only() {
+        let store_err_sink = AlwaysFailsSubmit(|| SinkError::Store("boom".into()));
+        let (result, reason, is_store_err) = submit_direction_assignment(
+            &"t1".to_string(),
+            "d1".to_string(),
+            "because".into(),
+            any_call_rec(),
+            &store_err_sink,
+        )
+        .await;
+        assert_eq!(result, ItemResult::Rejected);
+        assert_eq!(reason, None);
+        assert!(is_store_err, "a SinkError::Store must flag is_store_err");
+
+        let invalid_sink = AlwaysFailsSubmit(|| SinkError::Invalid("bad state".into()));
+        let (result, reason, is_store_err) = submit_direction_assignment(
+            &"t1".to_string(),
+            "d1".to_string(),
+            "because".into(),
+            any_call_rec(),
+            &invalid_sink,
+        )
+        .await;
+        assert_eq!(result, ItemResult::Rejected);
+        assert_eq!(reason, None);
+        assert!(
+            !is_store_err,
+            "a SinkError::Invalid (rejected_by_precheck) must NOT flag is_store_err"
+        );
+    }
+
+    /// The regression M-b fixes: BEFORE this fix, `Outcome::Nothing`'s
+    /// `"undetermined"` reason was ALSO in `classify_one`'s H2 eval-write
+    /// `matches!`, so a task the model never actually reached (every model
+    /// step Timing out/Unavailable/circuit-open, `Outcome::Nothing`) wrote a
+    /// `sin90_classify_evals` row exactly as if the model had genuinely
+    /// looked and found nothing — laundering "we never got an answer" into
+    /// "classify examined this and moved the retry floor forward" (the exact
+    /// overclaim §2 #30/H3's own doc already forbids for the PROPOSAL side,
+    /// just not, until now, for this side-channel). Pins BOTH halves: no row
+    /// is written on a Timeout, AND the retry signal a genuinely NEW
+    /// Direction provides is untouched by that (it was never gated on the
+    /// eval row in the first place — `triage_entered_at`, N-H1, is the floor
+    /// absent one). Mutation target: add `(ItemResult::Nothing, Some(
+    /// "undetermined"))` back into the `matches!` and the `count == 0`
+    /// assertion below goes red.
+    #[tokio::test]
+    async fn classify_degrade_does_not_record_eval_but_new_direction_still_lifts_retry() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let _direction = store
+            .create_direction("Finance", "2026-Q4", None)
+            .await
+            .unwrap();
+        let task = inbox_task(&store, "Ambiguous errand").await;
+        let reader = store.ai_reader();
+
+        // Route the task into 待定 first (a decisive model "none"), same
+        // shape the H2 tests above use.
+        let none_model = StubModel::always(Ok(reply(
+            r#"{"choice":"none","confidence":"high","reason":"nothing fits yet"}"#,
+        )));
+        let items0 = run_classify(
+            "run-mb-seed",
+            std::slice::from_ref(&task),
+            ModelAccess::LocalOnly,
+            Some(&none_model),
+            &store,
+            &reader,
+        )
+        .await;
+        let proposal_id0 = match &items0[0].result {
+            ItemResult::Proposed(id) => id.clone(),
+            other => panic!("expected the 待定 fallback, got {other:?}"),
+        };
+        store.apply_proposal(&proposal_id0).await.unwrap();
+        crate::store::test_hooks::set_task_triage_entered_at(
+            &store,
+            &task.id,
+            "2020-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        async fn eval_count(store: &Sin90Store, task_id: &str) -> i64 {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM sin90_classify_evals WHERE task_id = ?",
+            )
+            .bind(task_id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap()
+        }
+        assert_eq!(
+            eval_count(&store, &task.id).await,
+            0,
+            "no evaluation recorded yet"
+        );
+
+        // Re-run classify on the SAME (now-in-待定) task with every model
+        // step degrading (Timeout) — R1 has no history (title_history
+        // excludes triage assignments), the model Times out (Degrade, does
+        // not open the circuit), R2 finds no title overlap with "Finance"
+        // either: the whole ladder ends `Outcome::Nothing`, `reason =
+        // "undetermined"`.
+        let timeout_model = StubModel::always(Err(ModelFailure::Timeout));
+        let mut triage_task = task.clone();
+        triage_task.direction_id = Some(TRIAGE_DIRECTION_ID.to_string());
+        let items1 = run_classify(
+            "run-mb-degrade",
+            std::slice::from_ref(&triage_task),
+            ModelAccess::LocalOnly,
+            Some(&timeout_model),
+            &store,
+            &reader,
+        )
+        .await;
+        assert_eq!(items1[0].result, ItemResult::Nothing);
+        assert_eq!(items1[0].reason, Some("undetermined"));
+        assert_eq!(
+            eval_count(&store, &task.id).await,
+            0,
+            "a Degrade (Timeout) must NOT record a classify eval — the model never actually replied"
+        );
+
+        // Positive control: the retry signal a genuinely NEW Direction
+        // provides is untouched by the (correctly skipped) eval write —
+        // `triage_entered_at` alone is enough of a floor.
+        let fresh = store
+            .create_direction("Freshly created", "2026-Q4", None)
+            .await
+            .unwrap();
+        crate::store::test_hooks::set_direction_created_at(
+            &store,
+            &fresh.id,
+            "2099-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        assert!(
+            crate::ai::AiReadModel::inbox_task(&reader, &task.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "a new Direction must still lift the retry suppression despite the skipped eval write"
+        );
+    }
+
+    /// PR#69 review round 1 (blocking): `run_classify` reads
+    /// `direction_candidates` ONCE for the whole batch, but (before this
+    /// fix) `record_classify_eval` stamped `now_iso8601()` fresh at WRITE
+    /// time — strictly AFTER any Direction born mid-batch, since program
+    /// order guarantees the eval write always happens causally after a
+    /// Direction the model itself created earlier in the SAME `complete()`
+    /// call. The retry gate's SQL (`store::ai_port::triage_retry_gate_sql`)
+    /// treats "eval at/after the Direction's `created_at`" as "classify
+    /// already accounted for this Direction" — which is a lie here: the
+    /// candidates snapshot was already frozen before the batch even started,
+    /// so the model never got a chance to see this Direction at all. The fix
+    /// stamps the eval with `run_started_at` (captured before
+    /// `direction_candidates` is read) instead, and widens the gate's `>` to
+    /// `>=` so a same-second tie between `run_started_at` and the new
+    /// Direction's `created_at` still re-opens the gate. Mutation target:
+    /// revert either half (write `now_iso8601()` again at write time, or the
+    /// gate back to strict `>`) and this goes red.
+    #[tokio::test]
+    async fn classify_retry_gate_not_masked_by_direction_born_mid_batch() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let _seed_direction = store
+            .create_direction("Finance", "2026-Q4", None)
+            .await
+            .unwrap();
+        let task = inbox_task(&store, "Ambiguous errand").await;
+        let reader = store.ai_reader();
+
+        // Park it in 待定 first (a decisive model "none"), same shape the H2
+        // tests above use.
+        let none_model = StubModel::always(Ok(reply(
+            r#"{"choice":"none","confidence":"high","reason":"nothing fits yet"}"#,
+        )));
+        let items0 = run_classify(
+            "run-seed",
+            std::slice::from_ref(&task),
+            ModelAccess::LocalOnly,
+            Some(&none_model),
+            &store,
+            &reader,
+        )
+        .await;
+        let proposal_id0 = match &items0[0].result {
+            ItemResult::Proposed(id) => id.clone(),
+            other => panic!("expected the 待定 fallback, got {other:?}"),
+        };
+        store.apply_proposal(&proposal_id0).await.unwrap();
+        crate::store::test_hooks::set_task_triage_entered_at(
+            &store,
+            &task.id,
+            "2020-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        // A `ModelPort` whose `complete()` creates a BRAND NEW Direction
+        // mid-run, then decisively replies "none" — `run_classify`'s
+        // `direction_candidates` snapshot was already taken before this ran,
+        // so the ladder never showed the model this Direction at all.
+        #[derive(Clone)]
+        struct CreatesDirectionThenNone(Sin90Store);
+        impl ModelPort for CreatesDirectionThenNone {
+            async fn complete(&self, _req: ModelRequest) -> Result<ModelReply, ModelFailure> {
+                self.0
+                    .create_direction("Born mid-batch", "2026-Q4", None)
+                    .await
+                    .unwrap();
+                Ok(reply(
+                    r#"{"choice":"none","confidence":"high","reason":"still nothing fits"}"#,
+                ))
+            }
+        }
+        let mut triage_task = task.clone();
+        triage_task.direction_id = Some(TRIAGE_DIRECTION_ID.to_string());
+        let model = CreatesDirectionThenNone(store.clone());
+        let items1 = run_classify(
+            "run-mid-batch-direction",
+            std::slice::from_ref(&triage_task),
+            ModelAccess::LocalOnly,
+            Some(&model),
+            &store,
+            &reader,
+        )
+        .await;
+        assert_eq!(
+            items1[0].result,
+            ItemResult::Rejected,
+            "already-待定 task re-assigned 待定 again is refused by A3, but the H2 write-eval \
+             gate still fires on `Rejected` (the model DID genuinely reply)"
+        );
+
+        assert!(
+            crate::ai::AiReadModel::inbox_task(&reader, &task.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "a Direction born DURING this same batch — before the eval this run wrote — must \
+             still count as 'newer than the eval' and keep the task retry-eligible; it must not \
+             be masked just because the eval write happened to land after the Direction's \
+             creation in wall-clock time"
+        );
+    }
+
+    /// M2 (T5.7.2 review round 3) positive control, paired with the Timeout
+    /// negative control just above: a task CURRENTLY in 待定, re-evaluated by
+    /// a model that DOES reply — with an invented candidate key, rejected as
+    /// `bad_output` — DOES write a classify eval. The model genuinely looked
+    /// (a real reply came back, R2 has nothing to fall back to either since
+    /// the title has no overlap with the one real Direction), it was just
+    /// unusable — exactly the "found nothing new" signal the retry gate
+    /// needs to advance past, same as a low-confidence reply already does.
+    /// Mutation target: delete `deterministic = true` from `ladder.rs`'s
+    /// `Err(why)` parse-failure arm and the `count == 1` assertion below
+    /// goes red. (NOT the `tripwire` arm any more — PR#69 review round 1
+    /// corrected that arm to `deterministic = false`: a tripwire-discarded
+    /// reply was never actually read, so it must not be conflated with a
+    /// genuine-but-unusable `bad_output` reply this test alone pins.)
+    #[tokio::test]
+    async fn classify_bad_output_for_a_triage_task_records_eval() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let _direction = store
+            .create_direction("Finance", "2026-Q4", None)
+            .await
+            .unwrap();
+        let task = inbox_task(&store, "Ambiguous errand").await;
+        let reader = store.ai_reader();
+
+        let none_model = StubModel::always(Ok(reply(
+            r#"{"choice":"none","confidence":"high","reason":"nothing fits yet"}"#,
+        )));
+        let items0 = run_classify(
+            "run-m2-bad-output-seed",
+            std::slice::from_ref(&task),
+            ModelAccess::LocalOnly,
+            Some(&none_model),
+            &store,
+            &reader,
+        )
+        .await;
+        let proposal_id0 = match &items0[0].result {
+            ItemResult::Proposed(id) => id.clone(),
+            other => panic!("expected the 待定 fallback, got {other:?}"),
+        };
+        store.apply_proposal(&proposal_id0).await.unwrap();
+        crate::store::test_hooks::set_task_triage_entered_at(
+            &store,
+            &task.id,
+            "2020-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        async fn eval_count(store: &Sin90Store, task_id: &str) -> i64 {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM sin90_classify_evals WHERE task_id = ?",
+            )
+            .bind(task_id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap()
+        }
+        assert_eq!(
+            eval_count(&store, &task.id).await,
+            0,
+            "no evaluation recorded yet"
+        );
+
+        // Re-run classify on the SAME (now-in-待定) task with the model
+        // inventing a candidate key that does not exist — `parse_classify_
+        // reply` rejects it as `bad_output`, degrading past the single
+        // `local` model step to R2, which also has nothing to match: the
+        // whole ladder ends `Outcome::Nothing { deterministic: true }`,
+        // `reason = "undetermined"`.
+        let bad_model = StubModel::always(Ok(reply(
+            r#"{"choice":"d9","confidence":"high","reason":"guessed"}"#,
+        )));
+        let mut triage_task = task.clone();
+        triage_task.direction_id = Some(TRIAGE_DIRECTION_ID.to_string());
+        let items1 = run_classify(
+            "run-m2-bad-output",
+            std::slice::from_ref(&triage_task),
+            ModelAccess::LocalOnly,
+            Some(&bad_model),
+            &store,
+            &reader,
+        )
+        .await;
+        assert_eq!(items1[0].result, ItemResult::Nothing);
+        assert_eq!(items1[0].reason, Some("undetermined"));
+        assert_eq!(
+            eval_count(&store, &task.id).await,
+            1,
+            "a `bad_output` reply must record a classify eval — the model genuinely looked, \
+             it just answered badly, unlike a Degrade/Timeout that never got a reply at all"
+        );
+    }
+
+    /// M-c pin (H2's `low_confidence` branch): a task CURRENTLY in 待定,
+    /// re-evaluated by a model that DOES reply but at low confidence, DOES
+    /// write a classify eval — the model genuinely looked, it just wasn't
+    /// sure, which is exactly the "found nothing new" signal the retry gate
+    /// needs to advance past. Mutation target: delete `(ItemResult::Nothing,
+    /// Some("low_confidence"))` from the `matches!` and this goes red.
+    #[tokio::test]
+    async fn classify_low_confidence_for_a_triage_task_records_eval() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let _direction = store
+            .create_direction("Finance", "2026-Q4", None)
+            .await
+            .unwrap();
+        let task = inbox_task(&store, "Ambiguous errand").await;
+        let reader = store.ai_reader();
+
+        let none_model = StubModel::always(Ok(reply(
+            r#"{"choice":"none","confidence":"high","reason":"nothing fits yet"}"#,
+        )));
+        let items0 = run_classify(
+            "run-mc-lowconf-seed",
+            std::slice::from_ref(&task),
+            ModelAccess::LocalOnly,
+            Some(&none_model),
+            &store,
+            &reader,
+        )
+        .await;
+        let proposal_id0 = match &items0[0].result {
+            ItemResult::Proposed(id) => id.clone(),
+            other => panic!("expected the 待定 fallback, got {other:?}"),
+        };
+        store.apply_proposal(&proposal_id0).await.unwrap();
+
+        let mut triage_task = task.clone();
+        triage_task.direction_id = Some(TRIAGE_DIRECTION_ID.to_string());
+        let low_confidence_model = StubModel::always(Ok(reply(
+            r#"{"choice":"none","confidence":"low","reason":"maybe, not sure"}"#,
+        )));
+        let items1 = run_classify(
+            "run-mc-lowconf",
+            std::slice::from_ref(&triage_task),
+            ModelAccess::LocalOnly,
+            Some(&low_confidence_model),
+            &store,
+            &reader,
+        )
+        .await;
+        assert_eq!(items1[0].result, ItemResult::Nothing);
+        assert_eq!(items1[0].reason, Some("low_confidence"));
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM sin90_classify_evals WHERE task_id = ?")
+                .bind(&task.id)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            count, 1,
+            "a low-confidence re-evaluation of a 待定 task must record a classify eval"
+        );
+    }
+
+    /// M-c pin (H2's `task.direction_id == TRIAGE_DIRECTION_ID` precondition):
+    /// a task that is NOT currently parked in 待定 must NEVER get a
+    /// `sin90_classify_evals` row, no matter what `(result, reason)` this
+    /// evaluation ends in — that table exists purely to advance the 待定
+    /// retry gate, and writing it for an ordinary inbox task would be
+    /// meaningless (nothing ever reads it for a non-待定 task) at best and a
+    /// silent behavior change at worst. Mutation target: delete the
+    /// `task.direction_id.as_deref() == Some(TRIAGE_DIRECTION_ID) &&` leg
+    /// from the `if` and this goes red.
+    #[tokio::test]
+    async fn classify_never_records_eval_for_a_non_triage_task() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let _direction = store
+            .create_direction("Work", "2026-Q4", None)
+            .await
+            .unwrap();
+        let task = inbox_task(&store, "Something unrelated to any candidate").await;
+        let reader = store.ai_reader();
+
+        let low_confidence_model = StubModel::always(Ok(reply(
+            r#"{"choice":"none","confidence":"low","reason":"probably nothing but not sure"}"#,
+        )));
+        let items = run_classify(
+            "run-mc-precondition",
+            std::slice::from_ref(&task),
+            ModelAccess::LocalOnly,
+            Some(&low_confidence_model),
+            &store,
+            &reader,
+        )
+        .await;
+        assert_eq!(items[0].result, ItemResult::Nothing);
+        assert_eq!(items[0].reason, Some("low_confidence"));
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM sin90_classify_evals WHERE task_id = ?")
+                .bind(&task.id)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            count, 0,
+            "a task not currently in 待定 must never get a classify eval row"
         );
     }
 
@@ -2190,6 +2807,13 @@ mod tests {
         }
         async fn record_call(&self, rec: crate::ai::AiCallRecord) -> Result<(), SinkError> {
             AiSink::record_call(self.store, rec).await
+        }
+        async fn record_classify_eval(
+            &self,
+            task_id: &str,
+            evaluated_at: &str,
+        ) -> Result<(), SinkError> {
+            AiSink::record_classify_eval(self.store, task_id, evaluated_at).await
         }
         async fn precheck(&self, cap: Capability, drafts: &[ProposalDraft]) -> Vec<bool> {
             AiSink::precheck(self.store, cap, drafts).await

@@ -877,7 +877,7 @@ where
                 ),
             ]
         }
-        Outcome::Nothing => [
+        Outcome::Nothing { .. } => [
             by_kind(ProposeKind::Carry, ProposeItemResult::Nothing),
             by_kind(
                 ProposeKind::Reorder,
@@ -2321,6 +2321,13 @@ mod tests {
         }
         async fn record_call(&self, rec: AiCallRecord) -> Result<(), SinkError> {
             AiSink::record_call(self.inner, rec).await
+        }
+        async fn record_classify_eval(
+            &self,
+            task_id: &str,
+            evaluated_at: &str,
+        ) -> Result<(), SinkError> {
+            AiSink::record_classify_eval(self.inner, task_id, evaluated_at).await
         }
         async fn precheck(&self, cap: Capability, drafts: &[ProposalDraft]) -> Vec<bool> {
             AiSink::precheck(self.inner, cap, drafts).await

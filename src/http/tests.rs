@@ -4737,6 +4737,13 @@ mod ai_classify {
         ) -> Result<(), crate::ai::SinkError> {
             self.inner.record_call(rec).await
         }
+        async fn record_classify_eval(
+            &self,
+            task_id: &str,
+            evaluated_at: &str,
+        ) -> Result<(), crate::ai::SinkError> {
+            self.inner.record_classify_eval(task_id, evaluated_at).await
+        }
         async fn precheck(
             &self,
             cap: Capability,
@@ -5675,6 +5682,1084 @@ mod ai_classify {
              unaffected by the broken rejection read"
         );
     }
+
+    /// T5.7.2 review round 2 (H1): replaces `suppress_rejected_classify_
+    /// does_not_apply_to_a_triage_parked_task` (removed) — that test pinned
+    /// the OLD, buggy scoping (`rejectable` filtered on literal
+    /// `direction_id.is_none()`) and only passed because of it; the review
+    /// found this scoping backwards: it meant a 待定-parked task's OWN
+    /// rejected reclassify-to-D recommendation was NEVER honored, so
+    /// classify re-proposed the SAME already-rejected D every time the
+    /// SEPARATE 待定 retry gate (`AiReadModel::inbox`/`inbox_task`, `store/
+    /// ai_port.rs`) re-qualified the task, for as long as nothing else
+    /// changed — exactly the "情况没变不再提" violation Q9 exists to
+    /// prevent. This pins the REAL semantics instead: a 待定 task's own
+    /// rejected reclassification stays suppressed while nothing changed,
+    /// and lifts once a genuinely new Direction appears — the SAME
+    /// "situation changed" judgement an ordinary inbox task's rejection
+    /// already got. Mutation target: reintroduce the `direction_id.is_none()`
+    /// filter on `rejectable` and the first `dedup_targets` call below goes
+    /// from `kept.is_empty()` to `kept.len() == 1` (the task falls out of
+    /// `rejectable` entirely, so it is never suppressed at all).
+    #[tokio::test]
+    async fn suppress_rejected_classify_applies_to_a_triage_parked_tasks_own_rejection() {
+        let (_app, _sink, store) = test_app_with_store().await;
+        let task = store
+            .create_task(
+                "Ambiguous task",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Fallback-classified into 待定 first (T5.2.2's own path).
+        let triage = crate::ai::ProposalDraft {
+            id: "p-h1-triage".into(),
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task.id.clone(),
+                direction_id: crate::core::TRIAGE_DIRECTION_ID.to_string(),
+            }],
+            rationale: None,
+        };
+        crate::ai::AiSink::submit(
+            &store,
+            Capability::Classify,
+            triage,
+            call_rec("c-h1-triage"),
+        )
+        .await
+        .unwrap();
+        store.apply_proposal("p-h1-triage").await.unwrap();
+
+        // classify recommends reclassifying it to a real Direction — the
+        // human rejects THAT.
+        let direction_d = store
+            .create_direction("Rejected target", "2026-Q4", None)
+            .await
+            .unwrap();
+        let reclassify = crate::ai::ProposalDraft {
+            id: "p-h1-reclassify".into(),
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task.id.clone(),
+                direction_id: direction_d.id.clone(),
+            }],
+            rationale: None,
+        };
+        crate::ai::AiSink::submit(
+            &store,
+            Capability::Classify,
+            reclassify,
+            call_rec("c-h1-reclassify"),
+        )
+        .await
+        .unwrap();
+        store
+            .reject_proposal("p-h1-reclassify", None)
+            .await
+            .unwrap();
+
+        let triage_task = store
+            .list_tasks(None, None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == task.id)
+            .expect("task still exists");
+        assert_eq!(
+            triage_task.direction_id.as_deref(),
+            Some(crate::core::TRIAGE_DIRECTION_ID)
+        );
+
+        // `dedup_targets` is handed the task DIRECTLY (bypassing the inbox's
+        // own 待定 retry gate, a SEPARATE mechanism, §2 #31) so this pins
+        // ONLY the rejection-suppression judgement.
+        let (kept, skipped) =
+            crate::http::ai_classify::dedup_targets(&store, std::slice::from_ref(&triage_task))
+                .await
+                .unwrap();
+        assert!(
+            kept.is_empty(),
+            "nothing changed since the rejection — a 待定 task's own rejected \
+             reclassification must stay suppressed, same as an ordinary inbox task's"
+        );
+        assert_eq!(skipped, vec![(task.id.clone(), "suppressed_rejected")]);
+
+        // A genuinely new Direction appears afterward — suppression lifts.
+        let direction_d2 = store.create_direction("D2", "2026-Q4", None).await.unwrap();
+        crate::store::test_hooks::set_direction_created_at(
+            &store,
+            &direction_d2.id,
+            "2099-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        let (kept2, skipped2) =
+            crate::http::ai_classify::dedup_targets(&store, std::slice::from_ref(&triage_task))
+                .await
+                .unwrap();
+        assert_eq!(
+            kept2.len(),
+            1,
+            "a new non-terminal Direction must lift the suppression"
+        );
+        assert!(skipped2.is_empty());
+    }
+
+    // ---- T5.7.2 (design §2 #31, T5.2.2 followup ②): 待定 reclassification -
+
+    /// `cargo test suppress_`'s 待定 judgements: a task fallback-classified
+    /// into 待定 stays excluded from the inbox while no eligible Direction
+    /// has appeared since (negative control), and becomes reclassifiable the
+    /// moment one does (positive control) — `AiReadModel::inbox`/
+    /// `inbox_task`'s own SQL gate, independent of `sin90_proposal_
+    /// rejections` entirely (no proposal was ever rejected in this test).
+    #[tokio::test]
+    async fn suppress_triage_reclassifies_after_new_direction_but_not_before() {
+        let (_app, _sink, store) = test_app_with_store().await;
+        // Exists BEFORE the 待定 fallback — must NOT itself count as "new".
+        let _old_direction = store
+            .create_direction("Pre-existing Direction", "2026-Q4", None)
+            .await
+            .unwrap();
+        // PR#69 review round 1: pinned safely in the past — otherwise this
+        // Direction's real wall-clock `created_at` and the task's own
+        // (post-fallback) `triage_entered_at`, stamped moments later, risk
+        // landing in the SAME second, and the gate's widened `>=` (a
+        // same-second tie must still count as "seen" for a Direction born
+        // MID-BATCH, see `classify_retry_gate_not_masked_by_direction_born_
+        // mid_batch`) would then wrongly treat this pre-existing Direction
+        // as "new" too, defeating this negative control's own premise.
+        crate::store::test_hooks::set_direction_created_at(
+            &store,
+            &_old_direction.id,
+            "2020-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        let task = store
+            .create_task(
+                "Mystery task",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let draft = crate::ai::ProposalDraft {
+            id: "p-triage-1".into(),
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task.id.clone(),
+                direction_id: crate::core::TRIAGE_DIRECTION_ID.to_string(),
+            }],
+            rationale: None,
+        };
+        crate::ai::AiSink::submit(&store, Capability::Classify, draft, call_rec("c-triage-1"))
+            .await
+            .unwrap();
+        store.apply_proposal("p-triage-1").await.unwrap();
+
+        let reader = store.ai_reader();
+
+        // Negative control: only the OLD (pre-fallback) Direction exists —
+        // must not retry.
+        let inbox = crate::ai::AiReadModel::inbox(&reader, 100).await.unwrap();
+        assert!(
+            !inbox.iter().any(|t| t.id == task.id),
+            "no new Direction since the 待定 fallback — must not retry"
+        );
+        assert!(crate::ai::AiReadModel::inbox_task(&reader, &task.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        // Positive control: a NEW non-terminal Direction appears afterward.
+        // Forced forward past the task's own (post-fallback) `updated_at` —
+        // `now_iso8601()` is second-resolution, so a same-second sequence in
+        // this test would otherwise tie (same reasoning the classify-side
+        // positive controls above document).
+        let fresh = store
+            .create_direction("Freshly created", "2026-Q4", None)
+            .await
+            .unwrap();
+        crate::store::test_hooks::set_direction_created_at(
+            &store,
+            &fresh.id,
+            "2099-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        let inbox2 = crate::ai::AiReadModel::inbox(&reader, 100).await.unwrap();
+        assert!(
+            inbox2.iter().any(|t| t.id == task.id),
+            "a Direction created after the 待定 fallback must let it retry"
+        );
+        assert!(crate::ai::AiReadModel::inbox_task(&reader, &task.id)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    /// `AssignTaskDirection`'s A3 (`core::proposal::validate`) actually lets
+    /// a 待定-parked task be reassigned to a REAL Direction — the inbox-level
+    /// gate above only controls whether classify SELECTS the task; this pins
+    /// that an `AssignTaskDirection` proposal targeting it can still be
+    /// submitted and accepted once selected, and that 待定 → 待定 stays
+    /// refused (§2 #30's own "不放宽待定→待定").
+    #[tokio::test]
+    async fn suppress_triage_reassign_to_real_direction_ok_triage_to_triage_still_not_in_inbox() {
+        let (_app, _sink, store) = test_app_with_store().await;
+        let task = store
+            .create_task(
+                "Mystery task",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+        let seed = crate::ai::ProposalDraft {
+            id: "p-triage-2".into(),
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task.id.clone(),
+                direction_id: crate::core::TRIAGE_DIRECTION_ID.to_string(),
+            }],
+            rationale: None,
+        };
+        crate::ai::AiSink::submit(&store, Capability::Classify, seed, call_rec("c-triage-2"))
+            .await
+            .unwrap();
+        store.apply_proposal("p-triage-2").await.unwrap();
+
+        let real = store
+            .create_direction("Real home", "2026-Q4", None)
+            .await
+            .unwrap();
+
+        // 待定 → 待定 is still refused (A3's carve-out is one-directional).
+        let again_triage = crate::ai::ProposalDraft {
+            id: "p-triage-again".into(),
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task.id.clone(),
+                direction_id: crate::core::TRIAGE_DIRECTION_ID.to_string(),
+            }],
+            rationale: None,
+        };
+        let err = crate::ai::AiSink::submit(
+            &store,
+            Capability::Classify,
+            again_triage,
+            call_rec("c-triage-again"),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, crate::ai::SinkError::Invalid(_)));
+
+        // 待定 → real Direction goes through.
+        let reclassify = crate::ai::ProposalDraft {
+            id: "p-triage-3".into(),
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task.id.clone(),
+                direction_id: real.id.clone(),
+            }],
+            rationale: None,
+        };
+        crate::ai::AiSink::submit(
+            &store,
+            Capability::Classify,
+            reclassify,
+            call_rec("c-triage-3"),
+        )
+        .await
+        .unwrap();
+        store.apply_proposal("p-triage-3").await.unwrap();
+
+        let refetched = store
+            .list_tasks(None, None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == task.id)
+            .expect("task still exists");
+        assert_eq!(refetched.direction_id.as_deref(), Some(real.id.as_str()));
+    }
+
+    // ---- T5.7.2 review round 2 (H2): 待定 retry gate's own exit condition -
+
+    /// H2 core: without `sin90_classify_evals`, a triage task classify
+    /// re-examines and STILL cannot place would re-qualify as a target on
+    /// EVERY future run for as long as the same newest Direction stays
+    /// newest (`none`/low-confidence/no-conclusion never move
+    /// `sin90_tasks.updated_at`, the old gate's comparand). Pins the fixed
+    /// gate's three states directly against `AiSink::record_classify_eval`
+    /// (the pipeline-level regression, at `MAX_CLASSIFY_TASK_IDS` scale, is
+    /// `suppress_triage_retry_does_not_starve_new_tasks` below): (1) a newer
+    /// eligible Direction opens the gate: (2) recording an evaluation closes
+    /// it again for that SAME Direction; (3) a Direction newer still
+    /// re-opens it.
+    #[tokio::test]
+    async fn suppress_triage_retry_gate_advances_past_a_fruitless_evaluation() {
+        let (_app, _sink, store) = test_app_with_store().await;
+        let task = store
+            .create_task(
+                "Mystery task",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+        let draft = crate::ai::ProposalDraft {
+            id: "p-h2-gate-1".into(),
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task.id.clone(),
+                direction_id: crate::core::TRIAGE_DIRECTION_ID.to_string(),
+            }],
+            rationale: None,
+        };
+        crate::ai::AiSink::submit(&store, Capability::Classify, draft, call_rec("c-h2-gate-1"))
+            .await
+            .unwrap();
+        store.apply_proposal("p-h2-gate-1").await.unwrap();
+        // Pin "entered 待定" safely in the past — `now_iso8601()`'s
+        // second-resolution would otherwise risk a same-second tie against
+        // the Directions created right below (mirrors every other
+        // `set_*_at`-backdating test in this suite).
+        crate::store::test_hooks::set_task_triage_entered_at(
+            &store,
+            &task.id,
+            "2020-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        let new_direction = store
+            .create_direction("Freshly created", "2026-Q4", None)
+            .await
+            .unwrap();
+        let reader = store.ai_reader();
+        assert!(
+            crate::ai::AiReadModel::inbox_task(&reader, &task.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "a newer eligible Direction must open the gate"
+        );
+
+        // classify looked at the task and STILL found nothing new (H2's own
+        // exit condition). PR#69 review round 1: `evaluated_at` is stamped a
+        // few seconds AFTER `new_direction`'s real wall-clock `created_at` —
+        // not `now_iso8601()` right here, which risks landing in the SAME
+        // second and, under the gate's widened `>=` (a same-second tie must
+        // still count as "seen"), wrongly re-opening the gate this
+        // assertion is pinning shut.
+        crate::ai::AiSink::record_classify_eval(
+            &store,
+            &task.id,
+            &crate::core::iso8601_after_secs(5),
+        )
+        .await
+        .unwrap();
+        assert!(
+            crate::ai::AiReadModel::inbox_task(&reader, &task.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the SAME newest Direction must not re-qualify the task right after it was evaluated"
+        );
+
+        // A Direction newer than the evaluation re-opens the gate.
+        let newer_direction = store
+            .create_direction("Even fresher", "2026-Q4", None)
+            .await
+            .unwrap();
+        crate::store::test_hooks::set_direction_created_at(
+            &store,
+            &newer_direction.id,
+            "2099-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        let _ = new_direction; // kept only to document it existed before the eval
+        assert!(
+            crate::ai::AiReadModel::inbox_task(&reader, &task.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "a Direction newer than the last evaluation must re-open the gate"
+        );
+    }
+
+    /// H2 at pipeline scale, the review's own starvation scenario: without
+    /// the gate's exit condition, more than `MAX_CLASSIFY_TASK_IDS` (20)
+    /// 待定 tasks the model keeps deciding "none" about would occupy EVERY
+    /// target slot forever, starving a genuinely new inbox task out of ever
+    /// being selected. Builds 21 already-triage tasks (all gate-eligible,
+    /// oldest-first) plus one fresh ordinary inbox task created last, and
+    /// runs the real `auto_select_targets` → `run_classify` pipeline twice:
+    /// run 1 selects the 20 OLDEST 待定 tasks (the cap); `ExplicitNoneModel`
+    /// decides "none" for each (already in 待定, so `submit_direction_
+    /// assignment`'s re-attempt is refused by A3 → `Rejected`) — `classify_
+    /// one`'s H2 write-eval still fires on that branch. Run 2's `auto_
+    /// select_targets` then finds those 20 no longer gate-eligible and
+    /// reaches the fresh task instead. Mutation target: revert `classify_
+    /// one`'s H2 write-eval block to a no-op and run 2 goes back to
+    /// re-selecting the same stale 20, never reaching the fresh task.
+    #[tokio::test]
+    async fn suppress_triage_retry_does_not_starve_new_tasks() {
+        let (_app, _sink, store) = test_app_with_store().await;
+
+        let cap = crate::ai::classify::MAX_CLASSIFY_TASK_IDS;
+        let mut triage_ids = Vec::new();
+        for i in 0..=cap {
+            // 0..=cap is cap+1 tasks — one more than the selection cap.
+            let t = store
+                .create_task(
+                    &format!("Mystery {i}"),
+                    None,
+                    None,
+                    TaskKind::Other,
+                    Energy::Mid,
+                    None,
+                )
+                .await
+                .unwrap();
+            let draft = crate::ai::ProposalDraft {
+                id: format!("p-starve-{i}"),
+                ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                    task_id: t.id.clone(),
+                    direction_id: crate::core::TRIAGE_DIRECTION_ID.to_string(),
+                }],
+                rationale: None,
+            };
+            crate::ai::AiSink::submit(
+                &store,
+                Capability::Classify,
+                draft,
+                call_rec(&format!("c-starve-{i}")),
+            )
+            .await
+            .unwrap();
+            store
+                .apply_proposal(&format!("p-starve-{i}"))
+                .await
+                .unwrap();
+            crate::store::test_hooks::set_task_triage_entered_at(
+                &store,
+                &t.id,
+                "2020-01-01T00:00:00Z",
+            )
+            .await
+            .unwrap();
+            triage_ids.push(t.id);
+        }
+        let _new_direction = store
+            .create_direction("Freshly created", "2026-Q4", None)
+            .await
+            .unwrap();
+        // PR#69 review round 1: pinned safely between the 2020 entered_at
+        // floor and `run_classify`'s own `run_started_at` (real wall-clock
+        // "now", captured a moment after this) — otherwise the gate's
+        // widened `>=` (a same-second tie must still count as "seen", so a
+        // Direction born mid-batch is not masked) would ALSO count THIS
+        // Direction and run 1's `run_started_at` as tied if both land in the
+        // same wall-clock second, keeping the gate open after run 1's eval
+        // write and defeating this test's own premise.
+        crate::store::test_hooks::set_direction_created_at(
+            &store,
+            &_new_direction.id,
+            "2024-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        let fresh_task = store
+            .create_task(
+                "Brand new task",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let reader = store.ai_reader();
+
+        // Run 1: the cap OLDEST 待定 tasks (created_at ASC) fill every slot;
+        // the fresh task is younger than all of them, past the cap.
+        let targets1 = crate::http::ai_classify::auto_select_targets(&store, &reader).await;
+        assert_eq!(targets1.len(), cap);
+        let target1_ids: std::collections::HashSet<_> =
+            targets1.iter().map(|t| t.id.clone()).collect();
+        assert!(
+            !target1_ids.contains(&fresh_task.id),
+            "run 1 must not reach the fresh task yet: {target1_ids:?}"
+        );
+
+        let _outcomes = crate::ai::classify::run_classify(
+            "run-starve-1",
+            &targets1,
+            crate::ai::ModelAccess::LocalOnly,
+            Some(&ExplicitNoneModel),
+            &store,
+            &reader,
+        )
+        .await;
+
+        // Run 2: the 20 just-evaluated 待定 tasks are no longer gate-eligible
+        // (H2) — the fresh task is now reachable.
+        let targets2 = crate::http::ai_classify::auto_select_targets(&store, &reader).await;
+        let target2_ids: std::collections::HashSet<_> =
+            targets2.iter().map(|t| t.id.clone()).collect();
+        assert!(
+            target2_ids.contains(&fresh_task.id),
+            "H2: the fresh task must no longer be starved once the stale 待定 retries \
+             drop out of the gate: {target2_ids:?}"
+        );
+    }
+
+    // ---- T5.7.2 review round 2 (M6): 待定→真实 Direction only for --------
+    // ---- classify's OWN placements, never a human's direct one ------------
+
+    /// M6 positive control: `suppress_triage_reassign_to_real_direction_ok_
+    /// triage_to_triage_still_not_in_inbox` above already pins the
+    /// classify-placed case (`AiSink::submit` records the `sin90_ai_calls`
+    /// row `task_triage_via_classify` relies on) — nothing new needed here.
+    ///
+    /// M6 negative control: a task a human/automation client files DIRECTLY
+    /// into 待定 (`POST /proposals`, no `AiSink::submit` in the path at all —
+    /// `capability_source` resolves to `"direct"`, same domain `reject_
+    /// proposal` reports) must NOT be reclassifiable out from under them by
+    /// a later AI run, and must never be offered to classify's retry inbox
+    /// either — both halves share the SAME `task_triage_via_classify` check
+    /// (`core::proposal::validate`'s A3, `AiReadModel::inbox`/`inbox_task`'s
+    /// SQL gate).
+    #[tokio::test]
+    async fn suppress_triage_reassign_requires_classify_placement_not_a_manual_one() {
+        let (_app, _sink, store) = test_app_with_store().await;
+        let task = store
+            .create_task(
+                "Filed by hand",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // A human/automation client submits AND accepts this DIRECTLY — no
+        // `AiSink::submit` anywhere in this path, so no `sin90_ai_calls` row
+        // ever links back to it (`capability_source = "direct"`).
+        let manual = crate::core::Sin90Proposal {
+            id: "p-manual-triage".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task.id.clone(),
+                direction_id: crate::core::TRIAGE_DIRECTION_ID.to_string(),
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&manual).await.unwrap();
+        store.apply_proposal(&manual.id).await.unwrap();
+        crate::store::test_hooks::set_task_triage_entered_at(
+            &store,
+            &task.id,
+            "2020-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        let real = store
+            .create_direction("Real home", "2026-Q4", None)
+            .await
+            .unwrap();
+
+        // The retry inbox must never offer this task at all, even though a
+        // new eligible Direction exists (the SAME condition that opens the
+        // gate for a classify-placed task in the sibling test above).
+        let reader = store.ai_reader();
+        assert!(
+            crate::ai::AiReadModel::inbox_task(&reader, &task.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "a manually-filed 待定 task must never enter classify's retry inbox"
+        );
+
+        // And an explicit reclassify attempt is refused, same as any other
+        // already-classified task (待定 or not) — A3's carve-out never
+        // applies to it.
+        let reclassify = crate::ai::ProposalDraft {
+            id: "p-manual-reclassify".into(),
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task.id.clone(),
+                direction_id: real.id.clone(),
+            }],
+            rationale: None,
+        };
+        let err = crate::ai::AiSink::submit(
+            &store,
+            Capability::Classify,
+            reclassify,
+            call_rec("c-manual-reclassify"),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, crate::ai::SinkError::Invalid(_)));
+    }
+
+    // ---- M-a (T5.7.2 review round 2 follow-up): a human/automation client
+    // moving their OWN 待定 placement out is always allowed, unlike an AI ----
+
+    /// The exact mirror of `suppress_triage_reassign_requires_classify_
+    /// placement_not_a_manual_one` above — SAME fixture (a manually-filed
+    /// 待定 task, `task_triage_via_classify` reports `false`) — but the
+    /// reclassify attempt is submitted DIRECTLY (`POST /proposals`'s own
+    /// path, `submit_proposal`/`apply_proposal`, `capability_source =
+    /// "direct"`) instead of through `AiSink::submit`. Before M-a this was
+    /// ALSO refused (M6's carve-out only ever checked `task_triage_via_
+    /// classify`, blind to who the CURRENT proposal itself came from) —
+    /// locking the user out of a task they filed into 待定 with their own
+    /// hands (Q7 cuts both ways). Mutation target: drop the
+    /// `capability_source == "direct" ||` leg `core::proposal::validate`'s
+    /// A3 carve-out gained and this goes red (`Err` instead of `Ok`).
+    #[tokio::test]
+    async fn direct_source_can_move_its_own_manually_filed_triage_task_out() {
+        let (_app, _sink, store) = test_app_with_store().await;
+        let task = store
+            .create_task(
+                "Filed by hand",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let manual = crate::core::Sin90Proposal {
+            id: "p-ma-manual-triage".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task.id.clone(),
+                direction_id: crate::core::TRIAGE_DIRECTION_ID.to_string(),
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&manual).await.unwrap();
+        store.apply_proposal(&manual.id).await.unwrap();
+
+        let real = store
+            .create_direction("Real home", "2026-Q4", None)
+            .await
+            .unwrap();
+
+        // The SAME human/automation client (a direct `POST /proposals`, not
+        // `AiSink::submit`) moves their own task out — must succeed.
+        let move_out = crate::core::Sin90Proposal {
+            id: "p-ma-manual-move-out".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task.id.clone(),
+                direction_id: real.id.clone(),
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&move_out).await.unwrap();
+        store.apply_proposal(&move_out.id).await.unwrap();
+
+        let refetched = store
+            .list_tasks(None, None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == task.id)
+            .expect("task still exists");
+        assert_eq!(
+            refetched.direction_id.as_deref(),
+            Some(real.id.as_str()),
+            "a direct-sourced proposal must be able to move the user's OWN 待定 task out"
+        );
+    }
+
+    /// Negative control for the test above, at the SAME `apply_proposal`
+    /// layer that resolves `capability_source` dynamically: an AI
+    /// (`AiSink::submit`, `capability_source = "classify"`) run must still
+    /// be refused for the identical manually-filed fixture — M-a narrows the
+    /// carve-out, it does not remove classify's own restriction. (Already
+    /// exercised end-to-end by `suppress_triage_reassign_requires_classify_
+    /// placement_not_a_manual_one` above; kept short here as the direct
+    /// counterpart's own paired control.)
+    #[tokio::test]
+    async fn classify_source_still_refused_for_the_same_manually_filed_task() {
+        let (_app, _sink, store) = test_app_with_store().await;
+        let task = store
+            .create_task(
+                "Filed by hand",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+        let manual = crate::core::Sin90Proposal {
+            id: "p-ma-manual-triage-2".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task.id.clone(),
+                direction_id: crate::core::TRIAGE_DIRECTION_ID.to_string(),
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&manual).await.unwrap();
+        store.apply_proposal(&manual.id).await.unwrap();
+        let real = store
+            .create_direction("Real home", "2026-Q4", None)
+            .await
+            .unwrap();
+        let reclassify = crate::ai::ProposalDraft {
+            id: "p-ma-classify-reclassify".into(),
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task.id.clone(),
+                direction_id: real.id.clone(),
+            }],
+            rationale: None,
+        };
+        let err = crate::ai::AiSink::submit(
+            &store,
+            Capability::Classify,
+            reclassify,
+            call_rec("c-ma-classify-reclassify"),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, crate::ai::SinkError::Invalid(_)));
+    }
+
+    // ---- N-H1 (T5.7.2 review round 2 follow-up): 待定 provenance survives --
+    // ---- CarryOverTask minting a new task id -------------------------------
+
+    /// The regression itself: a task classify fallback-parks into 待定, then
+    /// gets carried into the next week (`CarryOverTask` mints a brand-new
+    /// id, per-design — `direction_id` is copied, `triage_via`/
+    /// `triage_entered_at` must be too). Before this fix, BOTH the H2 retry
+    /// gate and M6's A3 carve-out were keyed off a JOIN/lookup that used the
+    /// task's CURRENT id — under the carried-over id, neither ever matched
+    /// anything again: the task could never re-enter the retry inbox no
+    /// matter how many new Directions appeared, and an AI reclassify of it
+    /// was refused exactly like a human's direct placement would be.
+    /// Mutation target: drop the `triage_via`/`triage_entered_at` columns
+    /// from `CarryOverTask`'s apply (leave them out of the new row's
+    /// INSERT) and every assertion below goes red.
+    #[tokio::test]
+    async fn carry_over_task_preserves_classify_triage_provenance_for_retry() {
+        let (_app, _sink, store) = test_app_with_store().await;
+        let prev = store.create_week("2026-W20").await.unwrap();
+        store
+            .transition_week(&prev.id, crate::core::WeekStatus::Active)
+            .await
+            .unwrap();
+        let seed = crate::core::Sin90Proposal {
+            id: "seed-nh1-task".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![crate::core::Sin90Op::CreateTasks {
+                week_id: prev.id.clone(),
+                tasks: vec![crate::core::NewTask {
+                    title: "Mystery task".into(),
+                    direction_id: None,
+                }],
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&seed).await.unwrap();
+        store.apply_proposal(&seed.id).await.unwrap();
+        let task = crate::ai::AiReadModel::week_tasks(&store.ai_reader(), &prev.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.title == "Mystery task")
+            .expect("seeded task must exist");
+
+        // Classify fallback-parks it into 待定.
+        let draft = crate::ai::ProposalDraft {
+            id: "p-nh1-triage".into(),
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task.id.clone(),
+                direction_id: crate::core::TRIAGE_DIRECTION_ID.to_string(),
+            }],
+            rationale: None,
+        };
+        crate::ai::AiSink::submit(
+            &store,
+            Capability::Classify,
+            draft,
+            call_rec("c-nh1-triage"),
+        )
+        .await
+        .unwrap();
+        store.apply_proposal("p-nh1-triage").await.unwrap();
+        crate::store::test_hooks::set_task_triage_entered_at(
+            &store,
+            &task.id,
+            "2020-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        let (via, entered_at) = crate::store::test_hooks::task_triage_state(&store, &task.id)
+            .await
+            .unwrap();
+        assert_eq!(via.as_deref(), Some("classify"));
+        assert_eq!(entered_at.as_deref(), Some("2020-01-01T00:00:00Z"));
+
+        // Carry it into the next week — a brand-new task id.
+        let target = store.create_week("2026-W21").await.unwrap();
+        let carry = crate::core::Sin90Proposal {
+            id: "p-nh1-carry".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![crate::core::Sin90Op::CarryOverTask {
+                task_id: task.id.clone(),
+                to_week: target.id.clone(),
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&carry).await.unwrap();
+        store.apply_proposal(&carry.id).await.unwrap();
+        let carried = crate::ai::AiReadModel::week_tasks(&store.ai_reader(), &target.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.carried_from.as_deref() == Some(task.id.as_str()))
+            .expect("carried-over task must exist under a new id");
+        assert_ne!(carried.id, task.id, "CarryOverTask must mint a new task id");
+
+        // The new id must carry the SAME provenance forward.
+        let (via, entered_at) = crate::store::test_hooks::task_triage_state(&store, &carried.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            via.as_deref(),
+            Some("classify"),
+            "triage_via must survive the carry under the new id"
+        );
+        assert_eq!(
+            entered_at.as_deref(),
+            Some("2020-01-01T00:00:00Z"),
+            "triage_entered_at must survive the carry under the new id"
+        );
+
+        let reader = store.ai_reader();
+
+        // Negative control: no new eligible Direction yet — still not
+        // retry-eligible under the new id.
+        assert!(
+            crate::ai::AiReadModel::inbox_task(&reader, &carried.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "no new Direction since the carry — must not retry yet"
+        );
+
+        // A new Direction appears — the carried task (under its NEW id) must
+        // become retry-eligible again.
+        let fresh = store
+            .create_direction("Freshly created", "2026-Q4", None)
+            .await
+            .unwrap();
+        crate::store::test_hooks::set_direction_created_at(
+            &store,
+            &fresh.id,
+            "2099-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        assert!(
+            crate::ai::AiReadModel::inbox_task(&reader, &carried.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "a new Direction must lift the carried task's retry suppression under its new id"
+        );
+
+        // And an AI reclassify of the CARRIED task to a real Direction must
+        // still be allowed (M6's carve-out, unaffected by the carry).
+        let reclassify = crate::ai::ProposalDraft {
+            id: "p-nh1-reclassify".into(),
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: carried.id.clone(),
+                direction_id: fresh.id.clone(),
+            }],
+            rationale: None,
+        };
+        crate::ai::AiSink::submit(
+            &store,
+            Capability::Classify,
+            reclassify,
+            call_rec("c-nh1-reclassify"),
+        )
+        .await
+        .unwrap();
+        store.apply_proposal("p-nh1-reclassify").await.unwrap();
+        let refetched = crate::ai::AiReadModel::week_tasks(&store.ai_reader(), &target.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == carried.id)
+            .expect("carried task still exists");
+        assert_eq!(refetched.direction_id.as_deref(), Some(fresh.id.as_str()));
+    }
+
+    /// The protection side: a task a human files DIRECTLY into 待定, then
+    /// carried into the next week, must remain protected from an AI
+    /// reclassify under its NEW id too (M6 unaffected by the carry) — pins
+    /// that `CarryOverTask` copies `triage_via = 'direct'` (not merely
+    /// leaving both columns `NULL`, which would coincidentally block the AI
+    /// move the same way but is not what the source row actually says: see
+    /// `store::test_hooks::task_triage_state`'s own assertion below).
+    #[tokio::test]
+    async fn carry_over_task_preserves_direct_triage_protection_under_new_id() {
+        let (_app, _sink, store) = test_app_with_store().await;
+        let prev = store.create_week("2026-W22").await.unwrap();
+        store
+            .transition_week(&prev.id, crate::core::WeekStatus::Active)
+            .await
+            .unwrap();
+        let seed = crate::core::Sin90Proposal {
+            id: "seed-nh1-direct-task".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![crate::core::Sin90Op::CreateTasks {
+                week_id: prev.id.clone(),
+                tasks: vec![crate::core::NewTask {
+                    title: "Filed by hand".into(),
+                    direction_id: None,
+                }],
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&seed).await.unwrap();
+        store.apply_proposal(&seed.id).await.unwrap();
+        let task = crate::ai::AiReadModel::week_tasks(&store.ai_reader(), &prev.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.title == "Filed by hand")
+            .expect("seeded task must exist");
+
+        let manual = crate::core::Sin90Proposal {
+            id: "p-nh1-direct-triage".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task.id.clone(),
+                direction_id: crate::core::TRIAGE_DIRECTION_ID.to_string(),
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&manual).await.unwrap();
+        store.apply_proposal(&manual.id).await.unwrap();
+
+        let target = store.create_week("2026-W23").await.unwrap();
+        let carry = crate::core::Sin90Proposal {
+            id: "p-nh1-direct-carry".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![crate::core::Sin90Op::CarryOverTask {
+                task_id: task.id.clone(),
+                to_week: target.id.clone(),
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&carry).await.unwrap();
+        store.apply_proposal(&carry.id).await.unwrap();
+        let carried = crate::ai::AiReadModel::week_tasks(&store.ai_reader(), &target.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.carried_from.as_deref() == Some(task.id.as_str()))
+            .expect("carried-over task must exist under a new id");
+
+        let (via, _) = crate::store::test_hooks::task_triage_state(&store, &carried.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            via.as_deref(),
+            Some("direct"),
+            "a direct placement's triage_via must survive the carry as 'direct', not NULL"
+        );
+
+        let real = store
+            .create_direction("Real home", "2026-Q4", None)
+            .await
+            .unwrap();
+        // L5 (T5.7.2 review round 3): force this Direction unambiguously
+        // NEWER than `carried`'s `triage_entered_at` — without this, `real`'s
+        // own `created_at` (recorded at ordinary test wall-clock time, the
+        // same second `triage_entered_at` itself was stamped at) may not
+        // actually be newer, so the `inbox_task` check below could pass for
+        // the WRONG reason (H2's "no fresh Direction" staleness gate alone,
+        // never reaching the `triage_via = 'classify'` filter this test
+        // exists to pin) instead of the reason the test's own name and doc
+        // claim. Mutation target: delete `triage_via = 'classify'` from
+        // `store/ai_port.rs`'s `triage_retry_gate_sql`/`inbox`/`inbox_task`
+        // and, WITH this line in place, the assertion below goes red.
+        crate::store::test_hooks::set_direction_created_at(
+            &store,
+            &real.id,
+            "2099-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        let reader = store.ai_reader();
+        assert!(
+            crate::ai::AiReadModel::inbox_task(&reader, &carried.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "a manually-filed 待定 task must never enter classify's retry inbox, even after a carry"
+        );
+        let reclassify = crate::ai::ProposalDraft {
+            id: "p-nh1-direct-reclassify".into(),
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: carried.id.clone(),
+                direction_id: real.id.clone(),
+            }],
+            rationale: None,
+        };
+        let err = crate::ai::AiSink::submit(
+            &store,
+            Capability::Classify,
+            reclassify,
+            call_rec("c-nh1-direct-reclassify"),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, crate::ai::SinkError::Invalid(_)));
+    }
+
     /// L3 (T5.7.2 review round 3): `POST /tasks` (`Sin90Store::create_task`)
     /// is a path INTO 待定 that never goes through `AssignTaskDirection` at
     /// all — a task filed straight in with `direction_id = "sin90-triage"`
@@ -5873,21 +6958,11 @@ mod ai_classify {
 
         // Classify re-evaluates the SAME (now-in-待定) task and finds
         // nothing new again — writes a real `sin90_classify_evals` row
-        // under the task's CURRENT (pre-carry) id. ① (T5.7.2 review round 3,
-        // stacked-PR split): seeded via raw SQL rather than `AiSink::
-        // record_classify_eval` — that trait method (H2's own write path)
-        // is a LATER branch's addition (`triage-reclassify`); this branch
-        // only needs the ROW to exist, the same upsert shape that method
-        // itself uses, to pin `CarryOverTask`'s own copy of it.
-        sqlx::query(
-            "INSERT INTO sin90_classify_evals (task_id, evaluated_at) VALUES (?, ?)
-             ON CONFLICT(task_id) DO UPDATE SET evaluated_at = excluded.evaluated_at",
-        )
-        .bind(&task.id)
-        .bind(crate::core::now_iso8601())
-        .execute(store.pool())
-        .await
-        .unwrap();
+        // under the task's CURRENT (pre-carry) id (H2's own write path,
+        // exercised directly rather than through a full ladder run).
+        crate::ai::AiSink::record_classify_eval(&store, &task.id, &crate::core::now_iso8601())
+            .await
+            .unwrap();
         let old_evaluated_at: String =
             sqlx::query_scalar("SELECT evaluated_at FROM sin90_classify_evals WHERE task_id = ?")
                 .bind(&task.id)
@@ -5925,6 +7000,111 @@ mod ai_classify {
             new_evaluated_at,
             Some(old_evaluated_at),
             "CarryOverTask must copy the classify eval row to the carried task's new id"
+        );
+    }
+
+    // ---- Low (T5.7.2 review round 2 follow-up): direction_assigned's own --
+    // ---- event payload carries the REAL prior direction_id -----------------
+
+    /// `AssignTaskDirection`'s apply used to hardcode the `direction_assigned`
+    /// event's `from_direction_id` to `null` regardless of the task's actual
+    /// prior state — wrong the moment M6's carve-out made a 待定 → real
+    /// transition reachable (the prior value was `sin90-triage`, not `null`).
+    /// Pins BOTH cases: inbox (`None`) → real, and 待定 (`Some(TRIAGE)`) →
+    /// real. Mutation target: hardcode `"from_direction_id": null` back in
+    /// `apply_op`'s `AssignTaskDirection` arm and this goes red.
+    #[tokio::test]
+    async fn direction_assigned_event_carries_real_from_direction_id() {
+        let (_app, _sink, store) = test_app_with_store().await;
+        let task = store
+            .create_task("Some task", None, None, TaskKind::Other, Energy::Mid, None)
+            .await
+            .unwrap();
+        let real = store
+            .create_direction("Real home", "2026-Q4", None)
+            .await
+            .unwrap();
+
+        // Case 1: inbox (NULL) → real.
+        let assign = crate::core::Sin90Proposal {
+            id: "p-low-from-direction-inbox".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task.id.clone(),
+                direction_id: real.id.clone(),
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&assign).await.unwrap();
+        store.apply_proposal(&assign.id).await.unwrap();
+        let payload: String = sqlx::query_scalar(
+            "SELECT payload FROM sin90_events
+             WHERE entity = 'task' AND entity_id = ? AND kind = 'direction_assigned'
+             ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(&task.id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(parsed["from_direction_id"], serde_json::Value::Null);
+
+        // Case 2: 待定 → real (M6's carve-out) — via a human/direct proposal,
+        // which M-a now allows to move its own placement out.
+        let task2 = store
+            .create_task(
+                "Another task",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+        let to_triage = crate::core::Sin90Proposal {
+            id: "p-low-from-direction-triage".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task2.id.clone(),
+                direction_id: crate::core::TRIAGE_DIRECTION_ID.to_string(),
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&to_triage).await.unwrap();
+        store.apply_proposal(&to_triage.id).await.unwrap();
+        let real2 = store
+            .create_direction("Real home 2", "2026-Q4", None)
+            .await
+            .unwrap();
+        let out_of_triage = crate::core::Sin90Proposal {
+            id: "p-low-from-direction-real".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task2.id.clone(),
+                direction_id: real2.id.clone(),
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&out_of_triage).await.unwrap();
+        store.apply_proposal(&out_of_triage.id).await.unwrap();
+        let payload2: String = sqlx::query_scalar(
+            "SELECT payload FROM sin90_events
+             WHERE entity = 'task' AND entity_id = ? AND kind = 'direction_assigned'
+             ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(&task2.id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        let parsed2: serde_json::Value = serde_json::from_str(&payload2).unwrap();
+        assert_eq!(
+            parsed2["from_direction_id"],
+            serde_json::Value::String(crate::core::TRIAGE_DIRECTION_ID.to_string()),
+            "from_direction_id must be the task's REAL prior Direction (待定), not null: {parsed2}"
         );
     }
 

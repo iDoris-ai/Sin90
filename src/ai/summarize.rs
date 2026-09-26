@@ -728,7 +728,7 @@ where
         // `Some`, so `run_item` never falls through to here) — kept so this
         // `match` stays exhaustive against `Outcome<T>`'s real shape rather
         // than assuming the always-decisive property holds forever.
-        Outcome::Nothing => SummarizeItemResult::Nothing,
+        Outcome::Nothing { .. } => SummarizeItemResult::Nothing,
         Outcome::Deferred => SummarizeItemResult::Deferred,
         Outcome::Aborted => SummarizeItemResult::Aborted,
     }
