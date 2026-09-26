@@ -405,9 +405,22 @@ pub(crate) async fn dedup_targets(
     store: &Sin90Store,
     targets: &[Task],
 ) -> Result<(Vec<Task>, Vec<(TaskId, &'static str)>), StoreError> {
+    // T5.7.2 review round 3: a `list_rejected_ops` failure degrades to "no
+    // known rejections" (same fail-open posture `auto_select_targets`'s own
+    // copy of this read already uses) instead of aborting the whole call —
+    // the pending-proposal dedup half computed inside
+    // `dedup_targets_with_rejected` does not depend on this read at all and
+    // must not go down with it.
     let rejected = store
         .list_rejected_ops(Capability::Classify.as_str())
-        .await?;
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                error = %e,
+                "dedup_targets: list_rejected_ops failed; treating as empty, pending-dedup unaffected"
+            );
+            Vec::new()
+        });
     dedup_targets_with_rejected(store, targets, &rejected).await
 }
 
@@ -506,11 +519,32 @@ async fn dedup_targets_with_rejected(
             // The "新 Direction" leg (§2 #31): one read, shared by every
             // rejected task this call is considering — a Direction created
             // after ANY of their `proposed_at` values un-suppresses them.
-            let max_new_direction = store
+            //
+            // T5.7.2 review round 3: this read (and `task_modified_since`
+            // below) used to propagate a failure with `?`, which aborted
+            // this WHOLE function — throwing away the pending-proposal
+            // dedup (`skip` entries already inserted above) along with the
+            // rejection-suppression half that actually failed. Only the
+            // rejection-suppression half is degraded here (fail-open: a
+            // rejected task whose "situation changed" check could not be
+            // answered is simply left un-suppressed, i.e. shown to the
+            // human again rather than silently hidden) — `skip`'s existing
+            // `"dedup"` entries, and every OTHER rejectable task's own
+            // check, are unaffected.
+            let max_new_direction = match store
                 .ai_reader()
                 .max_eligible_direction_created_at()
                 .await
-                .map_err(|e| StoreError::Internal(e.to_string()))?;
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "dedup_targets: max_eligible_direction_created_at failed; degrading rejection-suppression only, pending-dedup unaffected"
+                    );
+                    None
+                }
+            };
             for t in rejectable {
                 let Some(proposed_at) = latest_reject.get(&t.id) else {
                     continue;
@@ -524,7 +558,17 @@ async fn dedup_targets_with_rejected(
                 // scoping) and was ALSO fooled by an accepted `ReorderTasks`
                 // bumping `updated_at` for every task in a week regardless
                 // of Direction, human edit or not.
-                let task_modified = store.task_modified_since(&t.id, proposed_at).await?;
+                let task_modified = match store.task_modified_since(&t.id, proposed_at).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            task_id = %t.id,
+                            "dedup_targets: task_modified_since failed; degrading rejection-suppression for this task only"
+                        );
+                        continue;
+                    }
+                };
                 let new_direction = max_new_direction
                     .as_deref()
                     .is_some_and(|c| c > proposed_at.as_str());

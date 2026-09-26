@@ -136,7 +136,7 @@ impl AiReader {
     /// reserved 待定 id, i.e. the exact same eligibility set
     /// `direction_candidates`/`title_history` already filter on. `None` when
     /// no such Direction exists at all (a brand-new user, or every one is
-    /// terminal/待定) — the caller then has nothing to compare a `rejected_at`
+    /// terminal/待定) — the caller then has nothing to compare a `proposed_at`
     /// against, i.e. this leg never fires. Not part of `AiReadModel` (`ai/`
     /// never needs it — the suppression check itself lives at the HTTP layer,
     /// same posture `ai_classify::dedup_targets`'s own `Sin90Store::

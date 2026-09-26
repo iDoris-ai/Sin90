@@ -5345,7 +5345,7 @@ mod ai_classify {
             .create_direction("Freshly created", "2026-Q4", None)
             .await
             .unwrap();
-        // Force this Direction's `created_at` forward past `rejected_at` —
+        // Force this Direction's `created_at` forward past `proposed_at` —
         // same same-second tie concern the positive control above has.
         crate::store::test_hooks::set_direction_created_at(
             &store,
@@ -5530,6 +5530,15 @@ mod ai_classify {
             .await
             .unwrap();
         store.apply_proposal("p-reorder-trap").await.unwrap();
+        // Force `updated_at` far past `since` (`proposed_at`) so a mutant
+        // reverting `task_modified_since` to a naive `sin90_tasks.updated_at
+        // > since` comparison is caught for certain — `ReorderTasks`'s own
+        // bump already lands after `since` in real wall-clock time, but at
+        // second resolution the two can tie within the same test run; this
+        // makes the mutation-kill deterministic instead of a coin flip.
+        crate::store::test_hooks::set_task_updated_at(&store, &task_id, "2099-01-01T00:00:00Z")
+            .await
+            .unwrap();
 
         let refetched = store
             .list_tasks(None, None, None)
@@ -5553,6 +5562,118 @@ mod ai_classify {
              \"task modified\" — suppression must hold"
         );
         assert_eq!(skipped, vec![(task_id.clone(), "suppressed_rejected")]);
+    }
+
+    /// T5.7.2 review round 3: `dedup_targets`/`dedup_targets_with_rejected`
+    /// used to bail out of their WHOLE call the moment ANY of their
+    /// rejection-related reads failed (`list_rejected_ops` at the top, or
+    /// `task_modified_since`/`max_eligible_direction_created_at` inside
+    /// `dedup_targets_with_rejected`) — throwing away the UNRELATED
+    /// pending-proposal dedup half along with it. Dropping
+    /// `sin90_proposal_rejections` (AFTER a real rejection row already
+    /// exists in it) fails `list_rejected_ops` for certain, without
+    /// touching anything `AiSink::precheck`'s own dry run needs (that table
+    /// backs nothing else — see its own doc). The judgement: a still-valid
+    /// pending proposal for an UNRELATED task must still skip it
+    /// (`"dedup"`), even while the rejection-suppression half degrades —
+    /// fail-open (simply not suppressed), not a crash.
+    #[tokio::test]
+    async fn dedup_targets_degrades_rejection_suppression_without_losing_pending_dedup() {
+        let (_app, _sink, store) = test_app_with_store().await;
+        let direction = store
+            .create_direction("Side quest", "2026-Q4", None)
+            .await
+            .unwrap();
+
+        // Task A: a still-valid PENDING proposal — the "dedup" half.
+        let task_dedup = store
+            .create_task(
+                "Ambiguous task A",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+        let draft = crate::ai::ProposalDraft {
+            id: "p-degrade-dedup".into(),
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task_dedup.id.clone(),
+                direction_id: direction.id.clone(),
+            }],
+            rationale: None,
+        };
+        crate::ai::AiSink::submit(
+            &store,
+            Capability::Classify,
+            draft,
+            call_rec("c-degrade-dedup"),
+        )
+        .await
+        .unwrap();
+
+        // Task B: a REJECTED proposal that would normally suppress it — the
+        // "rejection" half this test corrupts the read for.
+        let task_rejected = store
+            .create_task(
+                "Ambiguous task B",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+        let draft2 = crate::ai::ProposalDraft {
+            id: "p-degrade-rejected".into(),
+            ops: vec![crate::core::Sin90Op::AssignTaskDirection {
+                task_id: task_rejected.id.clone(),
+                direction_id: direction.id.clone(),
+            }],
+            rationale: None,
+        };
+        crate::ai::AiSink::submit(
+            &store,
+            Capability::Classify,
+            draft2,
+            call_rec("c-degrade-rejected"),
+        )
+        .await
+        .unwrap();
+        store
+            .reject_proposal("p-degrade-rejected", None)
+            .await
+            .unwrap();
+
+        // Corrupt ONLY the rejection-read path.
+        sqlx::query("DROP TABLE sin90_proposal_rejections")
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let (kept, skipped) = crate::http::ai_classify::dedup_targets(
+            &store,
+            &[task_dedup.clone(), task_rejected.clone()],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            kept,
+            vec![task_rejected.clone()],
+            "rejection-suppression must degrade to \"not suppressed\" \
+             (fail-open) when its read fails, instead of aborting the whole \
+             call"
+        );
+        assert_eq!(
+            skipped,
+            vec![(task_dedup.id.clone(), "dedup")],
+            "the unrelated pending-proposal dedup must be entirely \
+             unaffected by the broken rejection read"
+        );
     }
     /// L3 (T5.7.2 review round 3): `POST /tasks` (`Sin90Store::create_task`)
     /// is a path INTO 待定 that never goes through `AssignTaskDirection` at
