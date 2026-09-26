@@ -341,9 +341,12 @@ pub(super) async fn dedup_propose(
         }
     }
 
-    if carry_drafts.is_empty() && reorder_drafts.is_empty() && create_drafts.is_empty() {
-        return Ok(ProposeDedup::default());
-    }
+    // T5.7.2 (design §2 #31): this used to `return Ok(ProposeDedup::default())`
+    // here when no PENDING draft matched — but the REJECTED half below must
+    // still run even when there is no pending proposal at all (the common
+    // case once something gets rejected rather than left pending), so this
+    // early exit is gone; every set below simply stays empty and every loop
+    // over an empty `Vec`/precheck over an empty batch is a cheap no-op.
 
     // One batch precheck across everything found — one write-lock
     // acquisition, not one per draft (§11.4 公共's own "去重" wording: "由
@@ -361,7 +364,15 @@ pub(super) async fn dedup_propose(
     // precheck call: a transient lock contention degrades to "produce a
     // possibly-redundant proposal this run", never to "silently skip
     // producing anything at all".
-    let valid = AiSink::precheck(store, Capability::Propose, &all_drafts).await;
+    // T5.7.2: skip the write-lock acquisition entirely when there is
+    // nothing PENDING to precheck (the common case, now that the early
+    // `return` above is gone) — `precheck` on an empty batch would still
+    // take `BEGIN IMMEDIATE` just to iterate zero times.
+    let valid = if all_drafts.is_empty() {
+        Vec::new()
+    } else {
+        AiSink::precheck(store, Capability::Propose, &all_drafts).await
+    };
     let mut valid = valid.into_iter();
 
     let mut excluded_carry_task_ids = HashSet::new();
@@ -437,6 +448,130 @@ pub(super) async fn dedup_propose(
             && current_gap_ids
                 .iter()
                 .all(|g| excluded_create_direction_ids.contains(g));
+    }
+
+    // T5.7.2 (design §2 #31): fold REJECTED propose proposals into the SAME
+    // exclusion sets the PENDING half above just built — same per-item
+    // granularity (`(task_id, to_week)` for carry, `(week_id, order)` for
+    // reorder, `(week_id, direction_id)` for create), gated by whether a new
+    // non-terminal Direction has appeared since that rejection (§2 #31: the
+    // ONLY leg propose's own suppression uses — no single "target task" to
+    // compare `updated_at` against for reorder/create, and carry shares the
+    // same check for consistency; see the design entry for the full
+    // reasoning). A rejected suggestion that's STILL suppressed simply
+    // reduces the candidate set this run considers, same as an
+    // already-covered-by-a-pending-proposal one does — it does not get its
+    // own distinct wire `reason` (§2 #31's own documented scope limit).
+    let rejected = store
+        .list_rejected_ops(Capability::Propose.as_str())
+        .await?;
+    if !rejected.is_empty() {
+        let max_new_direction = reader
+            .max_eligible_direction_created_at()
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        // T5.7.2 review round 2 (M2): the time basis is the rejected
+        // proposal's OWN `proposed_at`, not `rejected_at` — same reasoning
+        // `http::ai_classify::dedup_targets`'s own M2 fix gives: a proposal
+        // a human sat on for a while before rejecting can have a genuinely
+        // new Direction appear DURING that gap, which must already count as
+        // "changed" rather than waiting for the (later) rejection moment.
+        let situation_unchanged = |proposed_at: &str| {
+            max_new_direction
+                .as_deref()
+                .is_none_or(|c| c <= proposed_at)
+        };
+        // Re-derive `current_gap_ids` only if some rejected `CreateTasks`
+        // actually needs it — avoids the extra `gap_directions` read on a
+        // propose run with no create-shaped rejection at all.
+        let mut current_gap_ids: Option<HashSet<crate::core::DirectionId>> = None;
+        for r in &rejected {
+            if r.ops.is_empty() || !situation_unchanged(&r.proposed_at) {
+                continue;
+            }
+            // Mirrors the PENDING half's own `is_carry_batch_for_week`
+            // shape (`submit_one`/`run_propose` submit every `CarryOverTask`
+            // this run decided on as ONE proposal, not one op each) — a
+            // batch counts only if EVERY op in it is a carry into THIS week.
+            let is_carry_batch_for_week = r.ops.iter().all(
+                |op| matches!(op, Sin90Op::CarryOverTask { to_week, .. } if to_week == &week.id),
+            );
+            if is_carry_batch_for_week {
+                for op in &r.ops {
+                    if let Sin90Op::CarryOverTask { task_id, .. } = op {
+                        excluded_carry_task_ids.insert(task_id.clone());
+                    }
+                }
+            }
+            if let [Sin90Op::ReorderTasks { week_id, order }] = r.ops.as_slice() {
+                if week_id == &week.id
+                    && order.iter().cloned().collect::<HashSet<TaskId>>()
+                        == current_non_terminal_ids
+                {
+                    // T5.7.2 review round 2 (M3): reorder now ALSO accepts
+                    // the "task 被修改过" leg (M1's same judgement,
+                    // `Sin90Store::task_modified_since`) — any task in the
+                    // week whose status changed or content was edited AFTER
+                    // this rejected reorder was proposed means the situation
+                    // changed, even with no new Direction in sight. Checked
+                    // over EVERY task currently in the week (not just the
+                    // ones the rejected `order` named): a task added to the
+                    // week after the rejection, or one removed from it,
+                    // already fails the order-covering check above and never
+                    // reaches here, but a genuine status/content edit on any
+                    // task still in the CURRENT non-terminal set is exactly
+                    // the signal this leg exists to catch.
+                    let mut any_modified = false;
+                    for t in &week_tasks_all {
+                        if store.task_modified_since(&t.id, &r.proposed_at).await? {
+                            any_modified = true;
+                            break;
+                        }
+                    }
+                    if !any_modified {
+                        skip_reorder = true;
+                    }
+                }
+            }
+            if let [Sin90Op::CreateTasks { week_id, tasks }] = r.ops.as_slice() {
+                if week_id == &week.id {
+                    let gaps = match &current_gap_ids {
+                        Some(g) => g,
+                        None => {
+                            let alloc = reader.rhythm_alloc().await.unwrap_or_else(|e| {
+                                tracing::warn!(error = %e, "propose: dedup (rejected) rhythm_alloc read failed, treating as empty");
+                                Vec::new()
+                            });
+                            let g: HashSet<crate::core::DirectionId> =
+                                crate::ai::propose::gap_directions(&reader, &alloc, &week_tasks_all)
+                                    .await
+                                    .unwrap_or_else(|e| {
+                                        tracing::warn!(error = %e, "propose: dedup (rejected) gap_directions read failed, treating as empty");
+                                        Vec::new()
+                                    })
+                                    .into_iter()
+                                    .map(|g| g.direction_id)
+                                    .collect();
+                            current_gap_ids = Some(g);
+                            current_gap_ids.as_ref().unwrap()
+                        }
+                    };
+                    for t in tasks {
+                        if let Some(d) = &t.direction_id {
+                            if gaps.contains(d) {
+                                excluded_create_direction_ids.insert(d.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(gaps) = &current_gap_ids {
+            skip_create = !gaps.is_empty()
+                && gaps
+                    .iter()
+                    .all(|g| excluded_create_direction_ids.contains(g));
+        }
     }
 
     Ok(ProposeDedup {

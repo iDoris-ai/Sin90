@@ -331,20 +331,6 @@ pub mod test_hooks {
         ))
     }
 
-    /// Backdate when a task last moved into `in_progress` (its transition
-    /// event's `at`) — what `today_view`'s carry-over rule keys off.
-    pub async fn set_task_started_at(store: &Sin90Store, id: &str, at: &str) -> Result<()> {
-        sqlx::query(
-            "UPDATE sin90_events SET at = ?
-             WHERE entity = 'task' AND entity_id = ? AND to_state = 'in_progress'",
-        )
-        .bind(at)
-        .bind(id)
-        .execute(store.pool())
-        .await?;
-        Ok(())
-    }
-
     /// Force a task's `updated_at` forward via raw SQL (T5.7.2) — the only
     /// way a test can put real clock distance between "this task changed"
     /// and an EARLIER `rejected_at` without sleeping; `now_iso8601()` is
@@ -376,23 +362,15 @@ pub mod test_hooks {
         Ok(())
     }
 
-    /// Backdate a task's `"transitioned"` event's `at` (T5.7.2 review
-    /// round 2, M1) — puts real clock distance between "proposed" and "a
-    /// human transitioned this task" without sleeping past
-    /// `now_iso8601()`'s second-resolution boundary (mirrors
-    /// `set_task_started_at`'s identical need, for a different event kind /
-    /// without pinning `to_state` to `in_progress` specifically).
-    pub async fn set_task_transitioned_at(
-        store: &Sin90Store,
-        task_id: &str,
-        at: &str,
-    ) -> Result<()> {
+    /// Backdate when a task last moved into `in_progress` (its transition
+    /// event's `at`) — what `today_view`'s carry-over rule keys off.
+    pub async fn set_task_started_at(store: &Sin90Store, id: &str, at: &str) -> Result<()> {
         sqlx::query(
             "UPDATE sin90_events SET at = ?
-             WHERE entity = 'task' AND entity_id = ? AND kind = 'transitioned'",
+             WHERE entity = 'task' AND entity_id = ? AND to_state = 'in_progress'",
         )
         .bind(at)
-        .bind(task_id)
+        .bind(id)
         .execute(store.pool())
         .await?;
         Ok(())
@@ -419,6 +397,64 @@ pub mod test_hooks {
         Ok(())
     }
 
+    /// Backdate a task's `"transitioned"` event's `at` (T5.7.2 review
+    /// round 2, M1) — puts real clock distance between "proposed" and "a
+    /// human transitioned this task" without sleeping past
+    /// `now_iso8601()`'s second-resolution boundary (mirrors
+    /// `set_task_started_at`'s identical need, for a different event kind /
+    /// without pinning `to_state` to `in_progress` specifically).
+    pub async fn set_task_transitioned_at(
+        store: &Sin90Store,
+        task_id: &str,
+        at: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE sin90_events SET at = ?
+             WHERE entity = 'task' AND entity_id = ? AND kind = 'transitioned'",
+        )
+        .bind(at)
+        .bind(task_id)
+        .execute(store.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Backdate a task's `"direction_assigned"` event's `at` (M-c, T5.7.2
+    /// review round 2 follow-up) — puts real clock distance between
+    /// "proposed" and "an `AssignTaskDirection` accepted for this task"
+    /// without sleeping past `now_iso8601()`'s second-resolution boundary
+    /// (mirrors `set_task_transitioned_at`'s identical need for a different
+    /// event kind). Distinct from `set_task_triage_entered_at`, which (N-H1)
+    /// now backdates `sin90_tasks.triage_entered_at` itself, not this event
+    /// — that column is the H2 gate's OWN floor; this hook is for pinning
+    /// `Sin90Store::task_modified_since`'s unrelated `kind != 'direction_
+    /// assigned'` exclusion instead.
+    pub async fn set_task_direction_assigned_event_at(
+        store: &Sin90Store,
+        task_id: &str,
+        at: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE sin90_events SET at = ?
+             WHERE entity = 'task' AND entity_id = ? AND kind = 'direction_assigned'",
+        )
+        .bind(at)
+        .bind(task_id)
+        .execute(store.pool())
+        .await?;
+        Ok(())
+    }
+
+    pub async fn proposal_status(store: &Sin90Store, id: &str) -> Result<Option<String>> {
+        Ok(
+            sqlx::query("SELECT status FROM sin90_proposals WHERE id = ?")
+                .bind(id)
+                .fetch_optional(store.pool())
+                .await?
+                .map(|r| r.get::<String, _>("status")),
+        )
+    }
+
     /// Force a task's classify-evaluation timestamp
     /// (`sin90_classify_evals.evaluated_at`) via raw SQL (T5.7.2 review
     /// round 2, H2) — upserts, same shape `AiSink::record_classify_eval`
@@ -439,16 +475,6 @@ pub mod test_hooks {
         .execute(store.pool())
         .await?;
         Ok(())
-    }
-
-    pub async fn proposal_status(store: &Sin90Store, id: &str) -> Result<Option<String>> {
-        Ok(
-            sqlx::query("SELECT status FROM sin90_proposals WHERE id = ?")
-                .bind(id)
-                .fetch_optional(store.pool())
-                .await?
-                .map(|r| r.get::<String, _>("status")),
-        )
     }
 
     /// Backdate a `sin90_proposals.created_at` via raw SQL — the only way a
