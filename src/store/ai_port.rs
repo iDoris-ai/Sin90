@@ -214,6 +214,15 @@ impl SettingsRead for AiReader {
 /// `COALESCE(..., '')` around each leg first; both are still ISO-8601
 /// strings, so `''` sorts before any real timestamp exactly like the
 /// existing `COALESCE(..., '')` on the Direction side already relies on.
+///
+/// PR#69 review round 1 (blocking): `>` widened to `>=`. `evaluated_at` is
+/// now stamped with the WRITING run's `run_started_at` (captured before
+/// that run's `direction_candidates` snapshot was read), not a fresh
+/// `now_iso8601()` at write time — so a Direction born mid-batch can share
+/// the EXACT same second as `run_started_at` (both are second-resolution
+/// ISO-8601 strings). Strict `>` would still mask it in that tie; `>=`
+/// costs at most one extra, harmless retry (the newly-created Direction
+/// genuinely was never in that run's candidates snapshot either way).
 fn triage_retry_gate_sql(d_placeholders: &str) -> String {
     format!(
         "t.direction_id = ?
@@ -222,7 +231,7 @@ fn triage_retry_gate_sql(d_placeholders: &str) -> String {
                (SELECT MAX(created_at) FROM sin90_directions
                 WHERE status NOT IN ({d_placeholders}) AND id != ?),
                ''
-             ) > MAX(
+             ) >= MAX(
                COALESCE((SELECT evaluated_at FROM sin90_classify_evals WHERE task_id = t.id), ''),
                COALESCE(t.triage_entered_at, '')
              )"
@@ -919,14 +928,17 @@ impl AiSink for Sin90Store {
             .map_err(|e| SinkError::Store(e.to_string()))
     }
 
-    async fn record_classify_eval(&self, task_id: &str) -> Result<(), SinkError> {
-        let now = crate::core::now_iso8601();
+    async fn record_classify_eval(
+        &self,
+        task_id: &str,
+        evaluated_at: &str,
+    ) -> Result<(), SinkError> {
         sqlx::query(
             "INSERT INTO sin90_classify_evals (task_id, evaluated_at) VALUES (?, ?)
              ON CONFLICT(task_id) DO UPDATE SET evaluated_at = excluded.evaluated_at",
         )
         .bind(task_id)
-        .bind(&now)
+        .bind(evaluated_at)
         .execute(self.pool())
         .await
         .map_err(|e| SinkError::Store(e.to_string()))?;

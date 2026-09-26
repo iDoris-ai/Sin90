@@ -86,8 +86,12 @@ impl AiSink for EmittingSink<'_> {
         AiSink::record_call(self.store, rec).await
     }
 
-    async fn record_classify_eval(&self, task_id: &str) -> Result<(), SinkError> {
-        AiSink::record_classify_eval(self.store, task_id).await
+    async fn record_classify_eval(
+        &self,
+        task_id: &str,
+        evaluated_at: &str,
+    ) -> Result<(), SinkError> {
+        AiSink::record_classify_eval(self.store, task_id, evaluated_at).await
     }
 
     async fn precheck(&self, cap: Capability, drafts: &[ProposalDraft]) -> Vec<bool> {

@@ -410,9 +410,20 @@ pub trait AiSink: Send + Sync {
     /// (newest eligible Direction's `created_at`) advances past this
     /// evaluation instead of re-qualifying the same task on every future
     /// run until a genuinely NEW Direction appears.
+    ///
+    /// PR#69 review round 1 (blocking): `evaluated_at` is the CALLER's
+    /// `run_started_at` (`run_classify` captures it before reading
+    /// `direction_candidates`, which the whole batch shares ONE snapshot
+    /// of) — NOT a fresh `now_iso8601()` taken at write time. Stamping at
+    /// write time would date the eval AFTER any Direction the model itself
+    /// created mid-batch (program order guarantees the write happens
+    /// causally after), masking that Direction from the retry gate even
+    /// though this batch's candidates snapshot never showed it to the
+    /// model at all.
     fn record_classify_eval(
         &self,
         task_id: &str,
+        evaluated_at: &str,
     ) -> impl Future<Output = Result<(), SinkError>> + Send;
     /// Batch "is each pending proposal still valid?" (L3): ONE
     /// `BEGIN IMMEDIATE` per call; per draft a SAVEPOINT running steps 1–3 of

@@ -645,6 +645,7 @@ async fn classify_one<M, S, R>(
     model: Option<&M>,
     sink: &S,
     read: &R,
+    run_started_at: &str,
 ) -> (ItemResult, Option<&'static str>)
 where
     M: ModelPort,
@@ -799,12 +800,14 @@ where
         // non-producing call row inside `run_item`; nothing extra to record
         // here.
         //
-        // M2 (T5.7.2 review round 3): `skip_eval = !deterministic` — a
-        // genuine (if bad_output/tripwire-rejected) model reply DOES count
-        // as "classify looked at this" (write the eval, `skip_eval = false`);
-        // a ladder that never got a reply at all (Timeout/Unavailable/Busy/
-        // circuit-open/no model configured/R1+R2 alone) must NOT (`skip_eval
-        // = true`) — see `Outcome::Nothing`'s own doc in `ladder.rs`.
+        // M2 (T5.7.2 review round 3), narrowed by PR#69 review round 1 (Low):
+        // `skip_eval = !deterministic` — a genuine bad-output-rejected model
+        // reply DOES count as "classify looked at this" (write the eval,
+        // `skip_eval = false`); a ladder that never got a reply at all
+        // (Timeout/Unavailable/Busy/circuit-open/no model configured/R1+R2
+        // alone), OR one the privacy `tripwire` discarded before `parse`
+        // ever read it, must NOT (`skip_eval = true`) — see
+        // `Outcome::Nothing`'s own doc in `ladder.rs`.
         Outcome::Nothing { deterministic } => {
             (ItemResult::Nothing, Some("undetermined"), !deterministic)
         }
@@ -820,28 +823,33 @@ where
     // SAME task on every future run for as long as the same newest Direction
     // stays the newest one (the bug the gate's own exit condition fixes).
     //
-    // M-b (T5.7.2 review round 2 follow-up), extended by M2 (review round 3):
-    // this must ONLY fire when the MODEL truly replied — a decisive `none`, a
-    // low-confidence non-match, a decisive-none rejected at submit because
-    // the task was already accounted for, OR (M2) a reply that came back but
-    // was rejected as `bad_output`/blocked by the privacy `tripwire`
-    // (`Outcome::Nothing { deterministic: true }`, folded into `skip_eval =
-    // false` above) — NOT for a `Nothing` the ladder never got a reply for at
-    // all (`deterministic: false`: R1/R2 alone, no model reachable, every
-    // step degraded on the TRANSPORT — Timeout/Unavailable/Busy/RateLimited/
-    // NotReady/circuit-open/no model configured — `skip_eval = true`, so the
-    // `(ItemResult::Nothing, Some("undetermined"))` arm below only ever
-    // writes when `skip_eval` is already `false`), and NOT for a
-    // `SinkError::Store` submit failure (`skip_eval` via `is_store_err` — an
-    // infra hiccup that says nothing about whether the model examined the
-    // task, unlike a `rejected_by_precheck` state-moved rejection, which
-    // still counts: `core::proposal::validate`'s A3 always refuses `None`'s
-    // repeated `AssignTaskDirection(t, 待定)` for a task ALREADY in 待定,
-    // surfacing as `Rejected` — that IS a genuine "classify looked, found
-    // nothing new" outcome). Mutation target: drop the `(ItemResult::Nothing,
-    // Some("undetermined"))` arm from this `matches!` and
-    // `classify_bad_output_for_a_triage_task_records_eval` goes red; drop
-    // `!skip_eval` (or hardcode `deterministic` to `true` in `ladder.rs`) and
+    // M-b (T5.7.2 review round 2 follow-up), extended by M2 (review round 3),
+    // narrowed again by PR#69 review round 1 (Low): this must ONLY fire when
+    // the MODEL truly replied — a decisive `none`, a low-confidence
+    // non-match, a decisive-none rejected at submit because the task was
+    // already accounted for, OR (M2) a reply that came back but was rejected
+    // as `bad_output` (`Outcome::Nothing { deterministic: true }`, folded
+    // into `skip_eval = false` above) — NOT for a `Nothing` the ladder never
+    // got a reply for at all (`deterministic: false`: R1/R2 alone, no model
+    // reachable, every step degraded on the TRANSPORT —
+    // Timeout/Unavailable/Busy/RateLimited/NotReady/circuit-open/no model
+    // configured — `skip_eval = true`), and — Low, PR#69 review round 1 —
+    // ALSO not for a reply the privacy `tripwire` discarded before `parse`
+    // ever read it (`deterministic: false` there too now: the reply was
+    // never actually looked at, so it must not count as "classify examined
+    // this task" either), so the `(ItemResult::Nothing, Some("undetermined"))`
+    // arm below only ever writes when `skip_eval` is already `false`, and NOT
+    // for a `SinkError::Store` submit failure (`skip_eval` via
+    // `is_store_err` — an infra hiccup that says nothing about whether the
+    // model examined the task, unlike a `rejected_by_precheck` state-moved
+    // rejection, which still counts: `core::proposal::validate`'s A3 always
+    // refuses `None`'s repeated `AssignTaskDirection(t, 待定)` for a task
+    // ALREADY in 待定, surfacing as `Rejected` — that IS a genuine "classify
+    // looked, found nothing new" outcome). Mutation target: drop the
+    // `(ItemResult::Nothing, Some("undetermined"))` arm from this `matches!`
+    // and `classify_bad_output_for_a_triage_task_records_eval` goes red;
+    // drop `!skip_eval` (or hardcode `deterministic` to `true` in
+    // `ladder.rs`) and
     // `classify_degrade_does_not_record_eval_but_new_direction_still_lifts_
     // retry` goes red instead.
     if task.direction_id.as_deref() == Some(TRIAGE_DIRECTION_ID)
@@ -853,7 +861,7 @@ where
                 | (ItemResult::Rejected, _)
         )
     {
-        if let Err(e) = sink.record_classify_eval(&task.id).await {
+        if let Err(e) = sink.record_classify_eval(&task.id, run_started_at).await {
             tracing::warn!(error = %e, task_id = %task.id, "classify: failed to record a 待定 retry evaluation (H2, not fatal)");
         }
     }
@@ -866,6 +874,18 @@ where
 /// whole run, not per item). `candidates`/`settings` are read ONCE for the
 /// whole run (§11.4.1's "候选集" — up to 40 non-terminal Directions by
 /// `updated_at DESC`).
+///
+/// PR#69 review round 1 (blocking): `run_started_at` is captured HERE,
+/// before `direction_candidates` is read — not inside `AiSink::
+/// record_classify_eval` at write time — and threaded down to every
+/// `classify_one` call as the H2 eval-write gate's `evaluated_at`. Every
+/// task in this batch shares the SAME frozen `candidates` snapshot, so a
+/// Direction the model itself creates mid-batch (or one that lands between
+/// this snapshot and a later item's eval write) was never actually shown to
+/// any of these classifications; stamping the eval with a fresh `now_
+/// iso8601()` at write time would date it AFTER that Direction's own
+/// `created_at`, permanently masking it from the 待定 retry gate (`store::
+/// ai_port::triage_retry_gate_sql`) even though this run never evaluated it.
 pub async fn run_classify<M, S, R>(
     run_id: &str,
     tasks: &[Task],
@@ -879,6 +899,7 @@ where
     S: AiSink,
     R: AiReadModel,
 {
+    let run_started_at = crate::core::now_iso8601();
     let settings = read.settings().await.unwrap_or_else(|e| {
         tracing::warn!(error = %e, "classify: settings read failed, defaulting to executive disabled");
         Default::default()
@@ -904,6 +925,7 @@ where
                 model,
                 sink,
                 read,
+                &run_started_at,
             )
             .await
         };
@@ -1521,6 +1543,20 @@ mod tests {
             .create_direction("Finance", "2026-Q4", None)
             .await
             .unwrap();
+        // PR#69 review round 1: pinned safely in the past — otherwise this
+        // Direction's real wall-clock `created_at` and the task's own
+        // (post-fallback) `triage_entered_at`, stamped moments later by
+        // `apply_proposal` below, risk landing in the SAME second, and the
+        // gate's widened `>=` would then wrongly count this pre-existing
+        // Direction as "new since the fallback", putting the task straight
+        // back in the inbox this test asserts it left.
+        crate::store::test_hooks::set_direction_created_at(
+            &store,
+            &_real_direction.id,
+            "2020-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
         let task = inbox_task(&store, "Something that fits nothing on offer").await;
         let reader = store.ai_reader();
 
@@ -1842,7 +1878,11 @@ mod tests {
         async fn record_call(&self, _rec: AiCallRecord) -> Result<(), SinkError> {
             Ok(())
         }
-        async fn record_classify_eval(&self, _task_id: &str) -> Result<(), SinkError> {
+        async fn record_classify_eval(
+            &self,
+            _task_id: &str,
+            _evaluated_at: &str,
+        ) -> Result<(), SinkError> {
             Ok(())
         }
         async fn precheck(&self, _cap: Capability, drafts: &[ProposalDraft]) -> Vec<bool> {
@@ -2022,6 +2062,108 @@ mod tests {
         );
     }
 
+    /// PR#69 review round 1 (blocking): `run_classify` reads
+    /// `direction_candidates` ONCE for the whole batch, but (before this
+    /// fix) `record_classify_eval` stamped `now_iso8601()` fresh at WRITE
+    /// time — strictly AFTER any Direction born mid-batch, since program
+    /// order guarantees the eval write always happens causally after a
+    /// Direction the model itself created earlier in the SAME `complete()`
+    /// call. The retry gate's SQL (`store::ai_port::triage_retry_gate_sql`)
+    /// treats "eval at/after the Direction's `created_at`" as "classify
+    /// already accounted for this Direction" — which is a lie here: the
+    /// candidates snapshot was already frozen before the batch even started,
+    /// so the model never got a chance to see this Direction at all. The fix
+    /// stamps the eval with `run_started_at` (captured before
+    /// `direction_candidates` is read) instead, and widens the gate's `>` to
+    /// `>=` so a same-second tie between `run_started_at` and the new
+    /// Direction's `created_at` still re-opens the gate. Mutation target:
+    /// revert either half (write `now_iso8601()` again at write time, or the
+    /// gate back to strict `>`) and this goes red.
+    #[tokio::test]
+    async fn classify_retry_gate_not_masked_by_direction_born_mid_batch() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let _seed_direction = store
+            .create_direction("Finance", "2026-Q4", None)
+            .await
+            .unwrap();
+        let task = inbox_task(&store, "Ambiguous errand").await;
+        let reader = store.ai_reader();
+
+        // Park it in 待定 first (a decisive model "none"), same shape the H2
+        // tests above use.
+        let none_model = StubModel::always(Ok(reply(
+            r#"{"choice":"none","confidence":"high","reason":"nothing fits yet"}"#,
+        )));
+        let items0 = run_classify(
+            "run-seed",
+            std::slice::from_ref(&task),
+            ModelAccess::LocalOnly,
+            Some(&none_model),
+            &store,
+            &reader,
+        )
+        .await;
+        let proposal_id0 = match &items0[0].result {
+            ItemResult::Proposed(id) => id.clone(),
+            other => panic!("expected the 待定 fallback, got {other:?}"),
+        };
+        store.apply_proposal(&proposal_id0).await.unwrap();
+        crate::store::test_hooks::set_task_triage_entered_at(
+            &store,
+            &task.id,
+            "2020-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        // A `ModelPort` whose `complete()` creates a BRAND NEW Direction
+        // mid-run, then decisively replies "none" — `run_classify`'s
+        // `direction_candidates` snapshot was already taken before this ran,
+        // so the ladder never showed the model this Direction at all.
+        #[derive(Clone)]
+        struct CreatesDirectionThenNone(Sin90Store);
+        impl ModelPort for CreatesDirectionThenNone {
+            async fn complete(&self, _req: ModelRequest) -> Result<ModelReply, ModelFailure> {
+                self.0
+                    .create_direction("Born mid-batch", "2026-Q4", None)
+                    .await
+                    .unwrap();
+                Ok(reply(
+                    r#"{"choice":"none","confidence":"high","reason":"still nothing fits"}"#,
+                ))
+            }
+        }
+        let mut triage_task = task.clone();
+        triage_task.direction_id = Some(TRIAGE_DIRECTION_ID.to_string());
+        let model = CreatesDirectionThenNone(store.clone());
+        let items1 = run_classify(
+            "run-mid-batch-direction",
+            std::slice::from_ref(&triage_task),
+            ModelAccess::LocalOnly,
+            Some(&model),
+            &store,
+            &reader,
+        )
+        .await;
+        assert_eq!(
+            items1[0].result,
+            ItemResult::Rejected,
+            "already-待定 task re-assigned 待定 again is refused by A3, but the H2 write-eval \
+             gate still fires on `Rejected` (the model DID genuinely reply)"
+        );
+
+        assert!(
+            crate::ai::AiReadModel::inbox_task(&reader, &task.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "a Direction born DURING this same batch — before the eval this run wrote — must \
+             still count as 'newer than the eval' and keep the task retry-eligible; it must not \
+             be masked just because the eval write happened to land after the Direction's \
+             creation in wall-clock time"
+        );
+    }
+
     /// M2 (T5.7.2 review round 3) positive control, paired with the Timeout
     /// negative control just above: a task CURRENTLY in 待定, re-evaluated by
     /// a model that DOES reply — with an invented candidate key, rejected as
@@ -2031,8 +2173,11 @@ mod tests {
     /// unusable — exactly the "found nothing new" signal the retry gate
     /// needs to advance past, same as a low-confidence reply already does.
     /// Mutation target: delete `deterministic = true` from `ladder.rs`'s
-    /// `Err(why)` parse-failure arm (or the `tripwire` arm) and the
-    /// `count == 1` assertion below goes red.
+    /// `Err(why)` parse-failure arm and the `count == 1` assertion below
+    /// goes red. (NOT the `tripwire` arm any more — PR#69 review round 1
+    /// corrected that arm to `deterministic = false`: a tripwire-discarded
+    /// reply was never actually read, so it must not be conflated with a
+    /// genuine-but-unusable `bad_output` reply this test alone pins.)
     #[tokio::test]
     async fn classify_bad_output_for_a_triage_task_records_eval() {
         let store = Sin90Store::open_memory().await.unwrap();
@@ -2663,8 +2808,12 @@ mod tests {
         async fn record_call(&self, rec: crate::ai::AiCallRecord) -> Result<(), SinkError> {
             AiSink::record_call(self.store, rec).await
         }
-        async fn record_classify_eval(&self, task_id: &str) -> Result<(), SinkError> {
-            AiSink::record_classify_eval(self.store, task_id).await
+        async fn record_classify_eval(
+            &self,
+            task_id: &str,
+            evaluated_at: &str,
+        ) -> Result<(), SinkError> {
+            AiSink::record_classify_eval(self.store, task_id, evaluated_at).await
         }
         async fn precheck(&self, cap: Capability, drafts: &[ProposalDraft]) -> Vec<bool> {
             AiSink::precheck(self.store, cap, drafts).await

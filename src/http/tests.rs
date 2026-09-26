@@ -4737,8 +4737,12 @@ mod ai_classify {
         ) -> Result<(), crate::ai::SinkError> {
             self.inner.record_call(rec).await
         }
-        async fn record_classify_eval(&self, task_id: &str) -> Result<(), crate::ai::SinkError> {
-            self.inner.record_classify_eval(task_id).await
+        async fn record_classify_eval(
+            &self,
+            task_id: &str,
+            evaluated_at: &str,
+        ) -> Result<(), crate::ai::SinkError> {
+            self.inner.record_classify_eval(task_id, evaluated_at).await
         }
         async fn precheck(
             &self,
@@ -5822,6 +5826,21 @@ mod ai_classify {
             .create_direction("Pre-existing Direction", "2026-Q4", None)
             .await
             .unwrap();
+        // PR#69 review round 1: pinned safely in the past — otherwise this
+        // Direction's real wall-clock `created_at` and the task's own
+        // (post-fallback) `triage_entered_at`, stamped moments later, risk
+        // landing in the SAME second, and the gate's widened `>=` (a
+        // same-second tie must still count as "seen" for a Direction born
+        // MID-BATCH, see `classify_retry_gate_not_masked_by_direction_born_
+        // mid_batch`) would then wrongly treat this pre-existing Direction
+        // as "new" too, defeating this negative control's own premise.
+        crate::store::test_hooks::set_direction_created_at(
+            &store,
+            &_old_direction.id,
+            "2020-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
         let task = store
             .create_task(
                 "Mystery task",
@@ -6040,10 +6059,19 @@ mod ai_classify {
         );
 
         // classify looked at the task and STILL found nothing new (H2's own
-        // exit condition).
-        crate::ai::AiSink::record_classify_eval(&store, &task.id)
-            .await
-            .unwrap();
+        // exit condition). PR#69 review round 1: `evaluated_at` is stamped a
+        // few seconds AFTER `new_direction`'s real wall-clock `created_at` —
+        // not `now_iso8601()` right here, which risks landing in the SAME
+        // second and, under the gate's widened `>=` (a same-second tie must
+        // still count as "seen"), wrongly re-opening the gate this
+        // assertion is pinning shut.
+        crate::ai::AiSink::record_classify_eval(
+            &store,
+            &task.id,
+            &crate::core::iso8601_after_secs(5),
+        )
+        .await
+        .unwrap();
         assert!(
             crate::ai::AiReadModel::inbox_task(&reader, &task.id)
                 .await
@@ -6141,6 +6169,21 @@ mod ai_classify {
             .create_direction("Freshly created", "2026-Q4", None)
             .await
             .unwrap();
+        // PR#69 review round 1: pinned safely between the 2020 entered_at
+        // floor and `run_classify`'s own `run_started_at` (real wall-clock
+        // "now", captured a moment after this) — otherwise the gate's
+        // widened `>=` (a same-second tie must still count as "seen", so a
+        // Direction born mid-batch is not masked) would ALSO count THIS
+        // Direction and run 1's `run_started_at` as tied if both land in the
+        // same wall-clock second, keeping the gate open after run 1's eval
+        // write and defeating this test's own premise.
+        crate::store::test_hooks::set_direction_created_at(
+            &store,
+            &_new_direction.id,
+            "2024-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
         let fresh_task = store
             .create_task(
                 "Brand new task",
@@ -6917,7 +6960,7 @@ mod ai_classify {
         // nothing new again — writes a real `sin90_classify_evals` row
         // under the task's CURRENT (pre-carry) id (H2's own write path,
         // exercised directly rather than through a full ladder run).
-        crate::ai::AiSink::record_classify_eval(&store, &task.id)
+        crate::ai::AiSink::record_classify_eval(&store, &task.id, &crate::core::now_iso8601())
             .await
             .unwrap();
         let old_evaluated_at: String =
