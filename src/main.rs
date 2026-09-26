@@ -12,6 +12,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
+use sin90::adapter_agent24::clients::SchedulerClient;
+use sin90::adapter_agent24::reconciler;
 use sin90::adapter_agent24::{
     listener_from_fd, wire_kernel_clients, FatalHook, KernelClients, SpawnEnv,
 };
@@ -128,12 +130,27 @@ async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
     // `adapter_agent24`'s own test module with an injected `Offer`, so this
     // call site stays a one-liner with nothing left to get wrong.
     //
-    // N-H1: `_clients` is ALWAYS bound (never conditionally dropped) — the
-    // callback connection must outlive this whole function regardless of
+    // N-H1: `clients_handle` is ALWAYS bound (never conditionally dropped) —
+    // the callback connection must outlive this whole function regardless of
     // what `wire_kernel_clients` decided about wiring a business client to
     // it. Dropping it early would close the kernel's only connection for
     // this generation, which the kernel treats as this generation crashing.
-    let (sink, _clients) = wire_kernel_clients(&offer, Arc::new(clients));
+    let (sink, clients_handle) = wire_kernel_clients(&offer, Arc::new(clients));
+    // T3.3.2: the reconciler only ever runs HERE, mounted mode — it needs a
+    // real `SchedulerClient`, which only exists once the kernel's `Offer`
+    // actually granted `_a24/scheduler/` (`SchedulerClient::new`'s own doc).
+    // `run_standalone` below never constructs one at all, so there is no
+    // reconciler task there — spec.md M3's "无内核（standalone）时 outbox 保持
+    // pending 不报错" holds by construction, not by an extra check: with no
+    // task pulling from `sin90_outbox`, pending rows simply sit there.
+    if let Some(scheduler) = SchedulerClient::new(&clients_handle) {
+        reconciler::spawn_pump_loop(store.clone(), scheduler);
+    } else {
+        tracing::warn!(
+            "sin90: kernel did not grant the scheduler capability; Routine cron changes will sit \
+             in sin90_outbox as pending until a future generation is granted it"
+        );
+    }
     let state = Sin90State::new(store, sink, keys);
 
     let listener = listener_from_fd(env.listen_fd)?;
@@ -163,12 +180,12 @@ async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
     // (`adapter_agent24::kernel_roundtrip`) onto the same
     // `/api/v1/sin90` namespace — kept as its OWN router over its OWN tiny
     // state (never `Sin90State`) so `http` itself never has to know Agent24
-    // exists; see that module's doc for the full reasoning. `_clients` is
-    // `Arc::clone`d, not moved — the callback connection this generation
+    // exists; see that module's doc for the full reasoning. `clients_handle`
+    // is `Arc::clone`d, not moved — the callback connection this generation
     // owns must still outlive this whole function regardless (N-H1, above).
     #[cfg(feature = "test-hooks")]
     let inner_router = inner_router.merge(sin90::adapter_agent24::kernel_roundtrip::router(
-        std::sync::Arc::clone(&_clients),
+        std::sync::Arc::clone(&clients_handle),
         debug_actor_keys,
     ));
     let mounted_router = axum::Router::new().nest("/api/v1/sin90", inner_router);
