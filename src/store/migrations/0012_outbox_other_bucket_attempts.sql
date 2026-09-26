@@ -1,0 +1,35 @@
+-- 0012 (T3.3.2 对账器第 2 轮评审, L1): `sin90_outbox.attempts` is a SHARED
+-- counter — every retryable failure (`rate_limited`/`busy`/`not_ready`/
+-- `draining` as well as the unclassified "other" bucket) increments it,
+-- because it also drives `backoff_after`'s exponential wait for ALL of them
+-- alike (spec.md M3's own "失败按指数退避" is not scoped to just one error
+-- kind). That sharing is exactly right for backoff, and exactly WRONG for
+-- `adapter_agent24::reconciler`'s "give up after 20 unclassified failures in
+-- a row" rule (`OTHER_BUCKET_EXHAUSTION_THRESHOLD`): a row that has been
+-- retried 15 times purely due to `rate_limited`, then fails ONCE with an
+-- unrecognized kind, must not be one failure away from `failed(exhausted)`
+-- just because `attempts` happens to read 16 — being rate-limited
+-- repeatedly says nothing about whether the request itself is doomed, which
+-- is the whole premise of the exhaustion rule.
+--
+-- `other_bucket_attempts` is a SEPARATE counter, incremented ONLY by the
+-- "other" (unclassified) failure bucket — `rate_limited`/`busy`/`not_ready`/
+-- `draining` retries leave it untouched. The exhaustion check now reads
+-- THIS column, not `attempts`. Both counters still reset to 0 together
+-- whenever `upsert_outbox` collapses a fresh desired state onto the row
+-- (same reasoning as `attempts` itself: a brand new intent should not
+-- inherit an old intent's failure history).
+--
+-- Existing rows get `other_bucket_attempts = 0` (unknown failure-kind
+-- history before this column existed — starting fresh is the same posture
+-- `0005_outbox_failed.sql` already took for pre-existing rows' `attempts`).
+--
+-- Takes migration slot 0012, the next free one after 0011
+-- (`outbox_migrations_are_contiguous_no_gaps`, src/store/repo.rs). Landed on
+-- branch `feat/t3.3.2a-outbox-version` alongside 0011, per pre-pr-check
+-- SZ-4 ("a migration must not mix with other changes in one PR") — this
+-- file and its own smoke test (`tests/migration_0012_smoke.rs`) are the
+-- entire diff this migration contributes; the Rust code that actually
+-- reads/writes `other_bucket_attempts` lives on the stacked branch
+-- `feat/t3.3.2-reconciler`.
+ALTER TABLE sin90_outbox ADD COLUMN other_bucket_attempts INTEGER NOT NULL DEFAULT 0;

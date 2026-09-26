@@ -1,0 +1,70 @@
+-- 0011 (T3.3.2 对账器 Opus 评审: Critical C1 + Medium M1, design DESIGN-LIFEOS.md
+-- §2 #29, §4.1): two independent, unrelated-but-bundled column additions the
+-- reconciler needs — both surfaced by the SAME review round, so they share
+-- one migration file rather than each claiming a separate slot.
+--
+--   sin90_outbox.version   optimistic-concurrency counter for C1 ("调用在途
+--                           时用户修改 Routine，新改动会丢"): before this
+--                           column, `outbox_mark_{done,retry,failed}`
+--                           (src/store/repo.rs) located their row by `id`
+--                           alone. Sequence that lost data: the pump reads a
+--                           pending row (desired = v1) and calls the kernel;
+--                           WHILE that call is in flight, the user edits the
+--                           Routine again (desired = v2) — `upsert_outbox`
+--                           collapses this onto the SAME row, in place (its
+--                           own doc: "A pending OR failed row for this
+--                           dedup_key is overwritten in place"); the v1 call
+--                           then returns success, and `outbox_mark_done(id)`
+--                           marks the row `done` — but the row now HOLDS v2,
+--                           which was never sent to the kernel. `version`
+--                           closes this: `upsert_outbox` increments it every
+--                           time it overwrites an existing row in place (a
+--                           freshly INSERTed row starts at the column
+--                           default, 1); every `outbox_mark_*` call takes the
+--                           version the reader saw and adds `AND version = ?`
+--                           to its `WHERE` — 0 rows affected (the version
+--                           moved on) is treated as "nothing to do," not an
+--                           error, and the row is picked back up by the next
+--                           pump pass exactly as if this call had never
+--                           happened.
+--
+--   sin90_routines.kernel_suspended_at   M1's final design for "is the
+--                           KERNEL currently reporting this Routine's
+--                           schedule row `user_suspended: true`" (superseding
+--                           an earlier draft that used a separate
+--                           `sin90_routine_kernel_notices` table — design §2
+--                           #29 records why that table was the wrong shape:
+--                           this is a recomputed CURRENT-STATE snapshot the
+--                           reconciler rebuilds from scratch on every full
+--                           pass, not an append-only log). `TEXT NULL`: an
+--                           ISO-8601 timestamp of when this was last
+--                           observed true, `NULL` when not currently
+--                           suspended (or never observed). Writing it is NOT
+--                           a Routine-entity change — it must not bump
+--                           `updated_at` or append a `sin90_events` row (this
+--                           column is the reconciler's own observation of
+--                           the kernel's copy, not a decision a human or AI
+--                           made about the Routine).
+--
+-- Both are simple `ALTER TABLE ... ADD COLUMN`, no CHECK constraint on
+-- either (SQLite can't add one to an existing table without a full rebuild
+-- anyway; both invariants — "version only ever increases, only via
+-- `upsert_outbox`" and "kernel_suspended_at is rebuilt whole-column every
+-- reconcile pass" — are enforced in Rust, same posture `0005_outbox_failed.
+-- sql`'s header comment already took for `status`'s value set). Existing
+-- `sin90_outbox` rows get `version = 1` (a pre-existing row has been written
+-- exactly once, whatever it currently holds); existing `sin90_routines` rows
+-- get `kernel_suspended_at = NULL` (unknown until the next reconcile pass
+-- actually asks the kernel — the same "no notice yet" starting point the
+-- superseded table design would have had for a pre-existing row).
+--
+-- Takes migration slot 0011, the next free one after 0010
+-- (`outbox_migrations_are_contiguous_no_gaps`, src/store/repo.rs). Per
+-- pre-pr-check SZ-4 ("a migration must not mix with other changes in one
+-- PR"), this file — plus its own smoke test
+-- (`tests/migration_0011_smoke.rs`) and this DESIGN-LIFEOS.md update — is
+-- the ENTIRE contents of branch `feat/t3.3.2a-outbox-version`; the Rust code
+-- that actually reads/writes these two columns lives on the stacked branch
+-- `feat/t3.3.2-reconciler`.
+ALTER TABLE sin90_outbox ADD COLUMN version INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE sin90_routines ADD COLUMN kernel_suspended_at TEXT NULL;
