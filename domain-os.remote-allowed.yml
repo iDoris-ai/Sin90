@@ -1,4 +1,10 @@
-# Sin90 的领域 OS 清单（design §5.4）。
+# Sin90 的领域 OS 清单 —— 测试包 B 专用变体（design §11.3.2 / DESIGN-LIFEOS.md §2 #26）。
+#
+# 与 `domain-os.yml` 逐字相同，唯一差异是下面的 `model_access: remote_allowed`
+# 一行。只用来在 J16/J23 里验证 executive 引擎路径真的能被走到——正式包
+# （`domain-os.yml`）绝不声明这个字段（硬约束，J10c 钉住）。只随
+# `cargo build --features remote-allowed-manifest`（`ai::ports::MANIFEST_YAML`
+# 的 `include_str!` 切换到这份文件）与打包脚本一起使用，从不进正式发布。
 #
 # `name` 是身份的唯一来源 —— 命名空间、事件模块名、数据目录都由它派生。
 #
@@ -21,10 +27,12 @@ requires_deps: []
 # 人工审批的动作。代码按「句柄可能不在」写：Offer.provides 没给对应前缀，对应的类型化
 # 客户端就是 None（T3.2.1，见 src/adapter_agent24/clients/）。T5.1.2 起加 models：
 # classify/summarize/propose 的引擎梯经 `_a24/model/complete` 请求本地/executive 推理
-# （design §11.3）。刻意不写 model_access（缺省 local_only，DESIGN-LIFEOS.md §2 #26
-# 的硬约束——J10c 钉住这份文件不出现 `model_access: remote_allowed`；只有测试包 B 的
-# domain-os.remote-allowed.yml 才写它）。
+# （design §11.3）。
 kernel_capabilities: [events, memory, approval, scheduler, models]
+
+# 测试包 B 独有：只用来在夹具/黑盒测试里练 executive 路径（J16/J23），绝不出现在
+# 正式包（DESIGN-LIFEOS.md §2 #26 / §11.3.2 的硬约束，J10c 钉住）。
+model_access: remote_allowed
 
 impl_kind: out_of_process_provider
 spawn:

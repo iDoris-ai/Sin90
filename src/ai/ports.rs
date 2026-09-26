@@ -71,15 +71,89 @@ impl ServedTier {
 }
 
 /// Compiled in from Sin90's own `domain-os.yml` (`model_access`, default
-/// `local_only`). The `include_str!`-driven `MODEL_ACCESS` constant and the
-/// `remote-allowed-manifest` cargo feature (§11.3.2, J10c) are a T5.5.1
-/// handoff item — this branch has no adapter to wire it to yet.
+/// `local_only`, §11.3.2). See [`MODEL_ACCESS`] — the
+/// `include_str!`-driven constant and the `remote-allowed-manifest` cargo
+/// feature (J10c), wired by T5.1.2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ModelAccess {
     #[default]
     LocalOnly,
     RemoteAllowed,
 }
+impl ModelAccess {
+    /// The exact `domain-os.yml` scalar this variant round-trips to/from —
+    /// `sin90 print-model-access` (J23b) prints this, not `{self:?}`'s
+    /// `PascalCase`, so its output can be compared byte-for-byte against a
+    /// parsed manifest's own `model_access:` value.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalOnly => "local_only",
+            Self::RemoteAllowed => "remote_allowed",
+        }
+    }
+}
+
+/// The ONE manifest text compiled into THIS BINARY (T5.1.2, §11.3.2/§2 #26;
+/// 2026-09-26 review H1: previously `main.rs` had its OWN separate
+/// `include_bytes!("../domain-os.yml")` for the handshake — unconditional,
+/// never switching with this feature — while this constant switched on its
+/// own. Two independent embeds of "the manifest" that could disagree is
+/// exactly the bug: a package-B binary would have handshaken with the
+/// OFFICIAL manifest bytes (`kernel_capabilities` missing `models`,
+/// `model_access` absent) while believing internally it was RemoteAllowed,
+/// and — the sharper failure — a genuinely mismatched binary/yml pairing
+/// would mount FINE instead of failing, silently defeating J23b's whole
+/// point. Now there is exactly one embed: `main.rs`'s handshake sends
+/// `MANIFEST_YAML.as_bytes()`, so a mismatched pairing fails the kernel's
+/// own `manifest_digest` check at handshake time (`manifest_mismatch`,
+/// SPEC's closed error set) instead of mounting with a silently wrong
+/// internal belief.
+///
+/// Official builds embed `domain-os.yml` itself — the hard constraint is
+/// that THAT file never declares `model_access: remote_allowed` (J10c pins
+/// it). Only under the `remote-allowed-manifest` cargo feature (test package
+/// B, used solely to exercise the `executive` engine in J16/J23) does this
+/// switch to `../../domain-os.remote-allowed.yml`, an otherwise identical
+/// copy that DOES declare it. `include_str!`, not a runtime file read: the
+/// value this process trusts must be baked into the very binary that was
+/// mounted, not re-read from a path that could have changed underneath it.
+#[cfg(not(feature = "remote-allowed-manifest"))]
+pub const MANIFEST_YAML: &str = include_str!("../../domain-os.yml");
+#[cfg(feature = "remote-allowed-manifest")]
+pub const MANIFEST_YAML: &str = include_str!("../../domain-os.remote-allowed.yml");
+
+/// `domain-os.yml` is deliberately flat — no nested maps Sin90 itself needs
+/// to read — so this hand-parses the one scalar line it cares about rather
+/// than adding a YAML crate dependency for it, the same posture
+/// `adapter_agent24::INITIALIZE_CAPABILITIES`'s own manifest line search
+/// already takes for `kernel_capabilities`. Absent entirely = the kernel's
+/// own default, `local_only` (ME4-S2 §2.1); anything on the line this crate
+/// did not itself author (a typo, `~`/`null`, any other stray value) ALSO
+/// falls to `LocalOnly` — deny by default, matching §11.3.2's whole posture
+/// that staying local is the safe direction to fail toward, never guessed
+/// into `RemoteAllowed`.
+fn parse_model_access(yaml: &str) -> ModelAccess {
+    yaml.lines()
+        .find_map(|line| line.trim().strip_prefix("model_access:"))
+        .map(|value| match value.trim() {
+            "remote_allowed" => ModelAccess::RemoteAllowed,
+            _ => ModelAccess::LocalOnly,
+        })
+        .unwrap_or(ModelAccess::LocalOnly)
+}
+
+/// The compile-time-fixed answer every AI HTTP trigger route reads before
+/// even attempting the `executive` engine (§11.3.2) — resolved once from
+/// [`MANIFEST_YAML`] via [`std::sync::LazyLock`] (parsing a `&str` is not a
+/// `const fn` operation; "compiled-in" describes which TEXT decided the
+/// value, not that the parse itself runs at compile time). `pub`: read by
+/// `main.rs`'s `print-model-access` subcommand (J23b) and by
+/// `http::ai_classify`/`ai_summarize`/`ai_propose`'s trigger routes (T5.1.2
+/// handoff, closed by this branch — they used to hardcode
+/// `ModelAccess::LocalOnly`).
+pub static MODEL_ACCESS: std::sync::LazyLock<ModelAccess> =
+    std::sync::LazyLock::new(|| parse_model_access(MANIFEST_YAML));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AiSettings {
@@ -494,4 +568,143 @@ pub trait AiReadModel: SettingsRead {
         &self,
         iso_week: &str,
     ) -> impl Future<Output = Result<Vec<String>, ReadError>> + Send;
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use super::*;
+
+    /// J10c. The OFFICIAL `domain-os.yml` (the literal project-root file,
+    /// read independently of which cargo feature THIS test binary happens
+    /// to be compiled with) must: request the `models` kernel capability,
+    /// keep `requires_models: []` (§11.3.2 — reflex must keep working with
+    /// no model installed), and never declare `model_access:
+    /// remote_allowed` (§2 #26's hard constraint). Mutation: add that line
+    /// to `domain-os.yml` — this goes red.
+    #[test]
+    fn manifest_official_is_local_only() {
+        let official = include_str!("../../domain-os.yml");
+        assert!(
+            official
+                .lines()
+                .any(|l| l.trim().starts_with("kernel_capabilities:") && l.contains("models")),
+            "domain-os.yml must request the `models` kernel capability"
+        );
+        assert!(
+            official.lines().any(|l| l.trim() == "requires_models: []"),
+            "domain-os.yml must keep requires_models: [] (§11.3.2)"
+        );
+        assert_eq!(
+            parse_model_access(official),
+            ModelAccess::LocalOnly,
+            "the OFFICIAL domain-os.yml must never declare model_access: remote_allowed (§2 #26)"
+        );
+
+        // The compile-time constant itself: without the test-only feature,
+        // it is built from this same official manifest and must therefore
+        // also be LocalOnly.
+        #[cfg(not(feature = "remote-allowed-manifest"))]
+        assert_eq!(*MODEL_ACCESS, ModelAccess::LocalOnly);
+    }
+
+    /// H2 (2026-09-26 review): the other half of the test above's
+    /// compile-time-constant assertion — compiled ONLY when the test-package
+    /// B feature is on, `MODEL_ACCESS` must actually flip to `RemoteAllowed`,
+    /// not silently stay `LocalOnly` (which would mean the `#[cfg]` switch on
+    /// `MANIFEST_YAML` itself is broken). Between this and the `#[cfg(not(…))]`
+    /// arm above, EVERY build of this crate pins `MODEL_ACCESS` against the
+    /// manifest it was actually compiled with — `scripts/check-model-access.sh`
+    /// automates the same fact across two REAL separate builds (J23b); this
+    /// pins it for whichever single build this test binary itself is.
+    #[test]
+    #[cfg(feature = "remote-allowed-manifest")]
+    fn model_access_is_remote_allowed_when_the_test_feature_is_on() {
+        assert_eq!(*MODEL_ACCESS, ModelAccess::RemoteAllowed);
+    }
+
+    /// Positive control for the test above: proves `parse_model_access`
+    /// genuinely distinguishes the two values rather than always answering
+    /// `LocalOnly` regardless of input (which would make the assertion
+    /// above vacuous).
+    #[test]
+    fn parse_model_access_positive_control_recognizes_remote_allowed() {
+        assert_eq!(
+            parse_model_access("name: sin90\nmodel_access: remote_allowed\n"),
+            ModelAccess::RemoteAllowed
+        );
+    }
+
+    /// Absent line, explicit `local_only`, YAML null, and an unrecognized
+    /// value (typo/garbage) all deny by default to `LocalOnly` — none of
+    /// them are guessed into `RemoteAllowed`.
+    #[test]
+    fn parse_model_access_defaults_and_denies_unrecognized_values() {
+        assert_eq!(parse_model_access("name: sin90\n"), ModelAccess::LocalOnly);
+        assert_eq!(
+            parse_model_access("model_access: local_only\n"),
+            ModelAccess::LocalOnly
+        );
+        assert_eq!(
+            parse_model_access("model_access: ~\n"),
+            ModelAccess::LocalOnly
+        );
+        assert_eq!(
+            parse_model_access("model_access: remote\n"),
+            ModelAccess::LocalOnly
+        );
+    }
+
+    /// Sanity for the test-package-B manifest itself (readable regardless
+    /// of which feature this test binary was built with — this reads the
+    /// file directly, not through `MODEL_ACCESS`): it really does declare
+    /// `remote_allowed`, and still requests `models`.
+    #[test]
+    fn remote_allowed_manifest_file_actually_declares_it() {
+        let remote = include_str!("../../domain-os.remote-allowed.yml");
+        assert_eq!(parse_model_access(remote), ModelAccess::RemoteAllowed);
+        assert!(remote
+            .lines()
+            .any(|l| l.trim().starts_with("kernel_capabilities:") && l.contains("models")));
+    }
+
+    /// M2 (2026-09-26 review): an anti-drift guard between the two manifest
+    /// files — they're supposed to be identical apart from ONE line
+    /// (`model_access:`, the whole reason `domain-os.remote-allowed.yml`
+    /// exists). Without this, a future edit to one (a new
+    /// `kernel_capabilities` entry, a version bump, a `spawn` change...)
+    /// that forgets the other would silently let package B's manifest drift
+    /// away from the official one in ways `parse_model_access`'s narrow
+    /// scalar check can't catch — comments and blank lines are stripped
+    /// before comparing since they carry no runtime meaning.
+    #[test]
+    fn manifest_yamls_agree_outside_comments_and_model_access() {
+        fn significant_lines(yaml: &str) -> Vec<&str> {
+            yaml.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .filter(|l| !l.starts_with("model_access:"))
+                .collect()
+        }
+        let official = significant_lines(include_str!("../../domain-os.yml"));
+        let remote_allowed = significant_lines(include_str!("../../domain-os.remote-allowed.yml"));
+        assert_eq!(
+            official, remote_allowed,
+            "domain-os.yml and domain-os.remote-allowed.yml must agree on everything except \
+             model_access and comments — keep them in sync by hand until there's a shared \
+             template"
+        );
+    }
+
+    #[test]
+    fn model_access_as_str_round_trips_through_parse_model_access() {
+        assert_eq!(ModelAccess::LocalOnly.as_str(), "local_only");
+        assert_eq!(ModelAccess::RemoteAllowed.as_str(), "remote_allowed");
+        assert_eq!(
+            parse_model_access(&format!(
+                "model_access: {}\n",
+                ModelAccess::RemoteAllowed.as_str()
+            )),
+            ModelAccess::RemoteAllowed
+        );
+    }
 }

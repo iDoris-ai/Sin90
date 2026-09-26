@@ -29,6 +29,16 @@
 #[cfg(all(feature = "test-hooks", not(debug_assertions)))]
 compile_error!("test-hooks must not be enabled in release builds");
 
+// T5.1.2 (2026-09-26 review M1): `remote-allowed-manifest` (test package B,
+// §11.3.2/§2 #26) swaps `ai::MANIFEST_YAML`/`ai::MODEL_ACCESS` to a manifest
+// that declares `model_access: remote_allowed` — the one thing the hard
+// constraint says a real install must never do. Same insurance as
+// `test-hooks` above, same reason: a `--release --features
+// remote-allowed-manifest` binary must never be buildable, so it can never
+// be mistaken for (or accidentally shipped as) a real install.
+#[cfg(all(feature = "remote-allowed-manifest", not(debug_assertions)))]
+compile_error!("remote-allowed-manifest must not be enabled in release builds");
+
 pub mod adapter_agent24;
 pub mod ai;
 pub mod core;

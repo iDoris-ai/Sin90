@@ -76,7 +76,7 @@ const PROTOCOL_MAX: u32 = 1000;
 /// hand-copied second literal that could silently drift from it. See
 /// [`connect_and_initialize`]'s own comment at the call site for what the
 /// kernel actually does with this field today (L1: less than it looks like).
-const INITIALIZE_CAPABILITIES: &[&str] = &["events", "memory", "approval", "scheduler"];
+const INITIALIZE_CAPABILITIES: &[&str] = &["events", "memory", "approval", "scheduler", "models"];
 
 /// How long a queued event will wait — combined, across both the sub-quota
 /// gate and the main in-flight semaphore (M5) — before it is given up on and
