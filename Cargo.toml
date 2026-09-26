@@ -41,6 +41,11 @@ chrono-tz = "=0.10.4"
 
 [features]
 test-hooks = []
+# T5.1.2 (DESIGN-LIFEOS.md §11.3.2 / §2 #26): swaps `ai::ports::MANIFEST_YAML`'s
+# `include_str!` target to `domain-os.remote-allowed.yml` — the ONLY manifest
+# text allowed to declare `model_access: remote_allowed`. Test package B only
+# (J16/J23); the official package never enables this.
+remote-allowed-manifest = []
 
 [dev-dependencies]
 # L2 (2026-09-26 review): `#[tokio::test(start_paused = true)]` +

@@ -20,11 +20,29 @@ use sin90::adapter_agent24::{
 use sin90::http::{router, ActorKeys, NullEventSink, Sin90State};
 use sin90::store::Sin90Store;
 
-/// Compiled-in manifest, so the digest this binary computes for `initialize`
-/// is always the digest of the manifest it actually shipped with — the same
-/// "identity cannot drift from the code" reasoning Agent24's own in-process
-/// modules use for their embedded `domain-os.yml`.
-const MANIFEST: &[u8] = include_bytes!("../domain-os.yml");
+/// The manifest bytes sent to the kernel at `initialize` — `sin90::ai::
+/// MANIFEST_YAML`'s bytes, NOT a second, independent `include_bytes!` of
+/// this crate's own (2026-09-26 review H1). Before this fix, `main.rs` had
+/// its own always-`domain-os.yml` `include_bytes!` here while `ai::
+/// MANIFEST_YAML` switched with the `remote-allowed-manifest` feature —
+/// two embeds of "the manifest" that could disagree: a mismatched
+/// binary/yml pairing (package-B binary next to the official
+/// `domain-os.yml`, or vice versa) would send bytes that describe ONE
+/// manifest while `ai::MODEL_ACCESS` silently believed the OTHER, and
+/// nothing would ever notice — J23b's whole point (catching that mismatch)
+/// was defeated by construction. Now there is exactly one embed: a
+/// mismatched pairing sends bytes that don't match what this binary's own
+/// `include_str!` picked, but that mismatch can only happen between the
+/// project's two YAML FILES on disk (a 2026-09-26 review round-2 regression
+/// test guards that — `ai::ports::manifest_tests::manifest_yamls_agree_
+/// outside_comments_and_model_access`, not a frozen-design § reference) —
+/// the digest sent here and the text `ai::MODEL_ACCESS` parses are now
+/// PROVABLY the same bytes (pinned by this file's own `tests::
+/// manifest_sent_to_the_kernel_is_the_same_text_model_access_parses` below),
+/// so a genuinely wrong package (built with the wrong feature for the yml
+/// it ships next to) now fails the kernel's own `manifest_digest` check at
+/// handshake (`manifest_mismatch`) instead of silently mounting.
+const MANIFEST: &[u8] = sin90::ai::MANIFEST_YAML.as_bytes();
 
 #[derive(Parser)]
 #[command(name = "sin90")]
@@ -46,6 +64,13 @@ enum Command {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
+    /// T5.1.2 (design §11.3.2, J23b): prints this binary's compiled-in
+    /// `ai::MODEL_ACCESS` (`local_only` or `remote_allowed`) and exits — a
+    /// packaged install's own manifest text can be parsed the same way and
+    /// compared against this output to catch a binary/manifest mismatch
+    /// (e.g. a test-package-B binary shipped next to the official
+    /// `domain-os.yml`, or vice versa).
+    PrintModelAccess,
 }
 
 #[tokio::main]
@@ -57,6 +82,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Serve { port, data_dir }) => run_standalone(port, data_dir).await,
+        Some(Command::PrintModelAccess) => {
+            println!("{}", sin90::ai::MODEL_ACCESS.as_str());
+            Ok(())
+        }
         Some(Command::Module) | None => run_as_agent24_module().await,
     }
 }
@@ -191,4 +220,27 @@ async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
     let mounted_router = axum::Router::new().nest("/api/v1/sin90", inner_router);
     axum::serve(listener, mounted_router).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// H1 (2026-09-26 review): the exact bytes this binary sends to the
+    /// kernel at `initialize` (`MANIFEST`) must be the SAME text
+    /// `ai::MODEL_ACCESS` parses (`sin90::ai::MANIFEST_YAML`), not two
+    /// independent embeds that could silently drift apart. `MANIFEST`'s own
+    /// definition now IS `sin90::ai::MANIFEST_YAML.as_bytes()`, so this is a
+    /// regression guard against a future edit reintroducing a second,
+    /// independent `include_bytes!` here — that only matters under
+    /// `--features remote-allowed-manifest` (§11.3.2): with the feature off
+    /// both embeds would read the same literal `domain-os.yml` path anyway
+    /// and this test would stay green by coincidence; only compiled and run
+    /// WITH the feature does a hand-reverted `include_bytes!("../domain-os.
+    /// yml")` diverge from `ai::MANIFEST_YAML` (which would then be reading
+    /// `domain-os.remote-allowed.yml`) — verified by hand: reverting
+    /// `MANIFEST`'s definition and running `cargo test --features
+    /// remote-allowed-manifest` turns this red (see PR notes).
+    #[test]
+    fn manifest_sent_to_the_kernel_is_the_same_text_model_access_parses() {
+        assert_eq!(super::MANIFEST, sin90::ai::MANIFEST_YAML.as_bytes());
+    }
 }
