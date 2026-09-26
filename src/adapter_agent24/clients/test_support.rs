@@ -1,5 +1,5 @@
-//! Test-only fake-kernel plumbing shared by the three typed client test
-//! suites (`scheduler`/`memory`/`approval`) — one place to build a
+//! Test-only fake-kernel plumbing shared by the four typed client test
+//! suites (`scheduler`/`memory`/`approval`/`model`) — one place to build a
 //! [`crate::adapter_agent24::KernelClients`] over an in-memory socket pair
 //! with an injected `Offer`, so each client's tests do not each reimplement
 //! it. Mirrors `adapter_agent24::mod`'s own
@@ -83,6 +83,23 @@ pub(crate) async fn respond_error(
     } else {
         json!({"code": code, "message": message, "data": {"kind": kind}})
     };
+    let resp = json!({"jsonrpc": "2.0", "id": req["id"], "error": error});
+    write_line(peer, &resp).await;
+}
+
+/// Like [`respond_error`], but `data` is an arbitrary caller-built object
+/// (which must itself include `"kind"`) instead of just `{"kind": kind}` —
+/// `model::ModelClient`'s own tests need this for `unavailable`'s two extra
+/// fields (`retryable`/`cause`), which `respond_error`'s narrower shape
+/// cannot express.
+pub(crate) async fn respond_error_with_data(
+    peer: &mut FakePeer,
+    req: &Value,
+    code: i64,
+    message: &str,
+    data: Value,
+) {
+    let error = json!({"code": code, "message": message, "data": data});
     let resp = json!({"jsonrpc": "2.0", "id": req["id"], "error": error});
     write_line(peer, &resp).await;
 }

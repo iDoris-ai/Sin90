@@ -17,6 +17,7 @@
 pub mod approval;
 pub mod error;
 pub mod memory;
+pub mod model;
 pub mod scheduler;
 // `pub(crate)`, not private: T3.3.2's reconciler (`adapter_agent24::reconciler`,
 // a SIBLING of this module, not a descendant) needs the same fake-kernel
@@ -32,6 +33,7 @@ pub(crate) mod test_support;
 pub use approval::ApprovalClient;
 pub use error::ClientError;
 pub use memory::MemoryClient;
+pub use model::ModelClient;
 pub use scheduler::SchedulerClient;
 
 use std::sync::Arc;

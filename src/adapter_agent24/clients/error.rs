@@ -1,19 +1,33 @@
 //! T3.2.1 — the CLOSED error set every typed kernel client
-//! (`scheduler`/`memory`/`approval`) maps onto, so business code never
-//! matches on a raw `transport::TransportError` or a kernel `error.data.kind`
-//! string. Two independent sources collapse into this one enum:
+//! (`scheduler`/`memory`/`approval`/`model`) maps onto, so business code
+//! never matches on a raw `transport::TransportError` or a kernel
+//! `error.data.kind` string. Two independent sources collapse into this one
+//! enum:
 //!
 //! - `transport::TransportError`: this end's own connection-level failures
 //!   (busy, not sent, connection lost, ...).
 //! - `RpcErrorInfo`: the kernel's application-level failures, carried as
 //!   `-32000` + `error.data.kind` (SPEC-ME3-OUT-OF-PROCESS.md §3's closed
-//!   `ErrorKind` set — exactly 17 members today: `forbidden`/`busy`/
-//!   `cancelled`/`timeout`/`quota_exceeded`/`invalid_lease`/
-//!   `unknown_capability`/`version_mismatch`/`auth_failed`/
+//!   `ErrorKind` set — exactly **18** members as of ME4-S2 v3.1 (T5.1.2):
+//!   `forbidden`/`busy`/`cancelled`/`timeout`/`quota_exceeded`/
+//!   `invalid_lease`/`unknown_capability`/`version_mismatch`/`auth_failed`/
 //!   `manifest_mismatch`/`not_ready`/`draining`/`revoked`/`rate_limited`/
-//!   `payload_too_large`/`token_invalid`/`not_found` — this file's own
+//!   `payload_too_large`/`token_invalid`/`not_found`/**`unavailable`** (new,
+//!   ME4-S2 §7 — the model callback's own "the kernel can't reach a model
+//!   this module may use" kind, `ALL` 17 → 18) — this file's own
 //!   `tests::every_spec_error_kind_maps_to_its_documented_variant` pins the
 //!   count) or the protocol-level `-32602 invalid params`.
+//!
+//! T5.1.2 also gives `cancelled` its own dedicated variant
+//! ([`ClientError::Cancelled`], previously bucketed into [`ClientError::
+//! Other`] — no client needed to tell it apart until `model::ModelClient`'s
+//! own `ModelPort` impl needed to distinguish it from every other unhandled
+//! kind, since `ai::ports::ModelFailure::Cancelled` gets its own
+//! `LadderAction::Abort` treatment, §11.3.4). This is a shared, closed-set-
+//! wide change — it also affects `scheduler`/`memory`/`approval`, none of
+//! which classify by anything other than the `ClientError` variant, so
+//! nothing there relied on `cancelled` specifically falling through to
+//! `Other`.
 //!
 //! Only `auth_failed` and `manifest_mismatch` are handshake-only (SPEC §3:
 //! "认证失败...并断连"/"manifest 摘要不符...并断连", both under the
@@ -187,14 +201,52 @@ pub enum ClientError {
     /// up silently.
     #[error("other: {0}")]
     Other(String),
+    /// The kernel said `-32000 {kind: "unavailable"}` (ME4-S2 §7, T5.1.2) —
+    /// the model backend the kernel would route this call to is
+    /// unreachable, refused, or the shared token bucket kept it out of the
+    /// route. `cause` reuses [`crate::ai::UnavailableCause`] directly
+    /// (`adapter_agent24` may depend on `ai` — `ai/mod.rs`'s own dependency
+    /// arrow only forbids the reverse — so there is nothing to gain from a
+    /// second copy of the same four-variant closed set). `retryable` is the
+    /// WIRE'S OWN classification (`data.retryable`), not a fixed fact of
+    /// this variant like every other kind here — [`Self::is_retryable`]/
+    /// [`Self::is_permanent`] read it directly. Only reachable through
+    /// `model::ModelClient` today (no other typed client calls a method
+    /// that can answer `unavailable`).
+    #[error("unavailable ({cause:?}, retryable: {retryable})")]
+    Unavailable {
+        retryable: bool,
+        cause: crate::ai::UnavailableCause,
+    },
+    /// The kernel said `-32000 {kind: "cancelled"}` — this generation is
+    /// shutting down, or (for `model::ModelClient`'s own
+    /// `_a24/model/complete` specifically) `$/cancelRequest`/the model
+    /// cut-off cancellation root fired (ME4-S2 §7's `ModelError::Cancelled`
+    /// row). Distinct from every other closed-set kind: this crate cannot
+    /// tell whether the underlying action was attempted before the
+    /// cancellation reached it — like [`Self::ConnectionLost`], neither
+    /// [`Self::is_permanent`] nor [`Self::is_retryable`] claims to know;
+    /// the caller decides. Previously folded into [`Self::Other`] (module
+    /// docs) — no client needed to tell it apart until now.
+    #[error("cancelled")]
+    Cancelled,
 }
 
 impl ClientError {
     /// spec.md M3: retrying the exact same request can never turn this into
     /// success. Callers (T3.3.1's outbox) flip the row to `failed` and
     /// surface it, rather than retrying forever.
+    ///
+    /// [`Self::Unavailable`] is the one exception to "fixed per variant":
+    /// it carries the WIRE'S OWN `retryable` bool (T5.1.2), so this reads
+    /// that field directly (`!retryable`) instead of a hardcoded verdict —
+    /// exactly one of [`Self::is_permanent`]/[`Self::is_retryable`] is true
+    /// for it, same invariant every other variant keeps.
     #[must_use]
     pub fn is_permanent(&self) -> bool {
+        if let ClientError::Unavailable { retryable, .. } = self {
+            return !retryable;
+        }
         matches!(
             self,
             ClientError::Forbidden(_)
@@ -226,6 +278,9 @@ impl ClientError {
     /// "definitely did not happen the first time."
     #[must_use]
     pub fn is_retryable(&self) -> bool {
+        if let ClientError::Unavailable { retryable, .. } = self {
+            return *retryable;
+        }
         matches!(
             self,
             ClientError::RateLimited(_)
@@ -282,7 +337,7 @@ fn request_id_explicitly_not_in_flight(info: &RpcErrorInfo) -> bool {
 /// or a kind outside SPEC's closed set, falls through to
 /// [`ClientError::Other`] — deny by default, same posture the kernel's own
 /// `map_memory_error` takes (Agent24 `os_memory_page.rs`). See the module
-/// docs for which of the 17 real SPEC kinds get their own variant and which
+/// docs for which of the 18 real SPEC kinds get their own variant and which
 /// fall through on purpose.
 fn map_rpc_error(info: &RpcErrorInfo) -> ClientError {
     if info.code == -32602 {
@@ -303,6 +358,40 @@ fn map_rpc_error(info: &RpcErrorInfo) -> ClientError {
         Some("token_invalid") => ClientError::TokenInvalid(info.to_string()),
         Some("payload_too_large") => ClientError::PayloadTooLarge(info.to_string()),
         Some("not_found") => ClientError::NotFound(info.to_string()),
+        Some("unavailable") => map_unavailable(info),
+        Some("cancelled") => ClientError::Cancelled,
+        _ => ClientError::Other(info.to_string()),
+    }
+}
+
+/// `unavailable`'s own `data` shape (ME4-S2 §7 / v3 L-b): two fixed fields,
+/// `retryable: bool` and `cause` — the latter a closed four-value set
+/// ([`crate::ai::UnavailableCause`]). BOTH are required — a `cause` outside
+/// the closed set, a `retryable` that isn't a literal JSON bool, or either
+/// one simply ABSENT (e.g. a bare `unavailable` with no `data` object at
+/// all) is NOT guessed at (2026-09-26 review L4: `retryable` missing used
+/// to silently default to `false`, which is exactly the kind of guess this
+/// function otherwise refuses to make for `cause`) — any of these falls
+/// through to [`ClientError::Other`], the same "deny by default" posture
+/// [`map_rpc_error`]'s own fallback already takes for an unrecognised
+/// `kind`.
+fn map_unavailable(info: &RpcErrorInfo) -> ClientError {
+    let data = info.raw.get("data");
+    let cause = data
+        .and_then(|d| d.get("cause"))
+        .and_then(Value::as_str)
+        .and_then(|c| match c {
+            "no_provider" => Some(crate::ai::UnavailableCause::NoProvider),
+            "request_rejected" => Some(crate::ai::UnavailableCause::RequestRejected),
+            "backend_config" => Some(crate::ai::UnavailableCause::BackendConfig),
+            "response_too_large" => Some(crate::ai::UnavailableCause::ResponseTooLarge),
+            _ => None,
+        });
+    let retryable = data
+        .and_then(|d| d.get("retryable"))
+        .and_then(Value::as_bool);
+    match (cause, retryable) {
+        (Some(cause), Some(retryable)) => ClientError::Unavailable { retryable, cause },
         _ => ClientError::Other(info.to_string()),
     }
 }
@@ -335,6 +424,18 @@ mod tests {
         })
     }
 
+    /// An arbitrary `data` object under `kind` — used for `unavailable`'s
+    /// own two-field shape (`retryable` + `cause`), which neither `rpc` nor
+    /// `rpc_with_retryable` can express (T5.1.2).
+    fn rpc_with_data(kind: &str, data: Value) -> TransportError {
+        TransportError::Rpc(RpcErrorInfo {
+            code: -32000,
+            kind: Some(kind.to_string()),
+            message: "test".to_string(),
+            raw: json!({"code": -32000, "message": "test", "data": data}),
+        })
+    }
+
     /// The full classification table, one row per variant, each with its own
     /// positive control (the variant it must NOT be). spec.md M3 plus this
     /// review round's additions: permanent = forbidden/quota_exceeded/
@@ -361,6 +462,23 @@ mod tests {
             (ClientError::NotFound("x".into()), false, false),
             (ClientError::RequestNotInFlight("x".into()), false, false),
             (ClientError::Other("x".into()), false, false),
+            (ClientError::Cancelled, false, false),
+            (
+                ClientError::Unavailable {
+                    retryable: false,
+                    cause: crate::ai::UnavailableCause::BackendConfig,
+                },
+                true,
+                false,
+            ),
+            (
+                ClientError::Unavailable {
+                    retryable: true,
+                    cause: crate::ai::UnavailableCause::NoProvider,
+                },
+                false,
+                true,
+            ),
         ];
         for (err, want_permanent, want_retryable) in cases {
             assert_eq!(
@@ -486,14 +604,19 @@ mod tests {
         ));
     }
 
-    /// M4: every one of SPEC's 17 real `error.data.kind` strings, fed
-    /// through `map_transport_error`, lands on its documented variant — the
-    /// ones this file gives a dedicated variant to, and an explicit assertion
-    /// of `Other` for the rest, so "I forgot to classify this one" and "I
-    /// deliberately fall through" read identically different in the table.
-    /// Mutation: change any one expected variant below to a wrong one — the
-    /// corresponding `assert!` goes red (verified by hand for
-    /// `payload_too_large`; see PR notes).
+    /// M4 (T5.1.2: 17 → 18, `unavailable` added and `cancelled` promoted to
+    /// its own variant): every one of SPEC's 18 real `error.data.kind`
+    /// strings, fed through `map_transport_error`, lands on its documented
+    /// variant — the ones this file gives a dedicated variant to, and an
+    /// explicit assertion of `Other` for the rest, so "I forgot to classify
+    /// this one" and "I deliberately fall through" read identically
+    /// different in the table. `unavailable` here uses the BARE `rpc(kind)`
+    /// helper (no `data` object at all) — with no `cause` to recognise it
+    /// falls through to `Other` by design (`map_unavailable`'s own doc);
+    /// the dedicated `unavailable_*` tests below cover the real shape with
+    /// `data.retryable`/`data.cause` present. Mutation: change any one
+    /// expected variant below to a wrong one — the corresponding `assert!`
+    /// goes red (verified by hand for `payload_too_large`; see PR notes).
     #[test]
     fn every_spec_error_kind_maps_to_its_documented_variant() {
         // Named so clippy's `type_complexity` lint doesn't flag the table's
@@ -502,7 +625,7 @@ mod tests {
         let cases: &[Case] = &[
             ("forbidden", |e| matches!(e, ClientError::Forbidden(_))),
             ("busy", |e| matches!(e, ClientError::Busy(_))),
-            ("cancelled", |e| matches!(e, ClientError::Other(_))),
+            ("cancelled", |e| matches!(e, ClientError::Cancelled)),
             ("timeout", |e| matches!(e, ClientError::Timeout(_))),
             ("quota_exceeded", |e| {
                 matches!(e, ClientError::QuotaExceeded(_))
@@ -523,12 +646,15 @@ mod tests {
                 matches!(e, ClientError::TokenInvalid(_))
             }),
             ("not_found", |e| matches!(e, ClientError::NotFound(_))),
+            // Bare `unavailable`, no `data` at all — see the test's own doc.
+            ("unavailable", |e| matches!(e, ClientError::Other(_))),
         ];
         assert_eq!(
             cases.len(),
-            17,
-            "SPEC-ME3-OUT-OF-PROCESS.md §3's closed error.data.kind set has exactly 17 members \
-             as of this writing — update this count (and the table) if SPEC grows it"
+            18,
+            "SPEC-ME3-OUT-OF-PROCESS.md §3's closed error.data.kind set has exactly 18 members \
+             as of ME4-S2 v3.1 (T5.1.2 added `unavailable`) — update this count (and the table) \
+             if SPEC grows it further"
         );
         for (kind, expect_variant) in cases {
             let mapped = map_transport_error(rpc(kind));
@@ -537,6 +663,102 @@ mod tests {
                 "kind {kind:?} mapped to {mapped:?}, not the documented variant"
             );
         }
+    }
+
+    /// J10(b): the full `unavailable` shape (`data.retryable` +
+    /// `data.cause`) maps to the dedicated variant, carrying the wire's own
+    /// values through verbatim — `retryable` is read from the wire, not
+    /// inferred from `cause`.
+    #[test]
+    fn unavailable_backend_config_not_retryable_maps_to_dedicated_variant() {
+        let err = map_transport_error(rpc_with_data(
+            "unavailable",
+            json!({"retryable": false, "cause": "backend_config"}),
+        ));
+        assert_eq!(
+            err,
+            ClientError::Unavailable {
+                retryable: false,
+                cause: crate::ai::UnavailableCause::BackendConfig,
+            }
+        );
+        assert!(err.is_permanent());
+        assert!(!err.is_retryable());
+    }
+
+    /// Positive control for the test above: a DIFFERENT cause + `retryable:
+    /// true` maps to a different value, and `is_retryable()` follows the
+    /// wire's bool, not a hardcoded verdict.
+    #[test]
+    fn unavailable_no_provider_retryable_is_a_different_value_and_is_retryable() {
+        let err = map_transport_error(rpc_with_data(
+            "unavailable",
+            json!({"retryable": true, "cause": "no_provider"}),
+        ));
+        assert_eq!(
+            err,
+            ClientError::Unavailable {
+                retryable: true,
+                cause: crate::ai::UnavailableCause::NoProvider,
+            }
+        );
+        assert!(err.is_retryable());
+        assert!(!err.is_permanent());
+    }
+
+    /// J10(c): a `cause` outside the closed four-value set falls through to
+    /// `Other` rather than being guessed into some `Unavailable` value.
+    #[test]
+    fn unavailable_with_cause_outside_closed_set_falls_through_to_other() {
+        let err = map_transport_error(rpc_with_data(
+            "unavailable",
+            json!({"retryable": true, "cause": "something_else"}),
+        ));
+        assert!(matches!(err, ClientError::Other(_)));
+    }
+
+    /// Same fallback for a missing `cause` field entirely (`data` present,
+    /// but no `cause` key) — not just an unrecognised string.
+    #[test]
+    fn unavailable_with_missing_cause_falls_through_to_other() {
+        let err = map_transport_error(rpc_with_data("unavailable", json!({"retryable": true})));
+        assert!(matches!(err, ClientError::Other(_)));
+    }
+
+    /// L4 (2026-09-26 review): a `retryable` field missing entirely (only
+    /// `cause` present) falls through to `Other`, the SAME way a missing
+    /// `cause` already does above — not silently defaulted to
+    /// `retryable: false`.
+    #[test]
+    fn unavailable_with_missing_retryable_falls_through_to_other() {
+        let err = map_transport_error(rpc_with_data(
+            "unavailable",
+            json!({"cause": "no_provider"}),
+        ));
+        assert!(matches!(err, ClientError::Other(_)));
+    }
+
+    /// Same fallback for a `retryable` that is present but not a literal
+    /// JSON bool (e.g. the string `"true"`) — `Value::as_bool` returns
+    /// `None` for it, which this function must not silently coerce.
+    #[test]
+    fn unavailable_with_non_bool_retryable_falls_through_to_other() {
+        let err = map_transport_error(rpc_with_data(
+            "unavailable",
+            json!({"cause": "no_provider", "retryable": "true"}),
+        ));
+        assert!(matches!(err, ClientError::Other(_)));
+    }
+
+    /// J10(d): `cancelled` maps to its own dedicated variant, neither
+    /// permanent nor retryable (same posture as `ConnectionLost` — the
+    /// caller decides, this crate does not guess).
+    #[test]
+    fn cancelled_maps_to_dedicated_variant_neither_permanent_nor_retryable() {
+        let err = map_transport_error(rpc("cancelled"));
+        assert_eq!(err, ClientError::Cancelled);
+        assert!(!err.is_permanent());
+        assert!(!err.is_retryable());
     }
 
     #[test]
