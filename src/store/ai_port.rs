@@ -200,6 +200,14 @@ impl AiReadModel for AiReader {
     /// task statuses — not a hand-maintained `NOT IN ('achieved',
     /// 'abandoned')` literal duplicated independently in this function and
     /// in `title_history` below.
+    ///
+    /// T5.2.2 (design §2 #30): ALSO excludes [`TRIAGE_DIRECTION_ID`] — the
+    /// reserved "待定" Direction is only ever reached through classify's own
+    /// fallback (`ai::classify`'s dedicated arm, not R1/R2/the model), never
+    /// offered up as a real candidate for R1's history match, R2's title
+    /// overlap, or the model's choice enum. Without this exclusion it would
+    /// be a completely normal (non-terminal) row and would silently start
+    /// showing up as a candidate the moment it exists.
     async fn direction_candidates(&self, limit: u32) -> Result<Vec<DirectionCandidate>, ReadError> {
         let terminal = terminal_direction_status_wires();
         let placeholders = terminal.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
@@ -207,7 +215,7 @@ impl AiReadModel for AiReader {
             "SELECT d.id AS id, d.title AS title, d.status AS status, a.title AS area_title
              FROM sin90_directions d
              LEFT JOIN sin90_areas a ON a.id = d.area_id
-             WHERE d.status NOT IN ({placeholders})
+             WHERE d.status NOT IN ({placeholders}) AND d.id != ?
              ORDER BY d.updated_at DESC
              LIMIT ?"
         );
@@ -215,6 +223,7 @@ impl AiReadModel for AiReader {
         for t in &terminal {
             q = q.bind(t);
         }
+        q = q.bind(crate::core::TRIAGE_DIRECTION_ID);
         q = q.bind(limit);
         let rows = q.fetch_all(&self.0).await.map_err(rerr)?;
         rows.into_iter()
@@ -270,6 +279,15 @@ impl AiReadModel for AiReader {
     /// algorithm does the string comparison. See
     /// `r1_history_ignores_abandoned_direction` (T5.2.1a) for the regression
     /// this filter guards against.
+    ///
+    /// H2 (coordinator review, 2026-09-26 round 2): ALSO excludes
+    /// [`TRIAGE_DIRECTION_ID`] — a task fallen back into 待定 (T5.2.2) is
+    /// "already classified" in the literal `direction_id IS NOT NULL` sense,
+    /// but R1 must never treat that as evidence for "route the next
+    /// same-titled task to 待定 too". Without this exclusion, once one task
+    /// gets the 待定 fallback, EVERY future same-titled task would be routed
+    /// straight to 待定 by R1 (decisive, no model call) even after the user
+    /// creates the perfect real Direction for it — R1 would never even ask.
     async fn title_history(&self, normalized: &str) -> Result<Vec<DirectionId>, ReadError> {
         let terminal = terminal_direction_status_wires();
         let placeholders = terminal.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
@@ -278,12 +296,14 @@ impl AiReadModel for AiReader {
              FROM sin90_tasks t
              JOIN sin90_directions d ON d.id = t.direction_id
              WHERE t.direction_id IS NOT NULL
-               AND d.status NOT IN ({placeholders})"
+               AND d.status NOT IN ({placeholders})
+               AND d.id != ?"
         );
         let mut q = sqlx::query(&sql);
         for t in &terminal {
             q = q.bind(t);
         }
+        q = q.bind(crate::core::TRIAGE_DIRECTION_ID);
         let rows = q.fetch_all(&self.0).await.map_err(rerr)?;
         let mut out = Vec::new();
         for r in rows {
@@ -1665,6 +1685,34 @@ mod tests {
         assert!(
             !ids.contains(&closed.id),
             "the abandoned Direction must NOT be a candidate: {ids:?}"
+        );
+    }
+
+    /// T5.2.2 (design §2 #30): the reserved "待定" Direction — seeded by
+    /// migration `0014_triage_direction.sql`, so it is present in this
+    /// `open_memory()` fixture from the start, is `active` (non-terminal)
+    /// and would otherwise pass every existing filter here — must still
+    /// never come back as a candidate. Mutation target: delete the
+    /// `AND d.id != ?` clause (or the `.bind(crate::core::TRIAGE_DIRECTION_ID)`
+    /// call that feeds it) from `direction_candidates` and this goes red.
+    #[tokio::test]
+    async fn direction_candidates_excludes_the_triage_direction() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let real = store
+            .create_direction("Work", "2026-Q4", None)
+            .await
+            .unwrap();
+
+        let reader = store.ai_reader();
+        let candidates = reader.direction_candidates(50).await.unwrap();
+        let ids: Vec<String> = candidates.iter().map(|c| c.direction_id.clone()).collect();
+        assert!(
+            ids.contains(&real.id),
+            "a normal, non-terminal Direction must still be a candidate: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&crate::core::TRIAGE_DIRECTION_ID.to_string()),
+            "the reserved 待定 Direction must NEVER be offered as a candidate: {ids:?}"
         );
     }
 
