@@ -8101,15 +8101,17 @@ mod ai_propose {
         assert_eq!(item_result(&items3, "propose.carry"), "proposed");
     }
 
-    /// T5.7.1 / T5.2.1's dependency, the `propose` half: rejecting a pending
-    /// `carry` proposal that was blocking dedup lets the NEXT `/ai/propose`
-    /// run for the same week reproduce a proposal for the SAME candidate
-    /// task (unlike the accept-based positive control above — accepting
-    /// actually carries the source task over, so that test needs a SECOND
-    /// seed task for its "round 3"; rejecting leaves the original task
-    /// exactly where it was, so the same target reappears).
+    /// T5.7.2 (design §2 #31), the `propose` half of `cargo test suppress_`:
+    /// rejecting a pending `carry` proposal now SUPPRESSES it on the next
+    /// `/ai/propose` run for the same week (unlike the pre-T5.7.2 behaviour,
+    /// where a rejection immediately unblocked the same candidate task) —
+    /// round 3 stays `nothing`. Only after a brand-new non-terminal
+    /// Direction appears (§2 #31's "situation changed" leg propose's own
+    /// suppression uses) does round 4 reproduce a proposal for the SAME
+    /// candidate task (rejecting, unlike accepting, never carries the source
+    /// task over, so the same target stays available throughout).
     #[tokio::test]
-    async fn proposal_reject_of_propose_carry_unblocks_next_run_for_same_target() {
+    async fn suppress_rejected_propose_carry_blocks_until_new_direction() {
         let (app, _sink, store) = test_app_with_store().await;
         let prev = store.create_week("2026-W50").await.unwrap();
         store
@@ -8181,9 +8183,8 @@ mod ai_propose {
         let pending_after_reject = store.list_pending_proposals().await.unwrap();
         assert!(pending_after_reject.is_empty(), "{pending_after_reject:?}");
 
-        // Round 3: the SAME original candidate is uncovered again (it was
-        // never carried over — rejecting, unlike accepting, leaves it
-        // untouched).
+        // Round 3: the judgement — nothing has changed since the rejection
+        // (no edit, no new Direction), so it stays suppressed.
         let run3 = body_json(
             app.clone()
                 .oneshot(automation_req(
@@ -8199,8 +8200,8 @@ mod ai_propose {
         assert_eq!(state3, "done");
         assert_eq!(
             item_result(&items3, "propose.carry"),
-            "proposed",
-            "a rejected proposal must not permanently block its target"
+            "nothing",
+            "a rejected suggestion must stay suppressed when nothing has changed"
         );
 
         let rows =
@@ -8208,6 +8209,555 @@ mod ai_propose {
                 .await
                 .unwrap();
         assert_eq!(rows[0].capability_source, "propose");
+
+        // Positive control: a brand-new non-terminal Direction appears.
+        // Forced forward past the rejection's own timestamp —
+        // `now_iso8601()`'s second resolution means a same-second sequence
+        // in this test would otherwise tie (same reasoning the classify-side
+        // positive controls document).
+        let fresh = store
+            .create_direction("Freshly created", "2026-Q4", None)
+            .await
+            .unwrap();
+        crate::store::test_hooks::set_direction_created_at(
+            &store,
+            &fresh.id,
+            "2099-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        let run4 = body_json(
+            app.clone()
+                .oneshot(automation_req(
+                    "POST",
+                    "/ai/propose",
+                    json!({"week_id": target.id}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let (state4, items4) = poll_run_to_done(&app, run4["run_id"].as_str().unwrap()).await;
+        assert_eq!(state4, "done");
+        assert_eq!(
+            item_result(&items4, "propose.carry"),
+            "proposed",
+            "a new non-terminal Direction must lift the suppression"
+        );
+    }
+
+    /// M-c pin (propose's own M2): the `propose` counterpart of
+    /// `suppress_rejected_classify_uses_proposed_at_not_rejected_at_as_
+    /// situation_basis` above — `dedup_propose`'s rejected-half time basis
+    /// must be the rejected proposal's OWN `proposed_at`, not `rejected_at`.
+    /// Forces `proposed_at` safely into the past, creates a "gap" Direction
+    /// at real "now", and only THEN rejects — the gap Direction's
+    /// `created_at` is provably `<= rejected_at` (sequential real-time
+    /// calls), never `>` it, so the OLD `rejected_at`-basis code would have
+    /// called this "not new" and kept the carry suppressed. Calls
+    /// `dedup_propose` DIRECTLY (same posture the create-per-direction tests
+    /// above take). Mutation target: swap `r.proposed_at` for `r.rejected_at`
+    /// in `dedup_propose`'s `situation_unchanged(&r.proposed_at)` call and
+    /// this goes red (`excluded_carry_task_ids` stays non-empty).
+    #[tokio::test]
+    async fn suppress_rejected_propose_carry_uses_proposed_at_not_rejected_at_as_situation_basis() {
+        let (_app, _sink, store) = test_app_with_store().await;
+        let prev = store.create_week("2026-W49").await.unwrap();
+        store
+            .transition_week(&prev.id, crate::core::WeekStatus::Active)
+            .await
+            .unwrap();
+        let seed = crate::core::Sin90Proposal {
+            id: "seed-m2-carry-task".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![Sin90Op::CreateTasks {
+                week_id: prev.id.clone(),
+                tasks: vec![NewTask {
+                    title: "carryable".into(),
+                    direction_id: None,
+                }],
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&seed).await.unwrap();
+        store.apply_proposal(&seed.id).await.unwrap();
+        let task_id: String = sqlx::query_scalar("SELECT id FROM sin90_tasks WHERE week_id = ?")
+            .bind(&prev.id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        let target = store.create_week("2026-W34").await.unwrap();
+
+        let carry_draft = crate::ai::ProposalDraft {
+            id: "p-m2-carry".into(),
+            ops: vec![Sin90Op::CarryOverTask {
+                task_id: task_id.clone(),
+                to_week: target.id.clone(),
+            }],
+            rationale: None,
+        };
+        let rec = crate::ai::AiCallRecord {
+            id: "call-m2-carry".into(),
+            run_id: "run-m2-carry".into(),
+            task_kind: Capability::Propose,
+            engine: crate::ai::Engine::Reflex,
+            fallback_from: None,
+            served_tier: None,
+            model_id: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            latency_ms: 0,
+            ok: true,
+            error_kind: None,
+            proposal_id: None,
+            at: "2026-09-24T00:00:00Z".into(),
+        };
+        crate::ai::AiSink::submit(&store, Capability::Propose, carry_draft, rec)
+            .await
+            .unwrap();
+        crate::store::test_hooks::set_proposal_created_at(
+            &store,
+            "p-m2-carry",
+            "2020-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        // A Direction appears WHILE the (still-pending) proposal is sitting
+        // there, unrejected.
+        let _gap_direction = store
+            .create_direction("Created during the gap", "2026-Q4", None)
+            .await
+            .unwrap();
+
+        // Only NOW does the human reject it — `rejected_at` lands at real
+        // "now", provably at or after `gap_direction`'s `created_at`.
+        store.reject_proposal("p-m2-carry", None).await.unwrap();
+
+        let dedup = crate::http::ai_propose::dedup_propose(&store, &target)
+            .await
+            .unwrap();
+        assert!(
+            !dedup.excluded_carry_task_ids.contains(&task_id),
+            "a Direction created between proposing and rejecting must already count as \
+             \"new\" — the situation-changed basis is proposed_at, not rejected_at: {dedup:?}"
+        );
+    }
+
+    /// T5.7.2 review round 2 (M4): reorder's own rejection-suppression,
+    /// end to end through the real `/ai/propose` trigger — a FULL-COVERAGE
+    /// rejected reorder suppresses round 2 (nothing changed); a task's
+    /// status changing afterward (M3's own new leg) lifts it for round 3,
+    /// even with no new Direction anywhere in sight.
+    #[tokio::test]
+    async fn suppress_rejected_propose_reorder_blocks_until_task_changes() {
+        let (app, _sink, store) = test_app_with_store().await;
+        let target = store.create_week("2026-W46").await.unwrap();
+        let seed = crate::core::Sin90Proposal {
+            id: "seed-reorder-tasks".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![Sin90Op::CreateTasks {
+                week_id: target.id.clone(),
+                tasks: vec![
+                    NewTask {
+                        title: "task a".into(),
+                        direction_id: None,
+                    },
+                    NewTask {
+                        title: "task b".into(),
+                        direction_id: None,
+                    },
+                ],
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&seed).await.unwrap();
+        store.apply_proposal(&seed.id).await.unwrap();
+        let task_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM sin90_tasks WHERE week_id = ? ORDER BY sort_key ASC",
+        )
+        .bind(&target.id)
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        let task_a = task_ids[0].clone();
+        let task_b = task_ids[1].clone();
+        // Bump task B to `in_progress` so the reflex WANTS [b, a] — same
+        // setup `trigger_propose_dedup_requires_exact_reorder_coverage`
+        // above already establishes, so there is something for round 1 to
+        // actually propose.
+        let bump = crate::core::Sin90Proposal {
+            id: "bump-task-b".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![Sin90Op::TransitionTask {
+                task_id: task_b.clone(),
+                to: crate::core::TaskStatus::InProgress,
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&bump).await.unwrap();
+        store.apply_proposal(&bump.id).await.unwrap();
+
+        // Round 1: produces the [b, a] reorder.
+        let run1 = body_json(
+            app.clone()
+                .oneshot(automation_req(
+                    "POST",
+                    "/ai/propose",
+                    json!({"week_id": target.id}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let (state1, items1) = poll_run_to_done(&app, run1["run_id"].as_str().unwrap()).await;
+        assert_eq!(state1, "done");
+        assert_eq!(item_result(&items1, "propose.reorder"), "proposed");
+        let pending = store.list_pending_proposals().await.unwrap();
+        let reorder_id = pending
+            .iter()
+            .find(|p| matches!(p.ops.as_slice(), [Sin90Op::ReorderTasks { .. }]))
+            .expect("round 1 must have produced a reorder proposal")
+            .id
+            .clone();
+        store.reject_proposal(&reorder_id, None).await.unwrap();
+
+        // Round 2: nothing changed since the rejection — suppressed.
+        let run2 = body_json(
+            app.clone()
+                .oneshot(automation_req(
+                    "POST",
+                    "/ai/propose",
+                    json!({"week_id": target.id}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let (state2, items2) = poll_run_to_done(&app, run2["run_id"].as_str().unwrap()).await;
+        assert_eq!(state2, "done");
+        assert_eq!(
+            item_result(&items2, "propose.reorder"),
+            "skipped",
+            "an unchanged rejected reorder must stay suppressed"
+        );
+
+        // M3: a task in the week changes status — no new Direction anywhere
+        // — must still lift the suppression.
+        store
+            .transition_task(&task_a, crate::core::TaskStatus::InProgress)
+            .await
+            .unwrap();
+        crate::store::test_hooks::set_task_transitioned_at(&store, &task_a, "2099-01-01T00:00:00Z")
+            .await
+            .unwrap();
+
+        let run3 = body_json(
+            app.clone()
+                .oneshot(automation_req(
+                    "POST",
+                    "/ai/propose",
+                    json!({"week_id": target.id}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let (state3, items3) = poll_run_to_done(&app, run3["run_id"].as_str().unwrap()).await;
+        assert_eq!(state3, "done");
+        assert_ne!(
+            item_result(&items3, "propose.reorder"),
+            "skipped",
+            "a task status change in the week must lift the suppression even with \
+             no new Direction: {items3:?}"
+        );
+    }
+
+    /// 2026-09-26 external review (blocking): the OLD reorder-suppression
+    /// judgement (task-set coverage + `task_modified_since`) could not see a
+    /// `direction_assigned` reassignment change `reorder_reflex`'s OWN
+    /// ranking — `reorder_reflex` (`ai::propose`) sorts by `status_tier`
+    /// THEN by the task's Direction's rhythm-alloc `pct` (descending), but
+    /// `task_modified_since` deliberately excludes `direction_assigned`
+    /// events (that exclusion is correct for its OTHER caller; it just made
+    /// this one blind). Reproduces the review's own repro: D1 `pct: 50`, D2
+    /// `pct: 90`, task `b` starts under D1 — round 1's reflex order is
+    /// `[b, a, c]` (a/c have no Direction, `pct` 0, tie broken by
+    /// `created_at`); rejecting it and then reassigning `c` to the
+    /// ALREADY-EXISTING D2 (never "new" relative to `proposed_at`, so the
+    /// situation-changed gate above stays closed and cannot be what lifts
+    /// this) must still lift the suppression, because recomputing
+    /// `reorder_reflex` right now yields `[c, b, a]` — a different order
+    /// than the one that was rejected. Goes through the real `/ai/propose`
+    /// trigger (not `dedup_propose` directly) so the reproduced order itself
+    /// — not just `skip_reorder`'s boolean — is pinned.
+    #[tokio::test]
+    async fn suppress_rejected_propose_reorder_lifts_on_direction_requota() {
+        let (app, _sink, store) = test_app_with_store().await;
+        let d1 = store.create_direction("D1", "2026-Q4", None).await.unwrap();
+        let d2 = store.create_direction("D2", "2026-Q4", None).await.unwrap();
+        crate::store::test_hooks::insert_rhythm(&store, "rhythm-d1-d2")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE sin90_rhythms SET allocations = ? WHERE id = ?")
+            .bind(
+                serde_json::to_string(&vec![
+                    crate::core::Alloc {
+                        direction_id: d1.id.clone(),
+                        pct: 50,
+                    },
+                    crate::core::Alloc {
+                        direction_id: d2.id.clone(),
+                        pct: 90,
+                    },
+                ])
+                .unwrap(),
+            )
+            .bind("rhythm-d1-d2")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let target = store.create_week("2026-W49").await.unwrap();
+        let seed = crate::core::Sin90Proposal {
+            id: "seed-reorder-tasks-requota".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![Sin90Op::CreateTasks {
+                week_id: target.id.clone(),
+                tasks: vec![
+                    NewTask {
+                        title: "task a".into(),
+                        direction_id: None,
+                    },
+                    NewTask {
+                        title: "task b".into(),
+                        direction_id: Some(d1.id.clone()),
+                    },
+                    NewTask {
+                        title: "task c".into(),
+                        direction_id: None,
+                    },
+                ],
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&seed).await.unwrap();
+        store.apply_proposal(&seed.id).await.unwrap();
+        let task_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM sin90_tasks WHERE week_id = ? ORDER BY sort_key ASC",
+        )
+        .bind(&target.id)
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(task_ids.len(), 3);
+        let task_a = task_ids[0].clone();
+        let task_b = task_ids[1].clone();
+        let task_c = task_ids[2].clone();
+
+        // Round 1: b's D1 quota (50) outranks a/c's un-Directioned 0 —
+        // reflex proposes [b, a, c].
+        let run1 = body_json(
+            app.clone()
+                .oneshot(automation_req(
+                    "POST",
+                    "/ai/propose",
+                    json!({"week_id": target.id}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let (state1, items1) = poll_run_to_done(&app, run1["run_id"].as_str().unwrap()).await;
+        assert_eq!(state1, "done");
+        assert_eq!(item_result(&items1, "propose.reorder"), "proposed");
+        let pending1 = store.list_pending_proposals().await.unwrap();
+        let reorder1 = pending1
+            .iter()
+            .find(|p| matches!(p.ops.as_slice(), [Sin90Op::ReorderTasks { .. }]))
+            .expect("round 1 must have produced a reorder proposal");
+        match reorder1.ops.as_slice() {
+            [Sin90Op::ReorderTasks { order, .. }] => {
+                assert_eq!(
+                    order,
+                    &vec![task_b.clone(), task_a.clone(), task_c.clone()],
+                    "round 1 reflex order must rank b (D1 pct 50) first"
+                );
+            }
+            _ => unreachable!(),
+        }
+        store.reject_proposal(&reorder1.id, None).await.unwrap();
+
+        // Round 2: nothing changed since the rejection — negative control,
+        // must stay suppressed.
+        let run2 = body_json(
+            app.clone()
+                .oneshot(automation_req(
+                    "POST",
+                    "/ai/propose",
+                    json!({"week_id": target.id}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let (state2, items2) = poll_run_to_done(&app, run2["run_id"].as_str().unwrap()).await;
+        assert_eq!(state2, "done");
+        assert_eq!(
+            item_result(&items2, "propose.reorder"),
+            "skipped",
+            "an unchanged rejected reorder must stay suppressed"
+        );
+
+        // c gets reassigned to D2 — ALREADY-EXISTING (created before the
+        // rejection), so it is never "new" relative to `proposed_at`; the
+        // situation-changed (new-Direction) gate must stay closed, isolating
+        // this to reorder's OWN recomputed-order check.
+        let assign = crate::core::Sin90Proposal {
+            id: "assign-task-c-to-d2".into(),
+            status: crate::core::ProposalStatus::Pending,
+            source: crate::core::ProposalSource::Rule,
+            ops: vec![Sin90Op::AssignTaskDirection {
+                task_id: task_c.clone(),
+                direction_id: d2.id.clone(),
+            }],
+            rationale: None,
+        };
+        store.submit_proposal(&assign).await.unwrap();
+        store.apply_proposal(&assign.id).await.unwrap();
+
+        // Round 3: c's new D2 quota (90) now outranks everything — the
+        // recomputed reflex order [c, b, a] differs from the rejected
+        // [b, a, c], so the suppression must lift and reproduce it.
+        let run3 = body_json(
+            app.clone()
+                .oneshot(automation_req(
+                    "POST",
+                    "/ai/propose",
+                    json!({"week_id": target.id}),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let (state3, items3) = poll_run_to_done(&app, run3["run_id"].as_str().unwrap()).await;
+        assert_eq!(state3, "done");
+        assert_eq!(
+            item_result(&items3, "propose.reorder"),
+            "proposed",
+            "reassigning c to a Direction with a higher quota must lift the \
+             suppression even though D2 itself is not new: {items3:?}"
+        );
+        let pending3 = store.list_pending_proposals().await.unwrap();
+        let reorder3 = pending3
+            .iter()
+            .find(|p| {
+                matches!(p.ops.as_slice(), [Sin90Op::ReorderTasks { .. }]) && p.id != reorder1.id
+            })
+            .expect("round 3 must have produced a NEW reorder proposal");
+        match reorder3.ops.as_slice() {
+            [Sin90Op::ReorderTasks { order, .. }] => {
+                assert_eq!(
+                    order,
+                    &vec![task_c.clone(), task_b.clone(), task_a.clone()],
+                    "round 3 reflex order must re-rank c (now D2 pct 90) first"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// T5.7.2 review round 2 (M4): create's rejection-suppression is
+    /// PER-DIRECTION (M-b's own pending-side granularity, folded into the
+    /// REJECTED half too) — a rejected create naming a gap Direction D
+    /// excludes exactly D from being re-proposed, leaving an untouched gap
+    /// C still open. Calls `dedup_propose` directly (create needs a model
+    /// to actually run through the real ladder; this pins the dedup
+    /// computation itself, same posture `dedup_propose_excludes_create_
+    /// directions_per_item_not_all_or_nothing` above already takes).
+    #[tokio::test]
+    async fn suppress_rejected_propose_create_blocks_per_direction() {
+        let (_app, _sink, store) = test_app_with_store().await;
+        let direction_d = store.create_direction("D", "2026-Q4", None).await.unwrap();
+        let direction_c = store.create_direction("C", "2026-Q4", None).await.unwrap();
+        crate::store::test_hooks::insert_rhythm(&store, "rhythm-dc")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE sin90_rhythms SET allocations = ? WHERE id = ?")
+            .bind(
+                serde_json::to_string(&vec![
+                    crate::core::Alloc {
+                        direction_id: direction_d.id.clone(),
+                        pct: 100,
+                    },
+                    crate::core::Alloc {
+                        direction_id: direction_c.id.clone(),
+                        pct: 100,
+                    },
+                ])
+                .unwrap(),
+            )
+            .bind("rhythm-dc")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let target = store.create_week("2026-W47").await.unwrap();
+
+        let rejected_create = crate::ai::ProposalDraft {
+            id: "p-create-d".into(),
+            ops: vec![Sin90Op::CreateTasks {
+                week_id: target.id.clone(),
+                tasks: vec![NewTask {
+                    title: "new under D".into(),
+                    direction_id: Some(direction_d.id.clone()),
+                }],
+            }],
+            rationale: None,
+        };
+        let rec = crate::ai::AiCallRecord {
+            id: "call-create-d".into(),
+            run_id: "run-create-d".into(),
+            task_kind: Capability::Propose,
+            engine: crate::ai::Engine::Reflex,
+            fallback_from: None,
+            served_tier: None,
+            model_id: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            latency_ms: 0,
+            ok: true,
+            error_kind: None,
+            proposal_id: None,
+            at: "2026-09-24T00:00:00Z".into(),
+        };
+        crate::ai::AiSink::submit(&store, Capability::Propose, rejected_create, rec)
+            .await
+            .unwrap();
+        store.reject_proposal("p-create-d", None).await.unwrap();
+
+        let dedup = crate::http::ai_propose::dedup_propose(&store, &target)
+            .await
+            .unwrap();
+        assert!(
+            dedup
+                .excluded_create_direction_ids
+                .contains(&direction_d.id),
+            "D's rejected create must stay excluded while nothing changed: {dedup:?}"
+        );
+        assert!(
+            !dedup
+                .excluded_create_direction_ids
+                .contains(&direction_c.id),
+            "C was never mentioned by the rejection — must not be excluded: {dedup:?}"
+        );
+        assert!(
+            !dedup.skip_create,
+            "C is still a genuinely uncovered gap — must NOT blanket-skip create: {dedup:?}"
+        );
     }
 
     /// H3's coordinator-clarified nuance (`docs/DESIGN-LIFEOS.md` §11.4.3,
