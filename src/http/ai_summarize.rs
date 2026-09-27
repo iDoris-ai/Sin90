@@ -90,21 +90,23 @@ pub async fn trigger_summarize(
         // target about to be skipped anyway should not pay for an extra
         // round trip before the slot claim, and the trigger itself must not
         // race a background run that is about to discover the same thing.
-        let skip = match dedup_summarize(store, &review.id).await {
+        let skip_reason = match dedup_summarize(store, &review.id).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, run_id = %rid, "summarize: dedup query failed; running WITHOUT dedup for this run");
-                false
+                None
             }
         };
 
-        let item = if skip {
+        let item = if let Some(reason) = skip_reason {
             AiRunItem {
                 target: review.id.clone(),
                 result: "skipped".to_string(),
-                // M2 (2026-09-26 review): this run never even tried — a
-                // still-valid pending proposal already covers this review.
-                reason: Some("dedup"),
+                // M2 (2026-09-26 review): this run never even tried — either
+                // a still-valid pending proposal already covers this review
+                // (`"dedup"`) or (T5.7.2, design §2 #31) a rejected one does,
+                // unchanged since (`"suppressed_rejected"`).
+                reason: Some(reason),
             }
         } else {
             // T5.1.2 (closes the TODO this used to carry — mirrors
@@ -237,7 +239,7 @@ fn summarize_input_error(e: SummarizeInputError) -> Response {
 pub(crate) async fn dedup_summarize(
     store: &Sin90Store,
     review_id: &str,
-) -> Result<bool, StoreError> {
+) -> Result<Option<&'static str>, StoreError> {
     let pending = store.list_pending_proposals().await?;
     let mut drafts = Vec::new();
     for p in pending {
@@ -251,9 +253,83 @@ pub(crate) async fn dedup_summarize(
             }
         }
     }
-    if drafts.is_empty() {
-        return Ok(false);
+    if !drafts.is_empty() {
+        let valid = AiSink::precheck(store, Capability::Summarize, &drafts).await;
+        if valid.into_iter().any(|ok| ok) {
+            return Ok(Some("dedup"));
+        }
     }
-    let valid = AiSink::precheck(store, Capability::Summarize, &drafts).await;
-    Ok(valid.into_iter().any(|ok| ok))
+
+    // T5.7.2 (design §2 #31): rejection-based suppression, fingerprinted by
+    // `review_id` ALONE (body/`base_body_sha256` deliberately excluded — a
+    // rewrite's WORDING differs every run even when "should this review be
+    // rewritten at all" hasn't changed, so comparing bodies would make the
+    // suppression never actually fire). "Situation changed" has TWO
+    // independent legs, EITHER of which lifts the suppression:
+    //
+    // 1. the SAME SHA-256 `DraftReviewBody`'s own D6 check already relies
+    //    on: has the review's CURRENT body moved on from the snapshot the
+    //    rejected proposal was generated against (a human rewrote it by
+    //    hand)?
+    // 2. (2026-09-26 external review, blocking) — has the underlying WEEK's
+    //    data moved on, via [`Sin90Store::week_activity_since`]? Leg 1 ALONE
+    //    used to be the entire check, which combined with Q7
+    //    (`is_program_only` — AI never overwrites human-written body text)
+    //    into a permanent lock on the default path (a manually-created,
+    //    still-empty weekly draft): body untouched → suppressed; a human
+    //    edits the body → Q7 blocks the rewrite anyway; body emptied back
+    //    out → its hash equals the rejected snapshot again → suppressed
+    //    once more — with no path out even after the week's real numbers
+    //    (tasks done, Routines fired) have changed. Leg 2 is that path out:
+    //    it does NOT require the body to have changed at all, only the
+    //    WEEK's data to have moved past the rejected proposal's own
+    //    `proposed_at` (mirrors `http::ai_classify::dedup_targets`'s own
+    //    "task 被修改过" leg, at week granularity instead of task
+    //    granularity — the "新 Direction" leg classify/propose also have
+    //    does not apply here for the SAME reason it never did, §2 #31: a
+    //    weekly draft's numbers already fold in every Direction that
+    //    exists at RUN time regardless of one more appearing).
+    let rejected = store
+        .list_rejected_ops(Capability::Summarize.as_str())
+        .await?;
+    let Some((latest_hash, proposed_at)) =
+        rejected.iter().rev().find_map(|r| match r.ops.as_slice() {
+            [Sin90Op::DraftReviewBody {
+                review_id: rid,
+                base_body_sha256,
+                ..
+            }] if rid == review_id => Some((base_body_sha256.clone(), r.proposed_at.clone())),
+            _ => None,
+        })
+    else {
+        return Ok(None);
+    };
+    let current = store.get_review(review_id).await?;
+    let current_hash = crate::core::body_sha256(&current.body);
+    if current_hash != latest_hash {
+        // Leg 1: the body itself has already moved on from the rejected
+        // snapshot — no need to even ask leg 2.
+        return Ok(None);
+    }
+    // Leg 2: fail-OPEN on a read failure (same posture `ai_classify::
+    // dedup_targets`'s own `task_modified_since`/`max_eligible_direction_
+    // created_at` calls use) — if this crate cannot tell whether the
+    // week's data changed, it must not silently keep the suppression
+    // forever; the safer failure is showing the human a proposal again,
+    // not re-creating the exact permanent lock this leg exists to close.
+    let week_changed = match store
+        .week_activity_since(&current.period, &proposed_at)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                review_id,
+                "dedup_summarize: week_activity_since failed; treating the week's data as changed (fail-open, does not suppress)"
+            );
+            true
+        }
+    };
+    Ok((!week_changed).then_some("suppressed_rejected"))
 }
