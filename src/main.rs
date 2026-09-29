@@ -233,16 +233,25 @@ async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
     // namespace-stripped one (`agent24-os-proto::proxy::forward` builds the
     // upstream URI from `original.path_and_query()` verbatim) — so a request
     // for `_a24/memory/private/remember`-style Sin90 routes arrives here as
-    // `/api/v1/sin90/today`, not `/today`. Agent24 also enforces
-    // `route_namespace == "/api/v1/{name}"` at manifest validation
-    // (`agent24-domain`), so hardcoding it here can never drift from what
-    // `domain-os.yml` declares without the kernel refusing to mount at all.
-    // `router(state, ..)` itself stays un-nested — `run_standalone` and every
-    // existing test call it directly at bare paths, and both are legitimate:
-    // Sin90 served on its own vs. Sin90 served behind Agent24's proxy.
-    // `mounted = true`: this IS behind Agent24's kernel proxy, which is what
-    // makes `POST /_a24/scheduler/fired` (T3.2.2) trustworthy here — see
-    // router()'s doc and architecture.md #4.
+    // `/api/v1/sin90/today`, not `/today`. `router(state, ..)` itself stays
+    // un-nested — `run_standalone` and every existing test call it directly
+    // at bare paths, and both are legitimate: Sin90 served on its own vs.
+    // Sin90 served behind Agent24's proxy. `mounted = true`: this IS behind
+    // Agent24's kernel proxy, which is what makes `POST
+    // /_a24/scheduler/fired` (T3.2.2) trustworthy here — see router()'s doc
+    // and architecture.md #4.
+    //
+    // ME4-5.2.1 migration bug fix: this used to be nested onto
+    // `/api/v1/sin90` BY HAND, right below, before handing the result to
+    // `axum::serve`. `agent24_os_sdk::Module::serve` now does that same
+    // nesting itself — `axum::Router::new().nest(&self.facts.route_namespace,
+    // router)`, where `route_namespace` is read straight out of the SAME
+    // manifest text this module's own handshake already sent — so nesting it
+    // here TOO produced a doubled path (`/api/v1/sin90/api/v1/sin90/...`)
+    // that 404'd on every real request (caught by the real-mount black-box
+    // suite, `tests/agent24_mount_blackbox.rs`, all 5 cases: "never answered
+    // /today through the real proxy"). `router(state, ..)` is passed to
+    // `module.serve` UN-nested now; the SDK owns the one nesting step.
     let inner_router = router(state, true);
     // T3.2.3, `test-hooks` only: merge the standalone debug router
     // (`adapter_agent24::kernel_roundtrip`) onto the same
@@ -263,13 +272,13 @@ async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
             debug_store,
             debug_actor_keys,
         ));
-    let mounted_router = axum::Router::new().nest("/api/v1/sin90", inner_router);
     // ME4-5.2.1 migration: `module.serve(..)` replaces the old
     // `listener_from_fd(..)?` + bare `axum::serve(..)` pair — the SDK
     // adopted the kernel-bound listener fd already, at `connect()` time
     // (§2.3 step 0 of the frozen design: CLOEXEC set before this module has
-    // any chance to spawn a child process that could inherit it).
-    module.serve(mounted_router).await?;
+    // any chance to spawn a child process that could inherit it), and nests
+    // `inner_router` onto `route_namespace` itself (see the comment above).
+    module.serve(inner_router).await?;
     Ok(())
 }
 
