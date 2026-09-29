@@ -1,0 +1,7 @@
+{
+  "jsonrpc": "2.0",
+  "method": "_a24/scheduler/delete",
+  "params": {
+    "key": "routine.abc123def456"
+  }
+}

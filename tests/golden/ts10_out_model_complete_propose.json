@@ -1,0 +1,84 @@
+{
+  "jsonrpc": "2.0",
+  "method": "_a24/model/complete",
+  "params": {
+    "complexity": "complex",
+    "max_tokens": 512,
+    "messages": [
+      {
+        "content": "You are drafting scheduling suggestions for one week. You may: pick tasks from last week to carry over, reorder this week's tasks, and propose at most 3 brand-new tasks for under-allocated Directions. Respond with JSON only, matching the given schema. Omit anything you have no useful suggestion for (empty array is fine).",
+        "role": "system"
+      },
+      {
+        "content": "{\"carry_candidates\":[{\"key\":\"p1\",\"title\":\"Carryover task\"}],\"gap_directions\":[{\"key\":\"g1\",\"title\":\"Deep Focus\"}],\"reorder_candidates\":[{\"key\":\"w1\",\"title\":\"Reorder task\"}]}",
+        "role": "user"
+      }
+    ],
+    "response_format": {
+      "json_schema": {
+        "name": "sin90_propose",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "carry": {
+              "items": {
+                "enum": [
+                  "p1"
+                ],
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "new_tasks": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "direction": {
+                    "enum": [
+                      "g1"
+                    ],
+                    "type": "string"
+                  },
+                  "title": {
+                    "maxLength": 120,
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "title",
+                  "direction"
+                ],
+                "type": "object"
+              },
+              "maxItems": 3,
+              "type": "array"
+            },
+            "order": {
+              "items": {
+                "enum": [
+                  "w1"
+                ],
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "reason": {
+              "maxLength": 200,
+              "type": "string"
+            }
+          },
+          "required": [
+            "carry",
+            "order",
+            "new_tasks",
+            "reason"
+          ],
+          "type": "object"
+        },
+        "strict": true
+      },
+      "type": "json_schema"
+    }
+  }
+}

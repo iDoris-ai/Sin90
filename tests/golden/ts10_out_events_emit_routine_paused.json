@@ -1,0 +1,10 @@
+{
+  "jsonrpc": "2.0",
+  "method": "_a24/events/emit",
+  "params": {
+    "kind": "routine.paused",
+    "payload": {
+      "routine_id": "rtn_01JXAMPLE"
+    }
+  }
+}

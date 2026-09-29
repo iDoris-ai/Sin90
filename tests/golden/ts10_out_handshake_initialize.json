@@ -1,0 +1,19 @@
+{
+  "jsonrpc": "2.0",
+  "method": "initialize",
+  "params": {
+    "capabilities": [
+      "events",
+      "memory",
+      "approval",
+      "scheduler",
+      "models"
+    ],
+    "manifest_digest": "sha256:5a685aa993fa7d8dff5956cc8dad4c839bcf3a201071ea8e8c7b99155b9dd08a",
+    "module": "sin90",
+    "protocol_versions": {
+      "max": 1000,
+      "min": 1
+    }
+  }
+}

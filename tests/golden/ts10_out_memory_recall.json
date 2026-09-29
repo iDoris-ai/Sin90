@@ -1,0 +1,8 @@
+{
+  "jsonrpc": "2.0",
+  "method": "_a24/memory/private/recall",
+  "params": {
+    "page_size": 50,
+    "query": "review:weekly:2026-W39"
+  }
+}

@@ -1,0 +1,56 @@
+{
+  "jsonrpc": "2.0",
+  "method": "_a24/model/complete",
+  "params": {
+    "complexity": "simple",
+    "max_tokens": 256,
+    "messages": [
+      {
+        "content": "You are sorting one task into the best-fitting Direction from a short candidate list. Pick exactly one candidate key, or \"none\" if nothing fits well. Respond with JSON only, matching the given schema.",
+        "role": "system"
+      },
+      {
+        "content": "{\"candidates\":[{\"area\":\"Work\",\"key\":\"c1\",\"title\":\"Deep Focus\"},{\"area\":null,\"key\":\"c2\",\"title\":\"Admin\"}],\"item\":{\"title\":\"Write the Q3 rollup memo\"}}",
+        "role": "user"
+      }
+    ],
+    "response_format": {
+      "json_schema": {
+        "name": "sin90_classify",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "choice": {
+              "enum": [
+                "c1",
+                "c2",
+                "none"
+              ],
+              "type": "string"
+            },
+            "confidence": {
+              "enum": [
+                "low",
+                "medium",
+                "high"
+              ],
+              "type": "string"
+            },
+            "reason": {
+              "maxLength": 200,
+              "type": "string"
+            }
+          },
+          "required": [
+            "choice",
+            "confidence",
+            "reason"
+          ],
+          "type": "object"
+        },
+        "strict": true
+      },
+      "type": "json_schema"
+    }
+  }
+}

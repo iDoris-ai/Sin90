@@ -1,0 +1,27 @@
+{
+  "timeout_retryable_false": {
+    "is_permanent": false,
+    "is_retryable": false,
+    "tag": "request_not_in_flight"
+  },
+  "unavailable_backend_config": {
+    "is_permanent": true,
+    "is_retryable": false,
+    "tag": "unavailable:BackendConfig"
+  },
+  "unavailable_no_provider": {
+    "is_permanent": false,
+    "is_retryable": true,
+    "tag": "unavailable:NoProvider"
+  },
+  "unavailable_request_rejected": {
+    "is_permanent": true,
+    "is_retryable": false,
+    "tag": "unavailable:RequestRejected"
+  },
+  "unavailable_response_too_large": {
+    "is_permanent": false,
+    "is_retryable": true,
+    "tag": "unavailable:ResponseTooLarge"
+  }
+}
