@@ -1,0 +1,13 @@
+{
+  "jsonrpc": "2.0",
+  "method": "_a24/scheduler/upsert",
+  "params": {
+    "enabled": true,
+    "key": "routine.abc123def456",
+    "spec": {
+      "expr": "0 7 * * MON,WED,FRI",
+      "type": "cron",
+      "tz": "Asia/Shanghai"
+    }
+  }
+}

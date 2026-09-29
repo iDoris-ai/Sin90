@@ -1,0 +1,67 @@
+{
+  "busy": {
+    "is_permanent": false,
+    "is_retryable": true,
+    "tag": "busy"
+  },
+  "cancelled": {
+    "is_permanent": false,
+    "is_retryable": false,
+    "tag": "cancelled"
+  },
+  "draining": {
+    "is_permanent": false,
+    "is_retryable": true,
+    "tag": "draining"
+  },
+  "forbidden": {
+    "is_permanent": true,
+    "is_retryable": false,
+    "tag": "forbidden"
+  },
+  "invalid_params_code": {
+    "is_permanent": true,
+    "is_retryable": false,
+    "tag": "invalid_params"
+  },
+  "not_found": {
+    "is_permanent": false,
+    "is_retryable": false,
+    "tag": "not_found"
+  },
+  "not_ready": {
+    "is_permanent": false,
+    "is_retryable": true,
+    "tag": "not_ready"
+  },
+  "payload_too_large": {
+    "is_permanent": true,
+    "is_retryable": false,
+    "tag": "payload_too_large"
+  },
+  "quota_exceeded": {
+    "is_permanent": true,
+    "is_retryable": false,
+    "tag": "quota_exceeded"
+  },
+  "rate_limited": {
+    "is_permanent": false,
+    "is_retryable": true,
+    "tag": "rate_limited"
+  },
+  "revoked": {
+    "is_permanent": false,
+    "is_retryable": false,
+    "tag": "revoked"
+  },
+  "timeout": {
+    "is_permanent": false,
+    "is_retryable": true,
+    "tag": "timeout"
+  },
+  "token_invalid": {
+    "is_permanent": true,
+    "is_retryable": false,
+    "tag": "token_invalid"
+  }
+}

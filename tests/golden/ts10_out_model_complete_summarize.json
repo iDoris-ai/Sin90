@@ -1,0 +1,38 @@
+{
+  "jsonrpc": "2.0",
+  "method": "_a24/model/complete",
+  "params": {
+    "complexity": "simple",
+    "max_tokens": 1024,
+    "messages": [
+      {
+        "content": "You are writing the narrative paragraph(s) of a weekly review. Never type a digit yourself, including Chinese numerals — to reference a number, use the placeholder {{fN}} exactly as given; to reference a completed task, use {{tN}}. Never type the brackets 〔〕「」 yourself, only the program may render them. Do not use headings, lists, tables, quotes, or HTML — plain paragraphs only. Avoid \"Chinese-numeral + measure-word\" phrasing like \"这一周\"/\"一个\"/\"一次\" even for everyday counts that are not from the facts — prefer \"本周\"/\"某个\"/\"再次\" instead. Respond with JSON only, matching the given schema.",
+        "role": "system"
+      },
+      {
+        "content": "{\"facts\":[{\"key\":\"f1\",\"label\":\"Tasks done\",\"value\":\"5\"}],\"tasks\":[{\"key\":\"t1\",\"title\":\"Write the Q3 rollup memo\"}]}",
+        "role": "user"
+      }
+    ],
+    "response_format": {
+      "json_schema": {
+        "name": "sin90_summarize",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "narrative": {
+              "maxLength": 2000,
+              "type": "string"
+            }
+          },
+          "required": [
+            "narrative"
+          ],
+          "type": "object"
+        },
+        "strict": true
+      },
+      "type": "json_schema"
+    }
+  }
+}

@@ -43,6 +43,15 @@ use crate::http::{EventSink, ModelCaller, NullEventSink};
 
 pub mod clients;
 mod frame;
+/// TS.1.0 (`docs/design/ME4-S3-os-sdk.md` §5.1) — wire golden samples for the
+/// ME4-5.2.1 SDK migration. A SEPARATE `#[cfg(test)]` module on purpose, not
+/// folded into `reconciler`'s or `clients::model`'s own `mod tests`: those
+/// two files' test modules must stay byte-identical (reconciler.rs) or
+/// change by exactly one designated line (model.rs) across the migration
+/// (§5.2 point 3, checked by `scripts/check-test-modules.sh`) — adding golden
+/// captures inside either would corrupt that comparison.
+#[cfg(test)]
+mod golden_tests;
 /// T3.2.3, `test-hooks` only — see that module's own doc for why it lives
 /// here rather than in `http`.
 #[cfg(feature = "test-hooks")]

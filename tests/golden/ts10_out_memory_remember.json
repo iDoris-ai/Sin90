@@ -1,0 +1,12 @@
+{
+  "jsonrpc": "2.0",
+  "method": "_a24/memory/private/remember",
+  "params": {
+    "body": {
+      "dedup_key": "review:weekly:2026-W39",
+      "review_id": "rev-1",
+      "summary": "Shipped the SDK migration."
+    },
+    "kind": "review.summary"
+  }
+}

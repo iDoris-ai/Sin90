@@ -1,0 +1,9 @@
+{
+  "overflow_u32": {
+    "variant": true
+  },
+  "within_u32": {
+    "completion_tokens": 1,
+    "prompt_tokens": 4294967295
+  }
+}
