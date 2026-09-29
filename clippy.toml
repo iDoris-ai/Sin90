@@ -1,0 +1,33 @@
+# ME4-5.2.1 migration (`docs/design/ME4-S3-os-sdk.md` §5.2 point 6):
+# structural judgement that this crate no longer connects to Agent24's Unix
+# socket, or adopts its inherited listener fd, itself — that machinery moved
+# into `agent24-os-sdk`/`agent24-os-proto`/`agent24-os-fd`. A Unix socket /
+# fd subset of the SDK's own 26-item `clippy.toml` (`ME4-S3-os-sdk.md` §2.2),
+# NOT the full table: this crate is a business module, not the SDK itself —
+# `standalone` mode legitimately binds `tokio::net::TcpListener` on
+# `127.0.0.1` (`main.rs`), the black-box test binds `std::net::TcpStream`
+# (`tests/agent24_mount_blackbox.rs`), and domain code parses JSON with
+# `serde_json::from_str` all over `store`/`core`/`ai` — none of that is
+# about talking to Agent24 directly, so the SDK's `serde_json::from_slice`
+# etc. entries are deliberately NOT copied here. Positive control (checked
+# by hand: this same list, copied onto the `test/ts1.0-wire-golden`
+# pre-migration tree, `cargo clean -p sin90 && cargo clippy --all-targets --
+# -D warnings`) reports 29 hits, all in the four files this migration
+# deletes or rewrites — `adapter_agent24/mod.rs` (14), `transport.rs` (10),
+# `clients/test_support.rs` (4), `adapter_agent24/golden_tests.rs` (1,
+# TS.1.0's own real-socket handshake-capture test) — zero elsewhere in the
+# tree, so a clean run on the POST-migration tree is what actually proves
+# Sin90 no longer touches a socket/fd itself (§5.2 point 6).
+disallowed-types = [
+  { path = "tokio::net::UnixStream", reason = "ME4-5.2.1: the callback connection lives in agent24-os-proto/agent24-os-sdk now, not this crate" },
+  { path = "tokio::net::UnixListener", reason = "ME4-5.2.1: fd adoption lives in agent24-os-fd; use agent24_os_sdk::Module" },
+  { path = "tokio::net::UnixSocket", reason = "ME4-5.2.1" },
+  { path = "tokio::net::UnixDatagram", reason = "ME4-5.2.1" },
+  { path = "std::os::unix::net::UnixStream", reason = "ME4-5.2.1" },
+  { path = "std::os::unix::net::UnixListener", reason = "ME4-5.2.1" },
+  { path = "std::os::unix::net::UnixDatagram", reason = "ME4-5.2.1" },
+  { path = "std::os::fd::OwnedFd", reason = "ME4-5.2.1: fd adoption lives in agent24-os-fd" },
+]
+disallowed-methods = [
+  { path = "std::os::fd::FromRawFd::from_raw_fd", reason = "ME4-5.2.1: fd adoption lives in agent24-os-fd" },
+]

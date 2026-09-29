@@ -74,7 +74,6 @@ use super::clients::test_support::{
     fake_kernel, read_request, respond, respond_error, respond_error_with_data,
 };
 use super::clients::{ClientError, MemoryClient, SchedulerClient};
-use super::KernelClients;
 use crate::ai::classify::{build_classify_request, KeyedCandidate};
 use crate::ai::ports::Engine;
 use crate::ai::propose::{build_propose_request, KeyedDirection, KeyedTask};
@@ -156,6 +155,40 @@ fn assert_golden(name: &str, got: &Value) {
     assert_eq!(
         &want, got,
         "golden mismatch for {name:?} (fixture: {path:?})"
+    );
+}
+
+/// Like [`assert_golden`], but ALSO strips `params.<field>` (for each of
+/// `except_params_fields`) from the LOADED fixture before comparing — for
+/// the one golden entry (`ts10_out_handshake_initialize`) with fields §5.2
+/// point 2's own "有意差异清单" documents as intentionally different
+/// post-migration (`manifest_digest`, `protocol_versions`) rather than
+/// excluded for being a secret (`auth_token`, handled the same way in
+/// [`strip_id`]'s caller). Recording mode is unaffected — it always writes
+/// `got` verbatim, so re-recording on the pre-migration branch still
+/// captures the full, undivergent shape.
+fn assert_golden_except_params_fields(name: &str, got: &Value, except_params_fields: &[&str]) {
+    let path = golden_dir().join(format!("{name}.json"));
+    if std::env::var("SIN90_GOLDEN_RECORD").as_deref() == Ok("1") {
+        assert_golden(name, got);
+        return;
+    }
+    let existing = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "golden fixture {path:?} missing or unreadable ({e}) — run with \
+             SIN90_GOLDEN_RECORD=1 to (re)record it on the pre-migration branch first"
+        )
+    });
+    let mut want: Value = serde_json::from_str(&existing)
+        .unwrap_or_else(|e| panic!("golden fixture {path:?} is not valid JSON: {e}"));
+    if let Some(params) = want.get_mut("params").and_then(|p| p.as_object_mut()) {
+        for field in except_params_fields {
+            params.remove(*field);
+        }
+    }
+    assert_eq!(
+        &want, got,
+        "golden mismatch for {name:?} (fixture: {path:?}, excluding params.{except_params_fields:?})"
     );
 }
 
@@ -402,7 +435,8 @@ async fn ts10_out_model_complete_propose() {
 /// A Routine-change `_a24/events/emit` (§5.1: "events：一个 Routine 变更触发
 /// 的 emit") — the exact `kind`/payload shape `http::transition_routine`
 /// sends on a pause transition (`http/mod.rs`'s own doc comment on that
-/// handler). Captured at `KernelClients::call` directly (what
+/// handler). Captured at `agent24_os_proto::module::Connection::call`
+/// directly (what
 /// `KernelEventSink`'s worker ultimately sends) rather than round-tripping
 /// through the bounded mpsc queue and worker pool, which would make this
 /// test's timing depend on tokio's scheduler for no wire-shape benefit.
@@ -414,6 +448,7 @@ async fn ts10_out_events_emit_routine_paused() {
             .call(
                 "_a24/events/emit",
                 json!({"kind": "routine.paused", "payload": {"routine_id": "rtn_01JXAMPLE"}}),
+                agent24_os_proto::module::CallOptions::default(),
             )
             .await
     });
@@ -427,55 +462,71 @@ async fn ts10_out_events_emit_routine_paused() {
     call.await.unwrap().unwrap();
 }
 
-/// Handshake `initialize` params, minus `auth_token` (§5.1: "握手：
-/// `initialize` 的 params（去掉 `auth_token`）") — `auth_token` is a
-/// per-process secret, not a wire *shape* fact, so it is excluded from the
-/// fixture rather than pinned to a specific literal value.
+/// Handshake `initialize` params (§5.1: "握手：`initialize` 的 params（去掉
+/// `auth_token`）"). ME4-5.2.1 migration note: this test drives the SDK's
+/// own `Module::builder(..).with_env(..).connect()` over a
+/// `testing::FakeEndpoint` (mirroring `adapter_agent24::mod`'s own
+/// `module_with_offer` test helper) rather than a hand-rolled `UnixListener`
+/// loop, and compares a NARROWER field set than the other outbound goldens'
+/// full-object compare — two of §5.2 point 2's own documented "有意差异"
+/// apply here specifically:
+/// - `protocol_versions.max`: 1000 (Sin90's pre-migration constant) -> 1
+///   (§8 Q7's decision, asserted directly below, not pinned to the fixture).
+/// - `manifest_digest`: content-dependent on the exact manifest BYTES sent,
+///   which is not itself a wire *shape* fact (same posture as `auth_token`,
+///   already excluded) — recorded pre-migration against a minimal
+///   placeholder manifest (`b"name: sin90\n"`), whereas the SDK derives
+///   `capabilities` FROM the manifest text (§1.2 row 4: `INITIALIZE_
+///   CAPABILITIES` used to be a hand-copied constant, independent of
+///   whatever manifest bytes were actually sent) — so this test uses the
+///   REAL `crate::ai::MANIFEST_YAML` to exercise that derivation
+///   faithfully, which necessarily changes the digest too. `capabilities`
+///   itself IS still compared against the golden fixture: `domain-os.yml`'s
+///   `kernel_capabilities` line is independently pinned equal to the OLD
+///   `INITIALIZE_CAPABILITIES` constant (`adapter_agent24::mod`'s own
+///   pre-migration `initialize_capabilities_matches_domain_os_yml_kernel_
+///   capabilities` test, ported to the SDK's own `manifest::facts_from_yaml`
+///   — proto's test suite), so the derived list here is expected to be
+///   BYTE-IDENTICAL to what was recorded.
 #[tokio::test]
 async fn ts10_out_handshake_initialize_params() {
-    use serde_json::Value as V;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use agent24_os_sdk::testing::{noop_hook, FakeEndpoint};
 
     let dir = std::env::temp_dir().join(format!("sin90-golden-test-{}", crate::core::ulid()));
     std::fs::create_dir_all(&dir).unwrap();
-    let sock_path = dir.join("cb.sock");
-    let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
-    let manifest = b"name: sin90\n";
-    let token = "test-token-not-part-of-the-golden";
+    let (env, ep) = FakeEndpoint::bind(&dir);
 
-    let server = tokio::spawn({
-        let manifest = manifest.to_vec();
-        async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(stream);
-            let mut buf = Vec::new();
-            reader.read_until(b'\n', &mut buf).await.unwrap();
-            let mut req: V = serde_json::from_slice(&buf).unwrap();
-            assert_eq!(req["method"], "initialize");
-            assert_eq!(
-                req["params"]["manifest_digest"],
-                super::manifest_digest(&manifest)
-            );
-            if let Some(params) = req.get_mut("params").and_then(|p| p.as_object_mut()) {
-                params.remove("auth_token");
-            }
-            assert_golden("ts10_out_handshake_initialize", &strip_id(req.clone()));
-            let resp = json!({
-                "jsonrpc": "2.0", "id": req["id"],
-                "result": {"protocol_version": 1, "offer": {"provides": []}}
-            });
-            let mut bytes = serde_json::to_vec(&resp).unwrap();
-            bytes.push(b'\n');
-            reader.get_mut().write_all(&bytes).await.unwrap();
-        }
+    let connect = tokio::spawn(
+        super::Module::builder(crate::ai::MANIFEST_YAML)
+            .with_env(env, noop_hook())
+            .connect(),
+    );
+    let result = json!({"protocol_version": 1, "offer": {"provides": []}});
+    let (params, _peer) = ep.accept_initialize(result).await;
+
+    assert_eq!(params["protocol_versions"], json!({"min": 1, "max": 1}));
+
+    let mut narrowed_params = params.clone();
+    if let Some(obj) = narrowed_params.as_object_mut() {
+        obj.remove("auth_token");
+        obj.remove("manifest_digest");
+        obj.remove("protocol_versions"); // asserted directly above instead.
+    }
+    // Re-wrapped into the SAME envelope shape TS.1.0 recorded (full
+    // JSON-RPC request minus `id`, not just the bare `params` object) —
+    // `FakeEndpoint::accept_initialize` hands back only `params`.
+    let envelope = json!({
+        "jsonrpc": "2.0",
+        "method": "initialize",
+        "params": narrowed_params,
     });
+    assert_golden_except_params_fields(
+        "ts10_out_handshake_initialize",
+        &envelope,
+        &["manifest_digest", "protocol_versions"],
+    );
 
-    let noop_hook: super::FatalHook = std::sync::Arc::new(|| {});
-    let (_clients, _offer) =
-        KernelClients::handshake(&sock_path, "sin90", manifest, token, noop_hook)
-            .await
-            .unwrap();
-    server.await.unwrap();
+    connect.await.unwrap().unwrap();
 }
 
 // ---------------------------------------------------------------- inbound --

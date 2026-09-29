@@ -41,14 +41,20 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::adapter_agent24::clients::scheduler::{ModuleSpec, SchedulerClient};
-use crate::adapter_agent24::KernelClients;
 use crate::core::RoutineStatus;
 use crate::http::actor::{forbidden, Actor, ActorKeys};
 use crate::store::Sin90Store;
 
+/// ME4-5.2.1 migration: holds the ALREADY-BUILT `Option<SchedulerClient>`
+/// directly (`SchedulerClient` is cheaply `Clone`, an `Arc` bump, `clients/
+/// scheduler.rs`'s own doc) rather than a raw connection handle to rebuild a
+/// client from per request — `agent24_os_sdk::Module` never exposes its
+/// underlying connection at all (by design), so "rebuild from a handle" is
+/// no longer an option this crate has; `main.rs` builds this once, from
+/// `Module::scheduler()`, before merging this router in.
 #[derive(Clone)]
 struct DebugState {
-    clients: Arc<KernelClients>,
+    scheduler: Option<SchedulerClient>,
     store: Sin90Store,
     actor_keys: Arc<ActorKeys>,
 }
@@ -56,14 +62,14 @@ struct DebugState {
 /// Builds the standalone debug router — see the module doc for why it is its
 /// own router rather than a route on `crate::http::router`.
 pub fn router(
-    clients: Arc<KernelClients>,
+    scheduler: Option<SchedulerClient>,
     store: Sin90Store,
     actor_keys: Arc<ActorKeys>,
 ) -> axum::Router {
     axum::Router::new()
         .route("/debug/reconciler/force-upsert", post(force_upsert))
         .with_state(DebugState {
-            clients,
+            scheduler,
             store,
             actor_keys,
         })
@@ -99,7 +105,7 @@ async fn force_upsert(
         None => return forbidden("missing or unrecognized actor key"),
     }
 
-    let Some(scheduler) = SchedulerClient::new(&state.clients) else {
+    let Some(scheduler) = state.scheduler.clone() else {
         return error_response(
             StatusCode::FORBIDDEN,
             "scheduler_not_granted",

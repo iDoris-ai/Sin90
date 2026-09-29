@@ -1,18 +1,18 @@
 //! `_a24/model/complete` — typed client (T5.1.2, ME4-S2 v3.1 frozen design).
 //!
-//! Wire shape mirrors Agent24's own `agentd::model_callback` handler
-//! (`docs/design/ME4-S2-model-callback.md` §4.2/§4.3, frozen v3.1): params
-//! `{messages, response_format?, max_tokens?, complexity?, request_id?,
-//! _meta?}`, result `{text, model_id, tier, usage}`. This client
-//! deliberately never sends `request_id` (§3.4: unbound/background-shaped
-//! calls only — the engine ladder's own budget/circuit-breaker, not the
-//! kernel's per-proxied-request lifecycle, governs retry here) and never
-//! sends `_meta`.
-//!
-//! Same `deny_unknown_fields` posture as [`super::memory`]/[`super::
-//! scheduler`]: the response type here is a plain `Deserialize` with no
-//! `deny_unknown_fields`, so a field the kernel adds later does not break an
-//! unrebuilt Sin90.
+//! ME4-5.2.1 migration (`docs/design/ME4-S3-os-sdk.md` §5.1): the wire shape
+//! itself (`build_params`/`WireResult`) moved into `agent24-os-sdk` as
+//! `CompleteRequest`/`CompleteResult` — this file keeps a NEWTYPE around
+//! `agent24_os_sdk::ModelClient` so [`ModelClient::complete`] can keep its
+//! OLD inherent signature, `&ai::ModelRequest -> Result<ai::ModelReply,
+//! ClientError>` (`ai::ModelRequest` has no `Assistant` role and no
+//! `response_format`-is-optional shape the way the SDK's own
+//! `CompleteRequest` does — converting between the two happens here, once,
+//! at this one boundary the `ai` module boundary check (J7) already forces
+//! to exist). `MODEL_CALL_TIMEOUT` becomes an alias for the SDK's own
+//! `MODEL_RESPONSE_TIMEOUT` (same value, 125s) rather than a separate
+//! constant, so the one test that reads it (`model_response_timeout_...`,
+//! below) still compiles unchanged.
 //!
 //! # Two `complete`s on purpose
 //!
@@ -32,11 +32,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::Deserialize;
-use serde_json::{json, Value};
+use agent24_os_proto::module::Connection;
+use serde_json::json;
 
-use super::error::{map_transport_error, ClientError};
-use crate::adapter_agent24::KernelClients;
+use super::error::ClientError;
 use crate::ai::{
     Complexity, ModelFailure, ModelMessage, ModelPort, ModelReply, ModelRequest, Role, ServedTier,
 };
@@ -48,110 +47,102 @@ pub const PREFIX: &str = "_a24/model/";
 
 /// J10(a): `_a24/model/complete`'s own method timeout is 120s (ME4-S2 §5.2's
 /// `MODEL_CALL_TIMEOUT`) — this client's response deadline is set a little
-/// LONGER than that, not equal to it or shorter, so the kernel's own "the
-/// model took too long" `timeout` answer always arrives before this end's
-/// own deadline could fire and race it with a less specific
-/// [`ClientError::Timeout`] built from nothing but silence.
-pub(crate) const MODEL_CALL_TIMEOUT: Duration = Duration::from_secs(125);
+/// LONGER than that (§2.7's own reasoning), and is now the SDK's own
+/// `MODEL_RESPONSE_TIMEOUT` rather than a value this crate picks itself.
+pub(crate) const MODEL_CALL_TIMEOUT: Duration = agent24_os_sdk::clients::MODEL_RESPONSE_TIMEOUT;
 
-fn role_str(role: Role) -> &'static str {
+fn role(role: Role) -> agent24_os_sdk::ModelRole {
     match role {
-        Role::System => "system",
-        Role::User => "user",
+        Role::System => agent24_os_sdk::ModelRole::System,
+        Role::User => agent24_os_sdk::ModelRole::User,
     }
 }
 
-fn complexity_str(c: Complexity) -> &'static str {
+fn complexity(c: Complexity) -> agent24_os_sdk::Complexity {
     match c {
-        Complexity::Simple => "simple",
-        Complexity::Complex => "complex",
+        Complexity::Simple => agent24_os_sdk::Complexity::Simple,
+        Complexity::Complex => agent24_os_sdk::Complexity::Complex,
     }
 }
 
-/// `_a24/model/complete`'s params (ME4-S2 §4.2) — no `request_id`, no
-/// `_meta` (module doc).
-fn build_params(req: &ModelRequest) -> Value {
-    let messages: Vec<Value> = req
-        .messages
-        .iter()
-        .map(|m: &ModelMessage| json!({ "role": role_str(m.role), "content": m.content }))
-        .collect();
-    json!({
-        "messages": messages,
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "name": req.schema_name,
-                "schema": Value::Object(req.schema.clone()),
-                "strict": true,
-            },
-        },
-        "max_tokens": req.max_tokens,
-        "complexity": complexity_str(req.complexity),
-    })
-}
-
-#[derive(Debug, Deserialize)]
-struct WireUsage {
-    prompt_tokens: u32,
-    completion_tokens: u32,
-}
-
-/// `_a24/model/complete`'s result (ME4-S2 §4.3) — `text`/`tier`/`usage`
-/// always present; `model_id` explicitly nullable.
-#[derive(Debug, Deserialize)]
-struct WireResult {
-    text: String,
-    #[serde(default)]
-    model_id: Option<String>,
-    tier: String,
-    usage: WireUsage,
+/// `ai::ModelRequest` -> the SDK's own `CompleteRequest` (module doc: the
+/// one conversion boundary this file exists to own).
+fn build_request(req: &ModelRequest) -> agent24_os_sdk::CompleteRequest {
+    agent24_os_sdk::CompleteRequest {
+        messages: req
+            .messages
+            .iter()
+            .map(|m: &ModelMessage| agent24_os_sdk::ModelMessage {
+                role: role(m.role),
+                content: m.content.clone(),
+            })
+            .collect(),
+        response_format: Some(agent24_os_sdk::JsonSchemaFormat {
+            name: req.schema_name.to_string(),
+            schema: json!(req.schema),
+            strict: true,
+        }),
+        max_tokens: Some(req.max_tokens),
+        complexity: Some(complexity(req.complexity)),
+    }
 }
 
 /// Typed `_a24/model/complete` client. Only [`ModelClient::new`] ever
 /// constructs one.
-pub struct ModelClient {
-    clients: Arc<KernelClients>,
-}
+pub struct ModelClient(agent24_os_sdk::ModelClient);
 
 impl ModelClient {
     /// `None` unless the handshake's `Offer` granted [`PREFIX`]
     /// (architecture.md 不可破边界 #7 — same "句柄可能不在" posture every
     /// other typed client already has).
     #[must_use]
-    pub fn new(clients: &Arc<KernelClients>) -> Option<Self> {
-        clients.provides(PREFIX).then(|| Self {
-            clients: Arc::clone(clients),
-        })
+    pub fn new(conn: &Arc<Connection>) -> Option<Self> {
+        agent24_os_sdk::ModelClient::new(conn).map(Self)
     }
 
-    /// `_a24/model/complete`. J10(a): `call_with_timeout(125s)`, never a
-    /// `request_id`.
+    /// Wraps an already-built SDK client (`agent24_os_sdk::Module::
+    /// model()`) — the production path, which never has a bare
+    /// `Arc<Connection>` to hand [`Self::new`].
+    #[must_use]
+    pub fn from_sdk(inner: agent24_os_sdk::ModelClient) -> Self {
+        Self(inner)
+    }
+
+    /// `_a24/model/complete`. J10(a): the SDK's own 125s response deadline,
+    /// never a `request_id` (this client never passes one to the SDK).
     pub async fn complete(&self, req: &ModelRequest) -> Result<ModelReply, ClientError> {
-        let params = build_params(req);
-        let value = self
-            .clients
-            .call_with_timeout(&format!("{PREFIX}complete"), params, MODEL_CALL_TIMEOUT)
-            .await
-            .map_err(map_transport_error)?;
-        let wire: WireResult = serde_json::from_value(value)
-            .map_err(|e| ClientError::Other(format!("model/complete: bad response shape: {e}")))?;
-        let tier = match wire.tier.as_str() {
-            "local" => ServedTier::Local,
-            "remote" => ServedTier::Remote,
-            other => {
-                return Err(ClientError::Other(format!(
-                    "model/complete: unknown tier {other:?}"
-                )))
-            }
+        let wire = build_request(req);
+        let result = self.0.complete(&wire, None).await?;
+        let tier = match result.tier {
+            agent24_os_sdk::ServedTier::Local => ServedTier::Local,
+            agent24_os_sdk::ServedTier::Remote => ServedTier::Remote,
         };
-        // J10(f): usage maps straight through into `ModelReply`.
+        // J10(f)/§5.1 "usage u32 -> u64": the SDK parses `usage.{prompt,
+        // completion}_tokens` as `u64` (the kernel's own wire width);
+        // `ai::ModelReply` still carries `u32` (unchanged domain type, out
+        // of this migration's scope) — a value the kernel would never
+        // actually send (> u32::MAX) fails here exactly the way it failed
+        // pre-migration (`ClientError::Other`), just one layer down (SDK
+        // used to fail this at deserialization; the SDK now deserializes
+        // successfully as `u64` and THIS conversion is where it now fails).
+        let prompt_tokens = u32::try_from(result.usage.prompt_tokens).map_err(|_| {
+            ClientError::Other(format!(
+                "model/complete: bad response shape: usage.prompt_tokens {} does not fit u32",
+                result.usage.prompt_tokens
+            ))
+        })?;
+        let completion_tokens = u32::try_from(result.usage.completion_tokens).map_err(|_| {
+            ClientError::Other(format!(
+                "model/complete: bad response shape: usage.completion_tokens {} does not fit u32",
+                result.usage.completion_tokens
+            ))
+        })?;
         Ok(ModelReply {
-            text: wire.text,
-            model_id: wire.model_id,
+            text: result.text,
+            model_id: result.model_id,
             tier,
-            prompt_tokens: Some(wire.usage.prompt_tokens),
-            completion_tokens: Some(wire.usage.completion_tokens),
+            prompt_tokens: Some(prompt_tokens),
+            completion_tokens: Some(completion_tokens),
         })
     }
 }
@@ -162,12 +153,29 @@ impl ModelClient {
 /// that forgets to extend this fails to COMPILE. Every arm here matches
 /// [`ModelFailure`]'s own doc comments (`ai::ports`) exactly — those doc
 /// comments spelled out this mapping before this file existed (T5.1.1), this
-/// is just the code that keeps the promise.
+/// is just the code that keeps the promise. `Unavailable`'s `cause` is
+/// translated from the SDK's own (domain-decoupled) closed set into
+/// `crate::ai::UnavailableCause` here — the one place in this crate that
+/// still needs the `ai`-specific type (`clients/error.rs`'s own doc).
 fn map_client_error_to_model_failure(err: ClientError) -> ModelFailure {
     match err {
-        ClientError::Unavailable { retryable, cause } => {
-            ModelFailure::Unavailable { retryable, cause }
-        }
+        ClientError::Unavailable { retryable, cause } => ModelFailure::Unavailable {
+            retryable,
+            cause: match cause {
+                agent24_os_sdk::UnavailableCause::NoProvider => {
+                    crate::ai::UnavailableCause::NoProvider
+                }
+                agent24_os_sdk::UnavailableCause::RequestRejected => {
+                    crate::ai::UnavailableCause::RequestRejected
+                }
+                agent24_os_sdk::UnavailableCause::BackendConfig => {
+                    crate::ai::UnavailableCause::BackendConfig
+                }
+                agent24_os_sdk::UnavailableCause::ResponseTooLarge => {
+                    crate::ai::UnavailableCause::ResponseTooLarge
+                }
+            },
+        },
         ClientError::Busy(_) => ModelFailure::Busy,
         ClientError::RateLimited(_) => ModelFailure::RateLimited,
         ClientError::NotReady(_) => ModelFailure::NotReady,
@@ -220,7 +228,7 @@ mod tests {
     use crate::adapter_agent24::clients::test_support::{
         fake_kernel, read_request, respond, respond_error_with_data,
     };
-    use crate::ai::UnavailableCause;
+    use agent24_os_sdk::UnavailableCause;
     use serde_json::{json, Map};
 
     fn sample_request() -> ModelRequest {

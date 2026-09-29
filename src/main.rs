@@ -11,12 +11,11 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use agent24_os_sdk::Module;
 use clap::Parser;
-use sin90::adapter_agent24::clients::{MemoryClient, SchedulerClient};
+use sin90::adapter_agent24::clients::Clients;
 use sin90::adapter_agent24::reconciler;
-use sin90::adapter_agent24::{
-    listener_from_fd, wire_kernel_clients, FatalHook, KernelClients, SpawnEnv,
-};
+use sin90::adapter_agent24::{wire_kernel_clients, FatalHook};
 use sin90::http::{router, ActorKeys, NullEventSink, Sin90State};
 use sin90::store::Sin90Store;
 
@@ -42,7 +41,7 @@ use sin90::store::Sin90Store;
 /// so a genuinely wrong package (built with the wrong feature for the yml
 /// it ships next to) now fails the kernel's own `manifest_digest` check at
 /// handshake (`manifest_mismatch`) instead of silently mounting.
-const MANIFEST: &[u8] = sin90::ai::MANIFEST_YAML.as_bytes();
+const MANIFEST: &str = sin90::ai::MANIFEST_YAML;
 
 #[derive(Parser)]
 #[command(name = "sin90")]
@@ -116,17 +115,24 @@ async fn run_standalone(
 }
 
 async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
-    let env = SpawnEnv::from_env()?;
-    // Before the handshake: a bad key file must stop the module outright, not
-    // leave a mounted module whose every write route answers 403.
-    let keys = ActorKeys::load(Some(&env.data_dir))?;
+    // ME4-5.2.1 migration: read `A24_DATA_DIR` directly, BEFORE the
+    // handshake, purely so `ActorKeys::load` keeps its pre-migration
+    // ordering — "a bad key file must stop the module outright, not leave a
+    // mounted module whose every write route answers 403." `agent24_os_sdk::
+    // Module` only exposes `data_dir()` AFTER a successful `connect()`
+    // (`ModuleEnv::from_env()` is internal to it), so this one read is
+    // deliberately redundant with what `connect()` does internally a moment
+    // later — reading an env var twice is harmless, and it is the only way
+    // to keep the ordering this crate already depended on.
+    let data_dir: PathBuf = std::env::var("A24_DATA_DIR")?.into();
+    let keys = ActorKeys::load(Some(&data_dir))?;
 
     // T3.2.0/H3: the kernel serves exactly one callback connection per
     // generation and never offers a second one (user decision D1,
-    // architecture.md §5) — so once `Transport` decides this connection is
-    // dead, there is nothing left to do but end this generation and let the
-    // supervisor start a fresh one. `on_fatal` is that: it runs exactly once,
-    // from inside `adapter_agent24`, the moment that happens.
+    // architecture.md §5) — so once the connection is decided dead, there is
+    // nothing left to do but end this generation and let the supervisor
+    // start a fresh one. `on_fatal` is that: it runs exactly once, from
+    // inside the SDK, the moment that happens.
     //
     // L-2: `warn`, not `error` — a clean kernel shutdown of this generation
     // (the kernel closing its end on purpose, e.g. during its own graceful
@@ -135,7 +141,7 @@ async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
     // do about "the connection is gone" either way. (N-M5, softening `exit`
     // itself into something the supervisor can tell apart from a crash, is
     // deliberately NOT part of this change — tracked as Sin90 SFU-7.)
-    let on_fatal: FatalHook = Arc::new(|| {
+    let on_fatal: FatalHook = FatalHook::new(|| {
         tracing::warn!(
             "sin90: callback connection to the Agent24 kernel is gone (a clean kernel shutdown \
              of this generation looks the same as a real failure from here); this generation \
@@ -143,28 +149,18 @@ async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
         );
         std::process::exit(70); // EX_SOFTWARE-ish: an unexpected runtime condition, not a CLI usage error.
     });
-    let (clients, offer) = KernelClients::handshake(
-        &env.callback_sock,
-        "sin90",
-        MANIFEST,
-        &env.handshake_token,
-        on_fatal,
-    )
-    .await?;
-    tracing::info!(?offer, "sin90: handshake accepted");
+    let module = Module::builder(MANIFEST)
+        .on_connection_lost(on_fatal)
+        .connect()
+        .await?;
+    tracing::info!(offer = ?module.offer().provides, "sin90: handshake accepted");
 
-    let store = Sin90Store::open(&env.data_dir.join("sin90.db")).await?;
+    let store = Sin90Store::open(&module.data_dir().join("sin90.db")).await?;
     // `wire_kernel_clients` is the actual decision (decoupled from "is
     // `events` specifically granted" — design §5); tested directly in
     // `adapter_agent24`'s own test module with an injected `Offer`, so this
     // call site stays a one-liner with nothing left to get wrong.
-    //
-    // N-H1: `clients_handle` is ALWAYS bound (never conditionally dropped) —
-    // the callback connection must outlive this whole function regardless of
-    // what `wire_kernel_clients` decided about wiring a business client to
-    // it. Dropping it early would close the kernel's only connection for
-    // this generation, which the kernel treats as this generation crashing.
-    let (sink, model, clients_handle) = wire_kernel_clients(&offer, Arc::new(clients));
+    let (sink, model) = wire_kernel_clients(&module);
     // T3.3.2 / T4.4.1 review M1: `_a24/scheduler/` and `_a24/memory/private/`
     // are granted INDEPENDENTLY — built as two separate `Option`s and
     // bundled into one `ReconcilerClients` (`adapter_agent24::reconciler`'s
@@ -175,16 +171,15 @@ async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
     // itself). `run_standalone` below never constructs either, so there is
     // no reconciler task there at all — spec.md M3's "无内核（standalone）时
     // outbox 保持 pending 不报错" holds by construction, not by an extra check.
-    let scheduler = SchedulerClient::new(&clients_handle);
-    let memory = MemoryClient::new(&clients_handle);
-    if scheduler.is_none() {
+    let clients = Clients::build(&module);
+    if clients.scheduler.is_none() {
         tracing::warn!(
             "sin90: kernel did not grant the scheduler capability; Routine cron changes will sit \
              in sin90_outbox as pending (the reconciler pump still runs for whatever capability \
              WAS granted — e.g. memory.remember rows, if `_a24/memory/private/` was)"
         );
     }
-    if memory.is_none() {
+    if clients.memory.is_none() {
         tracing::warn!(
             "sin90: kernel did not grant the memory capability; a finalized Review's derived \
              summary will sit in sin90_outbox as pending (the reconciler pump still runs for \
@@ -192,7 +187,21 @@ async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
              was)"
         );
     }
-    let reconciler_clients = reconciler::ReconcilerClients { scheduler, memory };
+    // T3.2.3/T3.5.1, `test-hooks` only: independent clones of the two debug
+    // routers' own dependencies, taken BEFORE `clients.scheduler`/`.memory`
+    // move into `ReconcilerClients` below — `SchedulerClient`/`MemoryClient`
+    // are both cheap `Arc`-bump `Clone`s (`clients/{scheduler,memory}.rs`'s
+    // own doc).
+    #[cfg(feature = "test-hooks")]
+    let debug_scheduler = clients.scheduler.clone();
+    #[cfg(feature = "test-hooks")]
+    let debug_kernel_roundtrip_clients = std::sync::Arc::new(Clients::build(&module));
+    #[cfg(feature = "test-hooks")]
+    let debug_offer = module.offer().provides.clone();
+    let reconciler_clients = reconciler::ReconcilerClients {
+        scheduler: clients.scheduler,
+        memory: clients.memory,
+    };
     if reconciler_clients.any() {
         reconciler::spawn_pump_loop(store.clone(), reconciler_clients);
     } else {
@@ -213,7 +222,6 @@ async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
     // handshake — `Sin90State::model`'s own doc.
     state.model = model;
 
-    let listener = listener_from_fd(env.listen_fd)?;
     tracing::info!("sin90: accepting on kernel-bound listener");
     // T3.2.3, `test-hooks` only: grab the `Arc<ActorKeys>` `state` already
     // holds BEFORE `router(state, ..)` below consumes `state` by value — the
@@ -240,24 +248,28 @@ async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
     // (`adapter_agent24::kernel_roundtrip`) onto the same
     // `/api/v1/sin90` namespace — kept as its OWN router over its OWN tiny
     // state (never `Sin90State`) so `http` itself never has to know Agent24
-    // exists; see that module's doc for the full reasoning. `clients_handle`
-    // is `Arc::clone`d, not moved — the callback connection this generation
-    // owns must still outlive this whole function regardless (N-H1, above).
+    // exists; see that module's doc for the full reasoning.
     #[cfg(feature = "test-hooks")]
     let inner_router = inner_router
         .merge(sin90::adapter_agent24::kernel_roundtrip::router(
-            std::sync::Arc::clone(&clients_handle),
+            debug_kernel_roundtrip_clients,
+            debug_offer,
             std::sync::Arc::clone(&debug_actor_keys),
         ))
         // T3.5.1: same posture as `kernel_roundtrip` above — its own tiny
         // router/state, merged at the HTTP level, never touching `Sin90State`.
         .merge(sin90::adapter_agent24::reconciler_debug::router(
-            std::sync::Arc::clone(&clients_handle),
+            debug_scheduler,
             debug_store,
             debug_actor_keys,
         ));
     let mounted_router = axum::Router::new().nest("/api/v1/sin90", inner_router);
-    axum::serve(listener, mounted_router).await?;
+    // ME4-5.2.1 migration: `module.serve(..)` replaces the old
+    // `listener_from_fd(..)?` + bare `axum::serve(..)` pair — the SDK
+    // adopted the kernel-bound listener fd already, at `connect()` time
+    // (§2.3 step 0 of the frozen design: CLOEXEC set before this module has
+    // any chance to spawn a child process that could inherit it).
+    module.serve(mounted_router).await?;
     Ok(())
 }
 
@@ -280,6 +292,6 @@ mod tests {
     /// remote-allowed-manifest` turns this red (see PR notes).
     #[test]
     fn manifest_sent_to_the_kernel_is_the_same_text_model_access_parses() {
-        assert_eq!(super::MANIFEST, sin90::ai::MANIFEST_YAML.as_bytes());
+        assert_eq!(super::MANIFEST, sin90::ai::MANIFEST_YAML);
     }
 }

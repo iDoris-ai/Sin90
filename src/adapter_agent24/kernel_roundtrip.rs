@@ -70,10 +70,10 @@ use axum::routing::post;
 use axum::Json;
 use serde_json::{json, Map};
 
-use crate::adapter_agent24::clients::approval::ApprovalToken;
+use agent24_os_sdk::{ApprovalSubmit, RequestContext};
+
 use crate::adapter_agent24::clients::scheduler::ModuleSpec;
 use crate::adapter_agent24::clients::{ClientError, Clients};
-use crate::adapter_agent24::KernelClients;
 use crate::http::actor::{forbidden, Actor, ActorKeys};
 
 /// The `Routine` key this round-trip upserts, lists, deletes, then lists
@@ -88,9 +88,17 @@ const SCHEDULER_TEST_KEY: &str = "routine.test";
 /// comes back `Pending`, not that the approval later executes.
 const GATE_TARGET_FAR_FUTURE: &str = "2099-01-01T00:00:00Z";
 
+/// ME4-5.2.1 migration: `clients` is now the ALREADY-BUILT `Clients` bundle
+/// (`Clients::build(&module)`, called once by `main.rs`) instead of a raw
+/// connection handle rebuilt per request — `agent24_os_sdk::Module` never
+/// exposes its underlying connection (by design), and `Clients` itself is
+/// cheap to share via `Arc` regardless. `offer` is carried separately
+/// (`Clients` does not know its own `Offer`) — `module.offer().provides`,
+/// snapshotted once at the same time.
 #[derive(Clone)]
 struct DebugState {
-    clients: Arc<KernelClients>,
+    clients: Arc<Clients>,
+    offer: Vec<String>,
     actor_keys: Arc<ActorKeys>,
 }
 
@@ -98,11 +106,16 @@ struct DebugState {
 /// merges this onto the main mounted router (`test-hooks` only) — see the
 /// module doc for why it is not simply another route on
 /// `crate::http::router`.
-pub fn router(clients: Arc<KernelClients>, actor_keys: Arc<ActorKeys>) -> axum::Router {
+pub fn router(
+    clients: Arc<Clients>,
+    offer: Vec<String>,
+    actor_keys: Arc<ActorKeys>,
+) -> axum::Router {
     axum::Router::new()
         .route("/debug/kernel-roundtrip", post(kernel_roundtrip))
         .with_state(DebugState {
             clients,
+            offer,
             actor_keys,
         })
 }
@@ -170,9 +183,8 @@ async fn kernel_roundtrip(
     // — exactly `kernel_clients_roundtrip`'s own `"{}"` call, unchanged.
     let req: KernelRoundtripRequest = serde_json::from_slice(&body).unwrap_or_default();
 
-    // Cheap to build fresh per call — `Clients::build`'s own doc.
-    let clients = Clients::build(&state.clients);
-    let offer = state.clients.offer().to_vec();
+    let clients = &state.clients;
+    let offer = state.offer.clone();
 
     // ---- memory: remember, then recall it back --------------------------
     let Some(memory) = &clients.memory else {
@@ -223,10 +235,14 @@ async fn kernel_roundtrip(
             "Offer.provides did not cover _a24/approval/",
         );
     };
-    let Some(request_id) = headers
-        .get("x-a24-request-id")
-        .and_then(|v| v.to_str().ok())
-    else {
+    // ME4-5.2.1 migration: reads both off `RequestContext::from_headers`
+    // (module doc's "Where request_id/approval_token come from") instead of
+    // hand-picking the two header names — same source, same values, now the
+    // SDK's own extraction (and the SDK's own `RequestId`/`ApprovalToken`
+    // types, which `approval::gate` requires: neither is constructible any
+    // other way, module doc note in `clients/approval.rs`).
+    let ctx = RequestContext::from_headers(&headers);
+    let Some(request_id) = ctx.request_id.as_ref() else {
         return error_response(
             StatusCode::BAD_REQUEST,
             "missing_request_id",
@@ -234,10 +250,7 @@ async fn kernel_roundtrip(
              real kernel proxy",
         );
     };
-    let Some(approval_token) = headers
-        .get("x-a24-approval-token")
-        .and_then(|v| v.to_str().ok())
-    else {
+    let Some(approval_token) = ctx.approval_token.as_ref() else {
         return error_response(
             StatusCode::BAD_REQUEST,
             "missing_approval_token",
@@ -246,13 +259,13 @@ async fn kernel_roundtrip(
         );
     };
     let gate_answer = match approval
-        .gate(
-            "schedule_callback",
-            Some(GATE_TARGET_FAR_FUTURE),
-            json!({"probe": "t3.2.3-kernel-clients-roundtrip"}),
+        .gate(&ApprovalSubmit {
+            action: "schedule_callback",
+            target: Some(GATE_TARGET_FAR_FUTURE),
+            payload: json!({"probe": "t3.2.3-kernel-clients-roundtrip"}),
             request_id,
-            &ApprovalToken::new(approval_token),
-        )
+            approval_token,
+        })
         .await
     {
         Ok(a) => a,
@@ -344,10 +357,25 @@ mod tests {
     /// target: reverting the request parameter back to
     /// `Json<KernelRoundtripRequest>` turns this red (403 -> 400, since axum
     /// itself would answer before `kernel_roundtrip`'s body ever executes).
+    /// ME4-5.2.1 migration: builds `Clients` directly from `fake_kernel`'s
+    /// raw `Connection` (its individual constructors — `SchedulerClient::
+    /// new`/`MemoryClient::new`/`ApprovalClient::new` — all still accept
+    /// `&Arc<Connection>`, module doc). Only `Clients::build` itself (the
+    /// PRODUCTION path) moved to taking `&Module`; nothing requires this
+    /// test-only bundle-from-a-fake-connection path, so it is spelled out
+    /// by hand here instead.
+    fn clients_from_connection(conn: &Arc<agent24_os_proto::module::Connection>) -> Arc<Clients> {
+        Arc::new(Clients {
+            scheduler: crate::adapter_agent24::clients::SchedulerClient::new(conn),
+            memory: crate::adapter_agent24::clients::MemoryClient::new(conn),
+            approval: crate::adapter_agent24::clients::ApprovalClient::new(conn),
+        })
+    }
+
     #[tokio::test]
     async fn l3_unauthenticated_request_with_malformed_body_is_403_not_400() {
-        let (clients, _peer) = fake_kernel(vec![]).await;
-        let app = router(clients, test_actor_keys());
+        let (conn, _peer) = fake_kernel(vec![]).await;
+        let app = router(clients_from_connection(&conn), vec![], test_actor_keys());
 
         let response = app
             .oneshot(
@@ -368,8 +396,8 @@ mod tests {
     /// well-formed body skip the auth gate either.
     #[tokio::test]
     async fn l3_unauthenticated_request_with_well_formed_body_is_still_403() {
-        let (clients, _peer) = fake_kernel(vec![]).await;
-        let app = router(clients, test_actor_keys());
+        let (conn, _peer) = fake_kernel(vec![]).await;
+        let app = router(clients_from_connection(&conn), vec![], test_actor_keys());
 
         let response = app
             .oneshot(
