@@ -46,6 +46,18 @@ docs/STATUS.md       今天能做什么/不能做什么，以及怎么自己核�
 docs/DEVELOPMENT.md  开发建议
 ```
 
+## 安装发布包
+
+从 Release 下载 `sin90-<版本>-macos-arm64.tar.gz` 和 `SHA256SUMS`（当前只打 Darwin/arm64 包），然后：
+
+```bash
+shasum -a 256 -c SHA256SUMS               # 校验完整性
+tar -xzf sin90-<版本>-macos-arm64.tar.gz  # 解包出 sin90-<版本>-macos-arm64/
+agent24 os install sin90-<版本>-macos-arm64/
+```
+
+自己打包：`scripts/package.sh`（仅限 Darwin/arm64，用 `cargo build --release`，产物落在 `dist/`，末尾自带 sha256 + tar 内容自检）。
+
 ## 许可
 
 Apache-2.0，与 Agent24 一致。数字公共物品：开源、免费、无许可。
