@@ -38,6 +38,27 @@ jiff = "0.2"
 # the Agent24 repo, in the same change.
 cron = "=0.15.0"
 chrono-tz = "=0.10.4"
+# ME4-5.2.1 (docs/design/ME4-S3-os-sdk.md §5.1): the out-of-process module
+# SDK — replaces this crate's own hand-written adapter_agent24 transport/
+# handshake/typed-client code. Pinned by tag, not branch, so Sin90's build is
+# reproducible independent of Agent24's own main branch history; bump this
+# tag deliberately, in its own commit, when picking up a newer SDK release
+# (CHANGELOG.md in that crate lists the minimum agent24d version each tag
+# needs).
+agent24-os-sdk = { git = "https://github.com/iDoris-ai/Agent24", tag = "agent24-os-sdk-v0.1.0" }
+# Deviation from the design's Cargo.toml row (§5.1's "不直接依赖 proto", L8):
+# that note is scoped to the DEV-dependency (test-util forwarding, which is
+# pure re-export and needs no type name). This ordinary dependency is a
+# separate, mechanical requirement the design did not spell out: the SDK's
+# own five client constructors are all `pub fn new(conn: &Arc<Connection>)`,
+# and `agent24-os-proto::module::Connection` is never re-exported from the
+# SDK's own crate root — so a NEWTYPE around `SchedulerClient`/`ModelClient`
+# (kept specifically so `reconciler.rs`'s protected test module needs zero
+# source changes, §5.2 point 3) cannot spell its own `new(conn: &Arc<???>)`
+# parameter type without this crate naming `Connection` itself. Same git
+# source and tag as the SDK above, so Cargo resolves to the exact same
+# `agent24-os-proto` build (one copy in the dependency graph, not two).
+agent24-os-proto = { git = "https://github.com/iDoris-ai/Agent24", tag = "agent24-os-sdk-v0.1.0" }
 
 [features]
 test-hooks = []
@@ -48,6 +69,13 @@ test-hooks = []
 remote-allowed-manifest = []
 
 [dev-dependencies]
+# L8 (§5.1 Cargo.toml row): forwards the SDK's own `test-util` feature
+# (proto's in-memory fake kernel, `module::testing`, re-exported as
+# `agent24_os_sdk::testing`) — this crate's dev-dependencies only ever need
+# to name the SDK, not `agent24-os-proto` directly. Cargo unions this
+# feature into the ordinary dependency above, the same pattern this
+# Cargo.toml already uses for `tokio`'s `test-util` feature just below.
+agent24-os-sdk = { git = "https://github.com/iDoris-ai/Agent24", tag = "agent24-os-sdk-v0.1.0", features = ["test-util"] }
 # L2 (2026-09-26 review): `#[tokio::test(start_paused = true)]` +
 # `tokio::time::{advance, pause}` — `model::ModelClient`'s own 125s-timeout
 # test drives the virtual clock instead of a real 125-second sleep. Cargo

@@ -120,7 +120,9 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Map};
+
+use agent24_os_sdk::RememberOnce;
 
 use crate::adapter_agent24::clients::scheduler::{
     ModuleScheduleState, ModuleSpec, SchedulerClient,
@@ -176,7 +178,15 @@ pub enum ReconcileError {
 /// Bundling both as independent `Option`s lets [`spawn_pump_loop`] start the
 /// instant EITHER is `Some`, and lets [`apply_one`] skip only the kind(s) it
 /// cannot serve (H1 review) rather than the whole pump refusing to exist.
-#[derive(Clone)]
+///
+/// ME4-5.2.1 migration: no longer `Clone` — `agent24_os_sdk::MemoryClient`
+/// (this crate now re-exports it directly, `clients/memory.rs`'s own doc)
+/// does not implement `Clone` itself (its `Core` field, cheap to clone
+/// inside the SDK, is private to that crate), and nothing in this crate
+/// actually cloned a `ReconcilerClients` — every construction site builds a
+/// fresh one from its own `Option<SchedulerClient>`/`Option<MemoryClient>`
+/// instead (`only_scheduler`/`scheduler_and_memory` in this file's own test
+/// module, `main.rs`'s one production construction).
 pub struct ReconcilerClients {
     pub scheduler: Option<SchedulerClient>,
     pub memory: Option<MemoryClient>,
@@ -241,91 +251,35 @@ fn parse_desired<T: serde::de::DeserializeOwned>(row: &OutboxRow) -> Result<T, s
     serde_json::from_value(row.desired.clone())
 }
 
-/// T4.4.1 review M2: how many `recall` pages [`memory_recall_finds_dedup_key`]
-/// follows via `cursor` before giving up. The kernel's own `recall` caps
-/// each CALL at scanning 2000 lines of underlying storage (newest to
-/// oldest) regardless of `page_size` — a non-empty `cursor` means that
-/// window was exhausted with more (matching or not) history left unscanned,
-/// NOT "there are more matches." Following the cursor to completion is
-/// therefore the only way to know FOR SURE a `dedup_key` marker is absent;
-/// 10 pages (≤ 20 000 lines of kernel-side scan) bounds a persistently
-/// large/busy history before this pre-check reports
-/// [`RecallCheck::Inconclusive`] instead of scanning forever — see the
-/// module doc's own M2/L4 paragraph for the accepted cost.
-const RECALL_PRECHECK_MAX_PAGES: usize = 10;
-
-/// `recall`'s own maximum `page_size` (module doc: "page_size 上限 50") —
-/// using the max shrinks the number of pages [`memory_recall_finds_dedup_key`]
-/// needs to exhaust a given amount of history.
-const RECALL_PRECHECK_PAGE_SIZE: usize = 50;
-
-/// The outcome of [`memory_recall_finds_dedup_key`]'s pre-check.
-enum RecallCheck {
-    /// A memory bearing the exact `dedup_key` marker was found — its own
-    /// kernel-minted id, for [`remember_review_summary`] to hand back
-    /// unchanged (T4.4.1 review L5: so the SAME `result_ref` lands on the
-    /// outbox row whether this row's memory was just-created or was found
-    /// already there from an earlier, ambiguously-outcomed attempt).
-    Found(String),
-    /// `cursor` ran out (became `None`) WITHOUT ever matching — the kernel's
-    /// entire relevant history was scanned; a `remember` call is safe.
-    NotFound,
-    /// T4.4.1 review M2: scanned [`RECALL_PRECHECK_MAX_PAGES`] pages and
-    /// `cursor` was STILL non-empty — genuinely UNKNOWN whether a match
-    /// exists further back. Callers must treat this as "try again later,"
-    /// never as "absent" (the whole point of paginating instead of trusting
-    /// one page: a false "not found" here would plant a duplicate memory).
-    Inconclusive,
-}
-
-/// T4.4.1 review M2: has a memory with this EXACT `dedup_key` marker
-/// already been written? Follows `recall`'s own `cursor` across up to
-/// [`RECALL_PRECHECK_MAX_PAGES`] pages, checking each candidate's
-/// `body.dedup_key` field for an EXACT match on every page — `recall`'s own
-/// substring-match ranking is never trusted for anything beyond "is this
-/// candidate worth checking," only the exact `dedup_key` equality decides a
-/// match.
-async fn memory_recall_finds_dedup_key(
-    memory: &MemoryClient,
-    dedup_key: &str,
-) -> Result<RecallCheck, ClientError> {
-    let mut cursor: Option<String> = None;
-    for _ in 0..RECALL_PRECHECK_MAX_PAGES {
-        let page = memory
-            .recall(
-                dedup_key,
-                RECALL_PRECHECK_PAGE_SIZE,
-                cursor.as_deref(),
-                None,
-            )
-            .await?;
-        if let Some(found) = page
-            .items
-            .iter()
-            .find(|item| item.body.get("dedup_key").and_then(Value::as_str) == Some(dedup_key))
-        {
-            return Ok(RecallCheck::Found(found.id.clone()));
-        }
-        match page.cursor {
-            Some(next) => cursor = Some(next),
-            None => return Ok(RecallCheck::NotFound),
-        }
-    }
-    Ok(RecallCheck::Inconclusive)
-}
+// ME4-5.2.1 migration (`docs/design/ME4-S3-os-sdk.md` §5.1 H3): the
+// recall-pre-check algorithm this file used to hand-roll here
+// (`memory_recall_finds_dedup_key`/`RecallCheck`, plus the two constants
+// below) moved into `agent24-os-sdk` verbatim as `MemoryClient::
+// remember_once` (same `RECALL_PRECHECK_MAX_PAGES`/`RECALL_PRECHECK_PAGE_SIZE`
+// values, same `body.dedup_key` marker field, same three-state outcome) —
+// [`remember_review_summary`] below calls it directly instead of
+// re-deriving the same algorithm. `RECALL_PRECHECK_MAX_PAGES` itself is
+// `#[cfg(test)]`-imported (not just deleted) because this file's own test
+// module (`mod tests`, byte-identical across this migration, §5.2 point 3)
+// still names it once (`reconcile_m2_recall_precheck_exhausting_all_pages_
+// retries_instead_of_assuming_absent`) — without `#[cfg(test)]` a normal
+// build would warn-then-fail on `-D warnings` (`unused_imports`), since
+// nothing in the NON-test part below uses the constant anymore.
+#[cfg(test)]
+use agent24_os_sdk::clients::RECALL_PRECHECK_MAX_PAGES;
 
 /// T4.4.1: lands ONE `memory.remember` row onto `_a24/memory/private/
 /// remember` — idempotently, despite that method itself minting a fresh id
-/// on every successful call (`MemoryClient::remember`'s own doc). The
-/// `recall` pre-check in [`memory_recall_finds_dedup_key`] is what makes a
-/// RETRY of this same row (after `ConnectionLost`/`timeout`, or a crash
-/// between the kernel accepting the call and `outbox_mark_done` committing)
-/// safe: if a memory with this row's `dedup_key` already exists, this
-/// returns its id WITHOUT calling `remember` again, and [`apply_one`]'s
-/// caller marks the row `done` (with that SAME id as `result_ref`) exactly
-/// as if `remember` itself had just succeeded.
+/// on every successful call (`MemoryClient::remember`'s own doc), via the
+/// SDK's `remember_once` (H3): its `recall` pre-check is what makes a RETRY
+/// of this same row (after `ConnectionLost`/`timeout`, or a crash between
+/// the kernel accepting the call and `outbox_mark_done` committing) safe —
+/// if a memory with this row's `dedup_key` already exists, it returns that
+/// id WITHOUT calling `remember` again, and [`apply_one`]'s caller marks the
+/// row `done` (with that SAME id as `result_ref`) exactly as if `remember`
+/// itself had just succeeded.
 ///
-/// T4.4.1 review M2: [`RecallCheck::Inconclusive`] (the pre-check could not
+/// T4.4.1 review M2: `RememberOnce::Inconclusive` (the pre-check could not
 /// scan far enough back to be SURE) is surfaced as `Err(ClientError::Other)`
 /// — NOT treated as "not found." `ClientError::Other` is neither permanent
 /// nor retryable-with-a-hard-guarantee in this crate's own closed set, but
@@ -349,20 +303,7 @@ async fn remember_review_summary(
     memory: &MemoryClient,
     desired: &RememberDesired,
 ) -> Result<String, ClientError> {
-    match memory_recall_finds_dedup_key(memory, &desired.dedup_key).await? {
-        RecallCheck::Found(id) => return Ok(id),
-        RecallCheck::NotFound => {}
-        RecallCheck::Inconclusive => {
-            return Err(ClientError::Other(format!(
-                "recall pre-check for dedup_key {:?} did not finish within {} pages (cursor \
-                 still non-empty) — cannot yet tell whether a memory already exists; retrying \
-                 later rather than risking a duplicate remember",
-                desired.dedup_key, RECALL_PRECHECK_MAX_PAGES
-            )));
-        }
-    }
     let mut body = Map::new();
-    body.insert("dedup_key".to_string(), json!(desired.dedup_key));
     body.insert("review_id".to_string(), json!(desired.review_id));
     body.insert("review_kind".to_string(), json!(desired.review_kind));
     body.insert("period".to_string(), json!(desired.period));
@@ -375,8 +316,19 @@ async fn remember_review_summary(
     // column (`"memory.remember"`, the reconciler's dispatch tag). All
     // three happen to contain the word "kind" but answer different
     // questions; `"review.summary"` mirrors `MemoryClient`'s own doctest.
-    let remembered = memory.remember("review.summary", body, None).await?;
-    Ok(remembered.id)
+    match memory
+        .remember_once("review.summary", &desired.dedup_key, body, None)
+        .await?
+    {
+        RememberOnce::Found { id } | RememberOnce::Created { id, .. } => Ok(id),
+        RememberOnce::Inconclusive => Err(ClientError::Other(format!(
+            "recall pre-check for dedup_key {:?} did not finish within {} pages (cursor \
+             still non-empty) — cannot yet tell whether a memory already exists; retrying \
+             later rather than risking a duplicate remember",
+            desired.dedup_key,
+            agent24_os_sdk::clients::RECALL_PRECHECK_MAX_PAGES
+        ))),
+    }
 }
 
 /// spec.md M3: "退避（1s 起，×2，上限 5min）". `attempts_after_increment` is the
