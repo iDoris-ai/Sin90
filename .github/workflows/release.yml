@@ -132,7 +132,7 @@ jobs:
       # the build + self-checks), and only actually create the Release on
       # a real tag push, or an explicit non-dry-run dispatch.
       - name: Create Release
-        if: ${{ github.event_name != 'pull_request' && inputs.dry_run != true }}
+        if: ${{ github.ref_type == 'tag' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false)) }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
