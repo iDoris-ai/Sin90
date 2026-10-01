@@ -1,0 +1,146 @@
+name: Release
+
+# DEP-A4: Sin90 multi-platform release packages, modeled on Agent24's
+# DEP-A3 release.yml (github.com/iDoris-ai/Agent24 .github/workflows/release.yml).
+# Only real `vX.Y.Z` tags trigger a release; the tag filter below is
+# GitHub's documented filter-pattern syntax (not regex) and matches the
+# whole ref name only, so e.g. `v0.4.0-m4` does not match.
+#
+# `pull_request` is scoped to just this file and scripts/package.sh so a PR
+# touching the release pipeline exercises the real build + self-checks on
+# all 4 targets before merge, without ever publishing anything — see the
+# `release` job's guard below.
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'true: 只构建并上传 artifact，不创建 GitHub Release'
+        type: boolean
+        default: true
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'scripts/package.sh'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-apple-darwin
+            # `macos-13` (the last plain Intel runner) has been retired.
+            # Current standard (free-minutes) Intel macOS runner, per
+            # https://docs.github.com/en/actions/reference/runners/github-hosted-runners
+            # (fetched 2026-10-01): "macOS, 4 CPU, Intel -> macos-15-intel,
+            # macos-26-intel". Picking the non-"-latest" one so the label
+            # doesn't silently move out from under us. Matches Agent24's
+            # DEP-A3 matrix.
+            runner: macos-15-intel
+          - target: x86_64-unknown-linux-gnu
+            # ubuntu-22.04 chosen for its lower glibc baseline, matching
+            # Agent24's DEP-A3 matrix. Note: GitHub put this image into
+            # deprecation brownouts from 2026-09-17 and retires it on
+            # 2027-04-17 -- migrate before then.
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            # Current standard arm64 Linux runners (same doc page, fetched
+            # 2026-10-01): "Linux, arm64 -> ubuntu-24.04-arm, ubuntu-22.04-arm,
+            # ubuntu-26.04-arm". Using 22.04 to match the x64 job's lower
+            # glibc baseline.
+            runner: ubuntu-22.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        with:
+          submodules: false
+
+      - name: Check tag matches crate version
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          CRATE_VER="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/^version = "([^"]*)"$/\1/')"
+          echo "Cargo.toml: $CRATE_VER (tag: $TAG_VER)"
+          if [ "$CRATE_VER" != "$TAG_VER" ]; then
+            echo "::error::tag v$TAG_VER does not match Cargo.toml version $CRATE_VER"
+            exit 1
+          fi
+
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Package (build + self-check)
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/package.sh --target ${{ matrix.target }}
+          archive="$(ls dist/*.tar.gz)"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$archive" .tar.gz)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: ${{ steps.pkg.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Collect + Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          ls -la
+          shasum -a 256 -- *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          shasum -a 256 -c SHA256SUMS
+
+      # Never publish from a pull_request run (it only exists to exercise
+      # the build + self-checks), and only actually create the Release on
+      # a real tag push, or an explicit non-dry-run dispatch.
+      - name: Create Release
+        if: ${{ github.ref_type == 'tag' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false)) }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          gh release create "$TAG" \
+            --verify-tag \
+            --title "Sin90 $TAG" \
+            --notes "占位：正式发布说明在发布时人工补充。" \
+            dist/*.tar.gz dist/SHA256SUMS
