@@ -1,6 +1,6 @@
 [package]
 name = "sin90"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 license = "Apache-2.0"
 description = "Sin90 — 个人助理领域 OS，Agent24 的参考实现之一"
