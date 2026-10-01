@@ -122,7 +122,7 @@ fi
 
 echo "== building sin90 $version ($target, release) ==" >&2
 rustup target add "$target" >/dev/null 2>&1 || true
-cargo build --release --target "$target"
+cargo build --release --locked --target "$target"
 
 bin_path="target/${target}/release/sin90"
 if [ ! -x "$bin_path" ]; then
