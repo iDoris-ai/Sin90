@@ -1880,7 +1880,7 @@ dependencies = [
 
 [[package]]
 name = "sin90"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "agent24-os-proto",
  "agent24-os-sdk",
