@@ -48,15 +48,31 @@ docs/DEVELOPMENT.md  开发建议
 
 ## 安装发布包
 
-从 Release 下载 `sin90-<版本>-macos-arm64.tar.gz` 和 `SHA256SUMS`（当前只打 Darwin/arm64 包），然后：
+每个 Release 下有 4 个平台的包，外加一份覆盖全部 4 个包的 `SHA256SUMS`：
+
+| 包名 | 平台 |
+|---|---|
+| `sin90-<版本>-macos-arm64.tar.gz` | macOS（Apple Silicon） |
+| `sin90-<版本>-macos-x64.tar.gz` | macOS（Intel） |
+| `sin90-<版本>-linux-x64.tar.gz` | Linux（x86_64） |
+| `sin90-<版本>-linux-arm64.tar.gz` | Linux（arm64） |
+
+下载对应平台的包和 `SHA256SUMS`，然后：
 
 ```bash
-shasum -a 256 -c SHA256SUMS               # 校验完整性
-tar -xzf sin90-<版本>-macos-arm64.tar.gz  # 解包出 sin90-<版本>-macos-arm64/
-agent24 os install sin90-<版本>-macos-arm64/
+shasum -a 256 -c SHA256SUMS               # 校验完整性（对 SHA256SUMS 里列出的全部包）
+tar -xzf sin90-<版本>-<os>-<arch>.tar.gz  # 解包出 sin90-<版本>-<os>-<arch>/
+agent24 os install sin90-<版本>-<os>-<arch>/
 ```
 
-自己打包：`scripts/package.sh`（仅限 Darwin/arm64，用 `cargo build --release`，产物落在 `dist/`，末尾自带 sha256 + tar 内容自检）。
+自己打包：`scripts/package.sh [--target <triple>]`，支持 4 个目标三元组
+（`aarch64-apple-darwin` / `x86_64-apple-darwin` / `x86_64-unknown-linux-gnu`
+/ `aarch64-unknown-linux-gnu`）；不传 `--target` 时自动探测本机平台。用
+`cargo build --release --target <triple>`，产物落在 `dist/`，末尾自带 sha256
++ tar 内容 + 二进制架构三项自检。CI 侧见 `.github/workflows/release.yml`：
+4 个目标各自在对应的原生 runner 上构建并打包，推送 `vX.Y.Z` 形式的 tag 时
+自动创建 Release；也可以用 `workflow_dispatch`（`dry_run` 默认 `true`，只构建
+不发布）手动触发。
 
 ## 许可
 
