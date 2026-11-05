@@ -147,13 +147,16 @@ mkdir -p "${stage_dir}/bin"
 # notarize-submission.json is kept for diagnosis. Preserves the exit status.
 cleanup_on_failure() {
     local status=$?
+    set +e
     if [ "$status" -ne 0 ]; then
-        rm -f "${dist_dir}/.sin90-notarize.zip" "${dist_dir}/${tarball}"
+        rm -f "${dist_dir}/.sin90-notarize.zip" "${dist_dir}/${tarball}" "${dist_dir}/SHA256SUMS" \
+            || echo "warning: could not remove partial outputs in ${dist_dir}" >&2
         if [ -d "$stage_dir" ]; then
-            chmod -R u+w "$stage_dir" && rm -rf "$stage_dir"
+            { chmod -R u+w "$stage_dir" && rm -rf "$stage_dir"; } \
+                || echo "warning: could not remove ${stage_dir}" >&2
         fi
     fi
-    return "$status"
+    exit "$status"
 }
 trap cleanup_on_failure EXIT
 
