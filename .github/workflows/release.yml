@@ -37,7 +37,7 @@ jobs:
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -87,9 +87,28 @@ jobs:
       - name: Rust toolchain
         run: rustup toolchain install stable --profile minimal
 
+      # S1-9: package.sh generates the integrity manifest with the Agent24 CLI.
+      # Pinned to an exact Agent24 commit that has `package-integrity`; bump it
+      # together with the Agent24 release this package targets.
+      - name: Install Agent24 CLI (package-integrity)
+        shell: bash
+        env:
+          AGENT24_REV: b059da114aa736c7434dc5304b015cd0dd7103a9
+        run: |
+          set -euo pipefail
+          cargo install --locked --git https://github.com/iDoris-ai/Agent24 \
+            --rev "$AGENT24_REV" --bin agent24 --root "$RUNNER_TEMP/agent24" agent24-cli
+          echo "AGENT24_CLI=$RUNNER_TEMP/agent24/bin/agent24" >> "$GITHUB_ENV"
+
+      # CI has no Developer ID key or notary credentials: macOS packages built
+      # here are unsigned (as before S1-9). Signed releases are built locally
+      # with scripts/package.sh, the same way Agent24 signs its CLI.
       - name: Package (build + self-check)
         id: pkg
         shell: bash
+        env:
+          SKIP_SIGN: '1'
+          SKIP_NOTARIZE: '1'
         run: |
           set -euo pipefail
           bash scripts/package.sh --target ${{ matrix.target }}

@@ -19,29 +19,25 @@ use sin90::adapter_agent24::{wire_kernel_clients, FatalHook};
 use sin90::http::{router, ActorKeys, NullEventSink, Sin90State};
 use sin90::store::Sin90Store;
 
-/// The manifest bytes sent to the kernel at `initialize` — `sin90::ai::
-/// MANIFEST_YAML`'s bytes, NOT a second, independent `include_bytes!` of
-/// this crate's own (2026-09-26 review H1). Before this fix, `main.rs` had
-/// its own always-`domain-os.yml` `include_bytes!` here while `ai::
-/// MANIFEST_YAML` switched with the `remote-allowed-manifest` feature —
-/// two embeds of "the manifest" that could disagree: a mismatched
-/// binary/yml pairing (package-B binary next to the official
-/// `domain-os.yml`, or vice versa) would send bytes that describe ONE
-/// manifest while `ai::MODEL_ACCESS` silently believed the OTHER, and
-/// nothing would ever notice — J23b's whole point (catching that mismatch)
-/// was defeated by construction. Now there is exactly one embed: a
-/// mismatched pairing sends bytes that don't match what this binary's own
-/// `include_str!` picked, but that mismatch can only happen between the
-/// project's two YAML FILES on disk (a 2026-09-26 review round-2 regression
-/// test guards that — `ai::ports::manifest_tests::manifest_yamls_agree_
-/// outside_comments_and_model_access`, not a frozen-design § reference) —
-/// the digest sent here and the text `ai::MODEL_ACCESS` parses are now
-/// PROVABLY the same bytes (pinned by this file's own `tests::
-/// manifest_sent_to_the_kernel_is_the_same_text_model_access_parses` below),
-/// so a genuinely wrong package (built with the wrong feature for the yml
-/// it ships next to) now fails the kernel's own `manifest_digest` check at
-/// handshake (`manifest_mismatch`) instead of silently mounting.
+/// The compiled baseline also used by MODEL_ACCESS; published bytes may add integrity.
 const MANIFEST: &str = sin90::ai::MANIFEST_YAML;
+
+fn load_manifest() -> Result<String, Box<dyn std::error::Error>> {
+    let on_disk = match std::fs::read_to_string("domain-os.yml") {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            tracing::error!(%error, "sin90: cannot read domain-os.yml");
+            return Err(error.into());
+        }
+    };
+    sin90::adapter_agent24::manifest::manifest_to_send(MANIFEST, on_disk.as_deref()).map_err(
+        |error| {
+            tracing::error!(%error, "sin90: domain-os.yml validation failed");
+            error.into()
+        },
+    )
+}
 
 #[derive(Parser)]
 #[command(name = "sin90")]
@@ -115,6 +111,8 @@ async fn run_standalone(
 }
 
 async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = load_manifest()?;
+
     // ME4-5.2.1 migration: read `A24_DATA_DIR` directly, BEFORE the
     // handshake, purely so `ActorKeys::load` keeps its pre-migration
     // ordering — "a bad key file must stop the module outright, not leave a
@@ -149,7 +147,7 @@ async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
         );
         std::process::exit(70); // EX_SOFTWARE-ish: an unexpected runtime condition, not a CLI usage error.
     });
-    let module = Module::builder(MANIFEST)
+    let module = Module::builder(manifest)
         .on_connection_lost(on_fatal)
         .connect()
         .await?;
@@ -284,23 +282,13 @@ async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    /// H1 (2026-09-26 review): the exact bytes this binary sends to the
-    /// kernel at `initialize` (`MANIFEST`) must be the SAME text
-    /// `ai::MODEL_ACCESS` parses (`sin90::ai::MANIFEST_YAML`), not two
-    /// independent embeds that could silently drift apart. `MANIFEST`'s own
-    /// definition now IS `sin90::ai::MANIFEST_YAML.as_bytes()`, so this is a
-    /// regression guard against a future edit reintroducing a second,
-    /// independent `include_bytes!` here — that only matters under
-    /// `--features remote-allowed-manifest` (§11.3.2): with the feature off
-    /// both embeds would read the same literal `domain-os.yml` path anyway
-    /// and this test would stay green by coincidence; only compiled and run
-    /// WITH the feature does a hand-reverted `include_bytes!("../domain-os.
-    /// yml")` diverge from `ai::MANIFEST_YAML` (which would then be reading
-    /// `domain-os.remote-allowed.yml`) — verified by hand: reverting
-    /// `MANIFEST`'s definition and running `cargo test --features
-    /// remote-allowed-manifest` turns this red (see PR notes).
+    // J23b: even feature builds use the same baseline that MODEL_ACCESS parses.
     #[test]
-    fn manifest_sent_to_the_kernel_is_the_same_text_model_access_parses() {
+    fn manifest_baseline_is_the_same_text_model_access_parses() {
         assert_eq!(super::MANIFEST, sin90::ai::MANIFEST_YAML);
+        assert_eq!(
+            sin90::adapter_agent24::manifest::manifest_to_send(super::MANIFEST, None).unwrap(),
+            sin90::ai::MANIFEST_YAML
+        );
     }
 }
