@@ -143,7 +143,8 @@ rm -rf "$dist_dir"
 mkdir -p "${stage_dir}/bin"
 
 # On any failure, leave no half-built package behind: the notarization zip, the
-# staged directory (owner read-only once generate ran) and a partial tarball.
+# staged directory (owner read-only once generate ran), a partial tarball and
+# SHA256SUMS.
 # notarize-submission.json is kept for diagnosis. Preserves the exit status.
 cleanup_on_failure() {
     local status=$?
