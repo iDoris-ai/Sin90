@@ -142,6 +142,21 @@ tarball="${pkg_name}.tar.gz"
 rm -rf "$dist_dir"
 mkdir -p "${stage_dir}/bin"
 
+# On any failure, leave no half-built package behind: the notarization zip, the
+# staged directory (owner read-only once generate ran) and a partial tarball.
+# notarize-submission.json is kept for diagnosis. Preserves the exit status.
+cleanup_on_failure() {
+    local status=$?
+    if [ "$status" -ne 0 ]; then
+        rm -f "${dist_dir}/.sin90-notarize.zip" "${dist_dir}/${tarball}"
+        if [ -d "$stage_dir" ]; then
+            chmod -R u+w "$stage_dir" && rm -rf "$stage_dir"
+        fi
+    fi
+    return "$status"
+}
+trap cleanup_on_failure EXIT
+
 cp domain-os.yml "${stage_dir}/domain-os.yml"
 cp "$bin_path" "${stage_dir}/bin/sin90"
 chmod +x "${stage_dir}/bin/sin90"

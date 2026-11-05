@@ -34,14 +34,20 @@ pub fn manifest_to_send(embedded: &str, on_disk: Option<&str>) -> Result<String,
     let mut published = parse(on_disk, "on-disk")?;
     published.remove(Value::String("integrity".into()));
     if baseline != published {
-        let keys: BTreeSet<_> = baseline
+        // Only name keys the compiled baseline knows; a key that exists only on
+        // disk is untrusted text and could carry anything into the log.
+        let mut keys: Vec<&str> = baseline
             .keys()
-            .chain(published.keys())
             .filter(|key| baseline.get(*key) != published.get(*key))
             .filter_map(Value::as_str)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect();
+        if published.keys().any(|key| !baseline.contains_key(key)) {
+            keys.push("<unknown keys>");
+        }
         return Err(ManifestError::Mismatch {
-            keys: keys.into_iter().collect::<Vec<_>>().join(", "),
+            keys: keys.join(", "),
         });
     }
     Ok(on_disk.to_owned())
@@ -85,7 +91,17 @@ mod tests {
     fn added_removed_and_multiple_keys_are_reported() {
         let error =
             manifest_to_send(EMBEDDED, Some("version: other\nextra: secret\n")).unwrap_err();
-        assert_eq!(error.to_string(), "manifest differs from compiled baseline at top-level keys: extra, kernel_capabilities, spawn, version");
+        assert_eq!(error.to_string(), "manifest differs from compiled baseline at top-level keys: kernel_capabilities, spawn, version, <unknown keys>");
+    }
+
+    #[test]
+    fn unknown_key_names_are_not_echoed() {
+        let disk = format!("{EMBEDDED}\"secret\\nforged log line\": 1\n");
+        let error = manifest_to_send(EMBEDDED, Some(&disk)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "manifest differs from compiled baseline at top-level keys: <unknown keys>"
+        );
     }
 
     #[test]
@@ -129,7 +145,12 @@ mod tests {
             manifest_to_send(embedded, Some(&disk))
                 .unwrap_err()
                 .to_string(),
-            "manifest differs from compiled baseline at top-level keys: model_access"
+            if cfg!(feature = "remote-allowed-manifest") {
+                "manifest differs from compiled baseline at top-level keys: model_access"
+            } else {
+                // The default baseline omits model_access (local_only by default).
+                "manifest differs from compiled baseline at top-level keys: <unknown keys>"
+            }
         );
     }
 }
