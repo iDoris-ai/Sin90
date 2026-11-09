@@ -10,8 +10,9 @@
 //! `CompleteRequest` does — converting between the two happens here, once,
 //! at this one boundary the `ai` module boundary check (J7) already forces
 //! to exist). `MODEL_CALL_TIMEOUT` becomes an alias for the SDK's own
-//! `MODEL_RESPONSE_TIMEOUT` (same value, 125s) rather than a separate
-//! constant, so the one test that reads it (`model_response_timeout_...`,
+//! `MODEL_RESPONSE_TIMEOUT` (4461s since SDK 0.2.0) rather than a separate
+//! constant, so the one test that reads it
+//! (`model_client_call_timeout_is_4461_seconds_longer_than_the_kernels_4456s`,
 //! below) still compiles unchanged.
 //!
 //! # Two `complete`s on purpose
@@ -45,9 +46,9 @@ use crate::ai::{
 /// (`{PREFIX}complete`).
 pub const PREFIX: &str = "_a24/model/";
 
-/// J10(a): `_a24/model/complete`'s own method timeout is 120s (ME4-S2 §5.2's
-/// `MODEL_CALL_TIMEOUT`) — this client's response deadline is set a little
-/// LONGER than that (§2.7's own reasoning), and is now the SDK's own
+/// J10(a), updated for SDK 0.2.0: the kernel's `_a24/model/complete` backstop
+/// is 4456s (ME4-S2a). This client's response deadline is a little longer
+/// (4461s, §2.7's own reasoning) and is the SDK's own
 /// `MODEL_RESPONSE_TIMEOUT` rather than a value this crate picks itself.
 pub(crate) const MODEL_CALL_TIMEOUT: Duration = agent24_os_sdk::clients::MODEL_RESPONSE_TIMEOUT;
 
@@ -84,6 +85,9 @@ fn build_request(req: &ModelRequest) -> agent24_os_sdk::CompleteRequest {
         }),
         max_tokens: Some(req.max_tokens),
         complexity: Some(complexity(req.complexity)),
+        // Sin90 does not sample. `None` omits the field, so a v1 kernel still
+        // accepts the call (SDK 0.2.0 / ME4-S2b).
+        temperature: None,
     }
 }
 
@@ -108,7 +112,7 @@ impl ModelClient {
         Self(inner)
     }
 
-    /// `_a24/model/complete`. J10(a): the SDK's own 125s response deadline,
+    /// `_a24/model/complete`. J10(a): the SDK's own 4461s response deadline,
     /// never a `request_id` (this client never passes one to the SDK).
     pub async fn complete(&self, req: &ModelRequest) -> Result<ModelReply, ClientError> {
         let wire = build_request(req);
@@ -348,22 +352,24 @@ mod tests {
         assert_eq!(reply.tier, ServedTier::Remote);
     }
 
-    /// J10(a) (timeout half): the client's own deadline is fixed at 125s —
-    /// longer than the kernel's own 120s method timeout (ME4-S2 §5.2),
-    /// never shorter (module doc's `MODEL_CALL_TIMEOUT` reasoning).
+    /// J10(a) (timeout half), SDK 0.2.0: the client's own deadline is 4461s —
+    /// longer than the kernel's 4456s backstop (ME4-S2a), never shorter
+    /// (module doc's `MODEL_CALL_TIMEOUT` reasoning). 125s was the SDK 0.1.0
+    /// value (5s past the old 120s method timeout).
     #[test]
-    fn model_client_call_timeout_is_125_seconds_longer_than_the_kernels_120s() {
-        assert_eq!(MODEL_CALL_TIMEOUT, Duration::from_secs(125));
-        assert!(MODEL_CALL_TIMEOUT > Duration::from_secs(120));
+    fn model_client_call_timeout_is_4461_seconds_longer_than_the_kernels_4456s() {
+        assert_eq!(MODEL_CALL_TIMEOUT, Duration::from_secs(4461));
+        assert!(MODEL_CALL_TIMEOUT > Duration::from_secs(4456));
     }
 
     /// L2 (2026-09-26 review): exercises the REAL wait, not just the
     /// constant, via `tokio::time::pause` — a fake peer that reads the
-    /// request and then never answers. Virtual clock advanced to 124s: the
-    /// call must not have resolved yet. Advanced further past 125s: it must
-    /// resolve to `ClientError::Timeout`. `peer` is kept alive for the whole
-    /// test (not dropped early) so this isolates a pure response timeout
-    /// from a `ConnectionLost` race.
+    /// request and then never answers. Virtual clock advanced to one second
+    /// before [`MODEL_CALL_TIMEOUT`]: the call must not have resolved yet.
+    /// Advanced two seconds further (past the deadline): it must resolve to
+    /// `ClientError::Timeout`. `peer` is kept alive for the whole test (not
+    /// dropped early) so this isolates a pure response timeout from a
+    /// `ConnectionLost` race.
     ///
     /// # Why the "still pending at 124s" check is a 0-duration `timeout`
     /// wrapper, not `JoinHandle::is_finished()` or a manual `yield_now` loop
@@ -381,19 +387,19 @@ mod tests {
     /// itself in `tokio::time::timeout(Duration::ZERO, &mut call)` sidesteps
     /// this: it gives the auto-advance heuristic a CLOSER (already-due, 0ms)
     /// timer to jump to instead, so it never has a reason to overshoot past
-    /// this checkpoint into the call's own far-off 125s one.
+    /// this checkpoint into the call's own far-off deadline.
     ///
-    /// Mutation (verified by hand): dropping `MODEL_CALL_TIMEOUT` to 1s
-    /// turns this red (`still_pending` becomes `false` — the call resolves
-    /// well before the 124s checkpoint). A narrow drop (to 120s, only 4s
-    /// short of the checkpoint) is NOT reliably caught by this specific
-    /// checkpoint — the same paused-clock scheduling asynchrony this doc
-    /// describes cuts both ways at small margins — so this test's real
-    /// guarantee is "the constant is not wildly wrong," not "exactly 125s
-    /// to the second"; [`model_client_call_timeout_is_125_seconds_longer_
-    /// than_the_kernels_120s`] pins the exact value separately.
+    /// Mutation (verified by hand on the old 125s deadline): dropping
+    /// `MODEL_CALL_TIMEOUT` to 1s turns this red (`still_pending` becomes
+    /// `false` — the call resolves well before the checkpoint). A narrow
+    /// drop a few seconds short of the checkpoint is NOT reliably caught —
+    /// the same paused-clock scheduling asynchrony this doc describes cuts
+    /// both ways at small margins — so this test's real guarantee is "the
+    /// constant is not wildly wrong," not "exactly N seconds to the
+    /// second"; [`model_client_call_timeout_is_4461_seconds_longer_than_the_kernels_4456s`]
+    /// pins the exact value separately.
     #[tokio::test(start_paused = true)]
-    async fn model_client_times_out_at_125_seconds_not_before() {
+    async fn model_client_times_out_at_its_deadline_not_before() {
         let (clients, mut peer) = fake_kernel(vec!["_a24/model/".to_string()]).await;
         let client = ModelClient::new(&clients).unwrap();
         let req = sample_request();
@@ -401,13 +407,16 @@ mod tests {
 
         let _wire_req = read_request(&mut peer).await; // consumed; peer never answers
 
-        tokio::time::advance(Duration::from_secs(124)).await;
+        tokio::time::advance(MODEL_CALL_TIMEOUT - Duration::from_secs(1)).await;
         let still_pending = tokio::time::timeout(Duration::ZERO, &mut call)
             .await
             .is_err();
-        assert!(still_pending, "must not time out before 125s");
+        assert!(
+            still_pending,
+            "must not time out before the response deadline"
+        );
 
-        tokio::time::advance(Duration::from_secs(2)).await; // now past 125s total
+        tokio::time::advance(Duration::from_secs(2)).await; // now past the deadline
         let err = call.await.unwrap().unwrap_err();
         assert!(matches!(err, ClientError::Timeout(_)));
         drop(peer); // keep alive up to here, not a moment less.
