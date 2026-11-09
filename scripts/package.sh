@@ -202,8 +202,21 @@ command -v "$agent24_cli" >/dev/null 2>&1 || {
     exit 1
 }
 echo "== generating the integrity manifest with $agent24_cli ==" >&2
-"$agent24_cli" package-integrity generate --root "$stage_dir" --executable bin/sin90
-"$agent24_cli" package-integrity verify --root "$stage_dir"
+# Building for another CPU (an x86_64-apple-darwin package on an Apple-silicon
+# Mac): tell the CLI which architecture the executable is for. A same-CPU
+# build passes nothing, so an older pinned Agent24 CLI without --arch still works.
+target_cpu="${target%%-*}"
+case "$(uname -m)" in
+    arm64|aarch64) host_cpu=aarch64 ;;
+    x86_64|amd64)  host_cpu=x86_64 ;;
+    *)             host_cpu="$(uname -m)" ;;
+esac
+arch_args=()
+if [ "$target_cpu" != "$host_cpu" ]; then
+    arch_args=(--arch "$target_cpu")
+fi
+"$agent24_cli" package-integrity generate --root "$stage_dir" --executable bin/sin90 ${arch_args[@]+"${arch_args[@]}"}
+"$agent24_cli" package-integrity verify --root "$stage_dir" ${arch_args[@]+"${arch_args[@]}"}
 
 echo "== packing ${tarball} ==" >&2
 # COPYFILE_DISABLE: macOS tar would otherwise add AppleDouble `._*` entries for
