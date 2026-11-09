@@ -48,7 +48,7 @@ docs/DEVELOPMENT.md  开发建议
 
 ## 安装发布包
 
-每个 Release 下有 4 个平台的包，外加一份覆盖全部 4 个包的 `SHA256SUMS`：
+正式 Release 最终有 4 个平台的包，外加一份 `SHA256SUMS`。推送 `vX.Y.Z` tag 时 CI 只上传 Linux 包，校验和只覆盖这些文件；已签名公证的 macOS 包由维护者随后上传，并更新 `SHA256SUMS`：
 
 | 包名 | 平台 |
 |---|---|
@@ -70,9 +70,10 @@ agent24 os install sin90-<版本>-<os>-<arch>/
 / `aarch64-unknown-linux-gnu`）；不传 `--target` 时自动探测本机平台。用
 `cargo build --release --target <triple>`，产物落在 `dist/`，末尾自带 sha256
 + tar 内容 + 二进制架构三项自检。CI 侧见 `.github/workflows/release.yml`：
-4 个目标各自在对应的原生 runner 上构建并打包，推送 `vX.Y.Z` 形式的 tag 时
-自动创建 Release；也可以用 `workflow_dispatch`（`dry_run` 默认 `true`，只构建
-不发布）手动触发。
+4 个目标各自在对应的原生 runner 上构建并自检（macOS 在 CI 里不签名，只作为
+workflow artifact）。推送 `vX.Y.Z` 形式的 tag 时自动创建 Release，资产只有
+Linux 包和只覆盖这些包的 `SHA256SUMS`；也可以用 `workflow_dispatch`
+（`dry_run` 默认 `true`，只构建不发布）手动触发。
 
 ## 许可
 

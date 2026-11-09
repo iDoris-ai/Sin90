@@ -138,12 +138,28 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # Tag Release ships Linux tarballs only. macOS packages are signed and
+      # notarized on a maintainer machine and uploaded afterwards (S1-9); the
+      # build job still produces them as workflow artifacts for self-check.
+      # SHA256SUMS covers exactly the files this job attaches to the Release.
       - name: Checksums
         working-directory: dist
+        shell: bash
         run: |
           set -euo pipefail
           ls -la
-          shasum -a 256 -- *.tar.gz > SHA256SUMS
+          shopt -s nullglob
+          release_archives=()
+          for archive in *.tar.gz; do
+            case "$archive" in
+              *linux*) release_archives+=("$archive") ;;
+            esac
+          done
+          if [ "${#release_archives[@]}" -eq 0 ]; then
+            echo "::error::no linux tarballs to publish"
+            exit 1
+          fi
+          shasum -a 256 -- "${release_archives[@]}" > SHA256SUMS
           cat SHA256SUMS
           shasum -a 256 -c SHA256SUMS
 
@@ -152,14 +168,30 @@ jobs:
       # a real tag push, or an explicit non-dry-run dispatch.
       - name: Create Release
         if: ${{ github.ref_type == 'tag' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false)) }}
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
+          shopt -s nullglob
+          release_archives=()
+          for archive in dist/*.tar.gz; do
+            case "$(basename "$archive")" in
+              *linux*) release_archives+=("$archive") ;;
+            esac
+          done
+          if [ "${#release_archives[@]}" -eq 0 ]; then
+            echo "::error::no linux tarballs to publish"
+            exit 1
+          fi
+          notes=$(printf '%s\n' \
+            '占位：正式发布说明在发布时人工补充。' \
+            '' \
+            'macOS 包（已签名公证）由维护者随后上传，届时更新 SHA256SUMS。')
           gh release create "$TAG" \
             --verify-tag \
             --title "Sin90 $TAG" \
-            --notes "占位：正式发布说明在发布时人工补充。" \
-            dist/*.tar.gz dist/SHA256SUMS
+            --notes "$notes" \
+            "${release_archives[@]}" dist/SHA256SUMS
