@@ -17,7 +17,6 @@ path = "src/lib.rs"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9.34"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
 axum = { version = "0.8", features = ["json"] }
@@ -46,7 +45,7 @@ chrono-tz = "=0.10.4"
 # tag deliberately, in its own commit, when picking up a newer SDK release
 # (CHANGELOG.md in that crate lists the minimum agent24d version each tag
 # needs).
-agent24-os-sdk = { git = "https://github.com/iDoris-ai/Agent24", tag = "agent24-os-sdk-v0.1.0" }
+agent24-os-sdk = { git = "https://github.com/iDoris-ai/Agent24", tag = "agent24-os-sdk-v0.2.0" }
 # Deviation from the design's Cargo.toml row (§5.1's "不直接依赖 proto", L8):
 # that note is scoped to the DEV-dependency (test-util forwarding, which is
 # pure re-export and needs no type name). This ordinary dependency is a
@@ -59,7 +58,7 @@ agent24-os-sdk = { git = "https://github.com/iDoris-ai/Agent24", tag = "agent24-
 # parameter type without this crate naming `Connection` itself. Same git
 # source and tag as the SDK above, so Cargo resolves to the exact same
 # `agent24-os-proto` build (one copy in the dependency graph, not two).
-agent24-os-proto = { git = "https://github.com/iDoris-ai/Agent24", tag = "agent24-os-sdk-v0.1.0" }
+agent24-os-proto = { git = "https://github.com/iDoris-ai/Agent24", tag = "agent24-os-sdk-v0.2.0" }
 
 [features]
 test-hooks = []
@@ -76,7 +75,7 @@ remote-allowed-manifest = []
 # to name the SDK, not `agent24-os-proto` directly. Cargo unions this
 # feature into the ordinary dependency above, the same pattern this
 # Cargo.toml already uses for `tokio`'s `test-util` feature just below.
-agent24-os-sdk = { git = "https://github.com/iDoris-ai/Agent24", tag = "agent24-os-sdk-v0.1.0", features = ["test-util"] }
+agent24-os-sdk = { git = "https://github.com/iDoris-ai/Agent24", tag = "agent24-os-sdk-v0.2.0", features = ["test-util"] }
 # L2 (2026-09-26 review): `#[tokio::test(start_paused = true)]` +
 # `tokio::time::{advance, pause}` — `model::ModelClient`'s own 125s-timeout
 # test drives the virtual clock instead of a real 125-second sleep. Cargo

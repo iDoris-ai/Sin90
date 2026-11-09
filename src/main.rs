@@ -19,25 +19,28 @@ use sin90::adapter_agent24::{wire_kernel_clients, FatalHook};
 use sin90::http::{router, ActorKeys, NullEventSink, Sin90State};
 use sin90::store::Sin90Store;
 
-/// The compiled baseline also used by MODEL_ACCESS; published bytes may add integrity.
+/// Embedded baseline passed to `Module::builder`. This is
+/// `sin90::ai::MANIFEST_YAML`, the same text `ai::MODEL_ACCESS` parses
+/// (J23b) — not a second, independent embed.
+///
+/// Before the 2026-09-26 review fix, `main.rs` had its own
+/// always-`domain-os.yml` `include_bytes!` while `ai::MANIFEST_YAML` switched
+/// with `remote-allowed-manifest`. A package-B binary next to the official
+/// `domain-os.yml` (or the reverse) would then describe one manifest on the
+/// wire and believe the other in `MODEL_ACCESS`. One embed closes that hole:
+/// the two project YAML files can still disagree with each other
+/// (`ai::ports::manifest_tests::manifest_yamls_agree_outside_comments_and_model_access`),
+/// but the baseline here and the text `MODEL_ACCESS` parses are the same
+/// bytes (this file's `manifest_sent_to_the_kernel_is_the_same_text_model_access_parses`).
+///
+/// Disk self-check is SDK 0.2.0's job. `Module::connect` reads `domain-os.yml`
+/// from the package directory (the process cwd), ignores the top-level
+/// `integrity` key, and requires the rest to match this baseline at both the
+/// YAML value layer and the kernel's typed manifest layer. The handshake
+/// sends those on-disk bytes. A missing file is `SdkError::ManifestMissing`.
+/// `with_env` tests that do not set a package directory keep using this
+/// embedded baseline alone.
 const MANIFEST: &str = sin90::ai::MANIFEST_YAML;
-
-fn load_manifest() -> Result<String, Box<dyn std::error::Error>> {
-    let on_disk = match std::fs::read_to_string("domain-os.yml") {
-        Ok(text) => Some(text),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => {
-            tracing::error!(%error, "sin90: cannot read domain-os.yml");
-            return Err(error.into());
-        }
-    };
-    sin90::adapter_agent24::manifest::manifest_to_send(MANIFEST, on_disk.as_deref()).map_err(
-        |error| {
-            tracing::error!(%error, "sin90: domain-os.yml validation failed");
-            error.into()
-        },
-    )
-}
 
 #[derive(Parser)]
 #[command(name = "sin90")]
@@ -111,8 +114,6 @@ async fn run_standalone(
 }
 
 async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
-    let manifest = load_manifest()?;
-
     // ME4-5.2.1 migration: read `A24_DATA_DIR` directly, BEFORE the
     // handshake, purely so `ActorKeys::load` keeps its pre-migration
     // ordering — "a bad key file must stop the module outright, not leave a
@@ -147,7 +148,7 @@ async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
         );
         std::process::exit(70); // EX_SOFTWARE-ish: an unexpected runtime condition, not a CLI usage error.
     });
-    let module = Module::builder(manifest)
+    let module = Module::builder(MANIFEST)
         .on_connection_lost(on_fatal)
         .connect()
         .await?;
@@ -282,13 +283,22 @@ async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    // J23b: even feature builds use the same baseline that MODEL_ACCESS parses.
+    /// H1 (2026-09-26 review): the embedded baseline (`MANIFEST`) must be the
+    /// SAME text `ai::MODEL_ACCESS` parses (`sin90::ai::MANIFEST_YAML`), not
+    /// two independent embeds that could silently drift apart. `MANIFEST`'s
+    /// definition now IS `sin90::ai::MANIFEST_YAML`, so this is a regression
+    /// guard against a future edit reintroducing a second embed — that only
+    /// matters under `--features remote-allowed-manifest` (§11.3.2): with the
+    /// feature off both embeds would read the same literal `domain-os.yml`
+    /// path anyway and this test would stay green by coincidence; only
+    /// compiled and run WITH the feature does a hand-reverted
+    /// `include_str!("../domain-os.yml")` diverge from `ai::MANIFEST_YAML`
+    /// (which would then be reading `domain-os.remote-allowed.yml`).
+    ///
+    /// SDK 0.2.0 compares the on-disk package manifest to this baseline
+    /// itself; this test only pins the embedded side of J23b.
     #[test]
-    fn manifest_baseline_is_the_same_text_model_access_parses() {
+    fn manifest_sent_to_the_kernel_is_the_same_text_model_access_parses() {
         assert_eq!(super::MANIFEST, sin90::ai::MANIFEST_YAML);
-        assert_eq!(
-            sin90::adapter_agent24::manifest::manifest_to_send(super::MANIFEST, None).unwrap(),
-            sin90::ai::MANIFEST_YAML
-        );
     }
 }

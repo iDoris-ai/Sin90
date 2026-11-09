@@ -470,8 +470,9 @@ async fn ts10_out_events_emit_routine_paused() {
 /// loop, and compares a NARROWER field set than the other outbound goldens'
 /// full-object compare — two of §5.2 point 2's own documented "有意差异"
 /// apply here specifically:
-/// - `protocol_versions.max`: 1000 (Sin90's pre-migration constant) -> 1
-///   (§8 Q7's decision, asserted directly below, not pinned to the fixture).
+/// - `protocol_versions.max`: 1000 (Sin90's pre-migration constant) -> 2
+///   (SDK 0.2.0 / ME4-S2b; SDK 0.1.0 declared 1). Asserted directly below,
+///   not pinned to the fixture.
 /// - `manifest_digest`: content-dependent on the exact manifest BYTES sent,
 ///   which is not itself a wire *shape* fact (same posture as `auth_token`,
 ///   already excluded) — recorded pre-migration against a minimal
@@ -504,7 +505,7 @@ async fn ts10_out_handshake_initialize_params() {
     let result = json!({"protocol_version": 1, "offer": {"provides": []}});
     let (params, _peer) = ep.accept_initialize(result).await;
 
-    assert_eq!(params["protocol_versions"], json!({"min": 1, "max": 1}));
+    assert_eq!(params["protocol_versions"], json!({"min": 1, "max": 2}));
 
     let mut narrowed_params = params.clone();
     if let Some(obj) = narrowed_params.as_object_mut() {

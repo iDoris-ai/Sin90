@@ -32,7 +32,6 @@ mod golden_tests;
 /// here rather than in `http`.
 #[cfg(feature = "test-hooks")]
 pub mod kernel_roundtrip;
-pub mod manifest;
 pub mod reconciler;
 /// T3.5.1, `test-hooks` only — see that module's own doc for why it lives
 /// here rather than in `http`, and why it exists alongside `kernel_roundtrip`
