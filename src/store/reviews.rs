@@ -9,6 +9,10 @@ use sqlx::Row;
 use std::collections::BTreeMap;
 
 // Reserved valid ULID: stable identity makes concurrent initialization idempotent.
+/// The system review Routine behind `/settings/review`. Change the schedule
+/// through `PUT /settings/review` (human only), not the Routine routes: the
+/// next settings write overwrites the cron. `GET /settings/review` is a plain
+/// read like the other list routes and needs no human key.
 pub const SYSTEM_REVIEW_ID: &str = "00000000000000000000000001";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -149,7 +153,7 @@ pub(super) async fn should_draft(tx: &mut Tx<'_>, id: &str, day: Date) -> Result
         add(day, -i64::from(day.weekday().to_monday_zero_offset()) - 1)
     };
     let end = latest_month_end(day);
-    Ok(end >= add(sunday, -13) && end <= sunday)
+    Ok(end >= add(sunday, -6) && end <= sunday)
 }
 
 pub(super) async fn draft_closed_periods(tx: &mut Tx<'_>, day: Date, now: &str) -> Result<()> {
@@ -513,6 +517,38 @@ mod tests {
                 ..
             }
         ));
+    }
+    #[tokio::test]
+    async fn monthly_cadence_drafts_only_the_first_review_after_month_end() {
+        let s = Sin90Store::open_memory().await.unwrap();
+        s.put_review_settings(ReviewSettings {
+            cadence: ReviewCadence::Monthly,
+            ..ReviewSettings::default()
+        })
+        .await
+        .unwrap();
+        // Sundays: Jan 31 (Sat) closes in the week ending Feb 1; Feb 28 (Sat)
+        // in the week ending Mar 1. Mondays review the previous week the same way.
+        for (day, drafted) in [
+            ("2026-02-01", true),
+            ("2026-02-08", false),
+            ("2026-02-15", false),
+            ("2026-02-22", false),
+            ("2026-03-01", true),
+            ("2026-03-08", false),
+            ("2026-03-09", false),
+            ("2026-04-06", true),
+            ("2026-04-13", false),
+        ] {
+            let got = matches!(
+                fire(&s, day).await,
+                RoutineFireOutcome::Recorded {
+                    auto_review: Some(_),
+                    ..
+                }
+            );
+            assert_eq!(got, drafted, "{day}");
+        }
     }
     #[tokio::test]
     async fn month_end_tuesday_saturday_sunday_first_review_and_dedup() {
