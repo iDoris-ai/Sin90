@@ -985,6 +985,11 @@ impl Sin90Store {
     }
 
     pub async fn update_area(&self, id: &str, patch: &AreaPatch) -> Result<Area> {
+        if patch.to.is_none() && patch.current_state.is_none() && patch.ideal_state.is_none() {
+            return Err(StoreError::Invalid(
+                "give at least one of to, current_state, ideal_state".into(),
+            ));
+        }
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query("SELECT * FROM sin90_areas WHERE id = ?")
             .bind(id)
@@ -1044,6 +1049,17 @@ impl Sin90Store {
     }
 
     pub async fn update_direction(&self, id: &str, patch: &DirectionPatch) -> Result<Direction> {
+        // The triage direction is a system row classify falls back to
+        // (migration 0014): renaming it, abandoning it or putting it in an
+        // Area would break that path, so it cannot be edited here.
+        if id == crate::core::TRIAGE_DIRECTION_ID {
+            return Err(StoreError::Conflict(
+                "the triage direction is managed by Sin90 and cannot be edited".into(),
+            ));
+        }
+        if patch.title.as_deref().is_some_and(|t| t.trim().is_empty()) {
+            return Err(StoreError::Invalid("title must not be blank".into()));
+        }
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query("SELECT * FROM sin90_directions WHERE id = ?")
             .bind(id)

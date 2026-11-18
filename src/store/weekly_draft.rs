@@ -688,6 +688,71 @@ mod l1_tests {
     use crate::core::{DirectionPatch, NewRoutine, RoutineKind, ScheduleBlockStatus};
 
     #[tokio::test]
+    async fn the_triage_direction_cannot_be_edited() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let area = store.create_area("A").await.unwrap();
+        let triage = crate::core::TRIAGE_DIRECTION_ID;
+        let before = store
+            .list_directions()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|d| d.id == triage)
+            .unwrap();
+        for patch in [
+            DirectionPatch {
+                title: Some("x".into()),
+                ..Default::default()
+            },
+            DirectionPatch {
+                status: Some(crate::core::DirectionStatus::Abandoned),
+                ..Default::default()
+            },
+            DirectionPatch {
+                area_id: Some(Some(area.id.clone())),
+                ..Default::default()
+            },
+        ] {
+            let err = store.update_direction(triage, &patch).await.unwrap_err();
+            assert!(matches!(err, StoreError::Conflict(_)), "{err:?}");
+        }
+        let after = store
+            .list_directions()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|d| d.id == triage)
+            .unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[tokio::test]
+    async fn a_blank_title_and_an_empty_area_patch_are_refused() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let area = store.create_area("A").await.unwrap();
+        let d = store
+            .create_direction("Run", "2026-Q4", None)
+            .await
+            .unwrap();
+        let err = store
+            .update_direction(
+                &d.id,
+                &DirectionPatch {
+                    title: Some("  ".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
+        let err = store
+            .update_area(&area.id, &crate::core::AreaPatch::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
+    }
+
+    #[tokio::test]
     async fn a_block_refuses_an_unknown_routine() {
         let store = Sin90Store::open_memory().await.unwrap();
         let err = store
