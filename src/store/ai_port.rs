@@ -2111,7 +2111,7 @@ mod tests {
             .unwrap();
         let in_week = "2026-09-22T09:00:00Z"; // 2026-W39
         let block = store
-            .create_block(Some(&direction.id), None, 90)
+            .create_block(Some(&direction.id), None, 90, None)
             .await
             .unwrap();
         store
@@ -2193,7 +2193,7 @@ mod tests {
             .unwrap();
         let in_week = "2026-09-22T09:00:00Z"; // 2026-W39
         let block = store
-            .create_block(Some(&direction.id), None, 30)
+            .create_block(Some(&direction.id), None, 30, None)
             .await
             .unwrap();
         store

@@ -9528,7 +9528,7 @@ mod ai_summarize {
             .await
             .unwrap();
         let block = store
-            .create_block(Some(&direction.id), None, 90)
+            .create_block(Some(&direction.id), None, 90, None)
             .await
             .unwrap();
         store
@@ -10220,4 +10220,157 @@ mod ai_summarize {
             "review B must not be suppressed by a rejection recorded against review A"
         );
     }
+}
+
+#[tokio::test]
+async fn l1_direction_and_area_edits_are_atomic_and_emit_snapshots() {
+    let (app, sink, store) = test_app_with_store().await;
+    let a = store.create_area("Work").await.unwrap();
+    let b = store.create_area("Health").await.unwrap();
+    let d = store
+        .create_direction("Run", "2026-Q4", Some(&a.id))
+        .await
+        .unwrap();
+    let uri = format!("/directions/{}", d.id);
+    let denied = app
+        .clone()
+        .oneshot(automation_req("PATCH", &uri, json!({"title":"No"})))
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let bad = app
+        .clone()
+        .oneshot(human_req(
+            "PATCH",
+            &uri,
+            json!({"status":"achieved", "title":"No"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), StatusCode::CONFLICT);
+    assert_eq!(store.list_directions().await.unwrap()[0], d);
+    let resp = app
+        .clone()
+        .oneshot(human_req(
+            "PATCH",
+            &uri,
+            json!({"title":"Jog", "status":"active", "target_window":"2027-Q1", "area_id":b.id}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let snapshot = body_json(resp).await;
+    assert_eq!(snapshot["title"], "Jog");
+    assert_eq!(snapshot["area_id"], b.id);
+    assert_eq!(snapshot["target_window"], "2027-Q1");
+    assert!(sink
+        .0
+        .lock()
+        .unwrap()
+        .contains(&("direction.updated".into(), snapshot)));
+    let uri = format!("/areas/{}", a.id);
+    let resp = app
+        .clone()
+        .oneshot(human_req(
+            "PATCH",
+            &uri,
+            json!({"current_state":"忙碌", "ideal_state":"从容"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let snapshot = body_json(resp).await;
+    assert!(sink
+        .0
+        .lock()
+        .unwrap()
+        .contains(&("area.updated".into(), snapshot)));
+    let areas = body_json(app.clone().oneshot(get_req("/areas")).await.unwrap()).await;
+    let row = areas["areas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["id"] == a.id)
+        .unwrap();
+    assert_eq!(row["current_state"], "忙碌");
+    assert_eq!(row["ideal_state"], "从容");
+    let resp = app
+        .clone()
+        .oneshot(human_req("PATCH", &uri, json!({"current_state":null})))
+        .await
+        .unwrap();
+    let row = body_json(resp).await;
+    assert!(row["current_state"].is_null());
+    assert_eq!(row["ideal_state"], "从容");
+    assert_eq!(
+        app.oneshot(human_req(
+            "PATCH",
+            "/directions/missing",
+            json!({"title":"x"})
+        ))
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn l1_block_routine_link_roundtrips_through_http_and_events() {
+    let (app, sink, store) = test_app_with_store().await;
+    let routine = store
+        .create_routine(&crate::core::NewRoutine {
+            title: "Run".into(),
+            area_id: None,
+            direction_id: None,
+            kind: crate::core::RoutineKind::Exercise,
+            cron: "0 7 * * MON".into(),
+            tz: None,
+            target_count: None,
+            target_minutes: Some(30),
+        })
+        .await
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(human_req(
+            "POST",
+            "/schedule-blocks",
+            json!({"routine_id":routine.id,"planned_minutes":30}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let block = body_json(resp).await;
+    assert_eq!(block["routine_id"], routine.id);
+    for to in ["started", "completed"] {
+        let resp = app
+            .clone()
+            .oneshot(human_req(
+                "PATCH",
+                &format!("/schedule-blocks/{}", block["id"].as_str().unwrap()),
+                json!({"to":to}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["routine_id"], routine.id);
+    }
+    assert!(sink
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(kind, p)| kind == "block.transitioned"
+            && p["routine_id"] == routine.id
+            && p["to"] == "completed"));
+    let resp = app
+        .oneshot(human_req(
+            "POST",
+            "/schedule-blocks",
+            json!({"routine_id":"missing","planned_minutes":30}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }

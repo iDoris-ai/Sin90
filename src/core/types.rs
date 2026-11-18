@@ -188,6 +188,8 @@ pub struct Alloc {
 /// uncategorized direction remains valid.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Area {
+    pub current_state: Option<String>,
+    pub ideal_state: Option<String>,
     pub id: AreaId,
     pub title: String,
     pub slug: String,
@@ -209,6 +211,26 @@ pub struct Direction {
     pub target_window: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DirectionPatch {
+    pub title: Option<String>,
+    pub status: Option<DirectionStatus>,
+    pub target_window: Option<String>,
+    #[serde(deserialize_with = "deserialize_double_option")]
+    pub area_id: Option<Option<AreaId>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AreaPatch {
+    pub to: Option<AreaStatus>,
+    #[serde(deserialize_with = "deserialize_double_option")]
+    pub current_state: Option<Option<String>>,
+    #[serde(deserialize_with = "deserialize_double_option")]
+    pub ideal_state: Option<Option<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -253,6 +275,7 @@ pub struct Rhythm {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduleBlock {
+    pub routine_id: Option<RoutineId>,
     pub id: ScheduleBlockId,
     pub direction_id: Option<DirectionId>,
     pub task_id: Option<TaskId>,

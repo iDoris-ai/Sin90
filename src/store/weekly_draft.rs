@@ -7,28 +7,9 @@
 //! mutable and can drift from what actually happened. Two exceptions, both
 //! still pure event reads (never a mutable-table join):
 //!
-//! - `by_area` needs a direction's `area_id`, which the `block.transitioned`
-//!   event does NOT carry (only `direction_id`/`direction_title` are
-//!   snapshotted onto it, see `attention.rs`'s doc). `area_id` is set once,
-//!   at `direction.created`, and never changes after (no direction-update
-//!   route exists in this codebase — `POST /directions` is create-only), so
-//!   replaying `direction.created` events for a `direction_id -> area_id`
-//!   map is exactly as safe as the `direction_title` snapshot the block
-//!   event already relies on: both are immutable-at-creation facts read
-//!   from the append-only log, not from `sin90_directions`.
-//! - `by_direction` is literally [`crate::store::Sin90Store::attention`]'s
-//!   own output (reused, not reimplemented, per the task's instruction not
-//!   to duplicate a differently-sourced hour count), reshaped to the wire's
-//!   `{direction_id, minutes}` pair.
-//!
-//! `routines[].completed` is a hardcoded `0`: nothing in this codebase links
-//! a completed `ScheduleBlock` back to the `Routine` that (maybe) generated
-//! it — `sin90_schedule_blocks` has no `routine_id` column, and
-//! `routine.fired`'s payload (`{routine_id, fire_id, scheduled_for,
-//! trigger}`) carries no block/task reference either (T3.2.2). Guessing an
-//! association (e.g. "the next block on the same direction") would be
-//! exactly the kind of table-joining/fabrication this task explicitly rules
-//! out, so it is left at 0 rather than invented. See task report for T4.3.1.
+//! Direction-to-area mappings use the latest created/updated snapshot in
+//! event insertion order. Routine completions count linked block completion
+//! events inside the requested week, including routines fired in other weeks.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -58,7 +39,6 @@ pub struct AreaMinutes {
 
 /// One Routine's fired/completed counts over the week — `routines`' wire
 /// shape (spec.md M4: `routines:[{routine_id, fired, completed}]`).
-/// `completed` is always `0` today — see this module's doc.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoutineDraftRow {
     pub routine_id: String,
@@ -133,37 +113,45 @@ pub fn render_weekly_draft_markdown(draft: &WeeklyDraft) -> String {
     out
 }
 
-/// `direction_id -> area_id` snapshot, replayed purely from
-/// `direction.created` events (never `sin90_directions`, which is
-/// mutable — though for THIS field it wouldn't matter, since a
-/// Direction's `area_id` is set once at creation and no update route
-/// ever changes it; the replay is still preferred over the table for the
-/// same "never join a mutable table" discipline `attention` and
-/// `week_attention` already follow, so this endpoint has exactly one
-/// sourcing rule, not two). A direction created with no area (`area_id:
-/// null`) is absent from the map; callers treat that the same as "no
-/// area" (`""`), matching [`crate::store::AttentionRow`]'s own "no direction" bucket.
-/// `pub(crate)` (T5.3.1's review C1 fix): run against a GIVEN connection —
-/// see [`weekly_draft_on`]'s own doc for why.
+/// Direction-to-area snapshot as of `before` (exclusive), from the
+/// append-only event log. History is counted by the area a direction had at
+/// the time (PLAN-LIFEOS-LAYERS §3 L1): moving a direction to another area
+/// does not rewrite past weeks.
 pub(crate) async fn direction_area_snapshot_on(
     conn: &mut SqliteConnection,
+    before: &str,
 ) -> Result<HashMap<String, String>> {
     let rows = sqlx::query(
         "SELECT entity_id AS direction_id,
-                json_extract(payload,'$.area_id') AS area_id
+                json_extract(payload,'$.area_id') AS area_id, at
          FROM sin90_events
-         WHERE entity = 'direction' AND kind = 'created'",
+         WHERE entity = 'direction' AND kind IN ('created', 'updated')
+         ORDER BY rowid",
     )
     .fetch_all(&mut *conn)
     .await?;
-    Ok(rows
+    // A direction with no event before `before` (only fixtures backdate
+    // blocks past their direction's creation) falls back to its first
+    // snapshot, so it is never shown as uncategorized by accident.
+    let mut areas: HashMap<String, Option<String>> = HashMap::new();
+    let mut first: HashMap<String, Option<String>> = HashMap::new();
+    for row in rows {
+        let id: String = row.get("direction_id");
+        let area: Option<String> = row.get("area_id");
+        let at: String = row.get("at");
+        first.entry(id.clone()).or_insert_with(|| area.clone());
+        if at.as_str() < before {
+            areas.insert(id, area);
+        }
+    }
+    for (id, area) in first {
+        areas.entry(id).or_insert(area);
+    }
+    let areas: HashMap<String, String> = areas
         .into_iter()
-        .filter_map(|r| {
-            let direction_id: String = r.get("direction_id");
-            let area_id: Option<String> = r.get("area_id");
-            area_id.map(|a| (direction_id, a))
-        })
-        .collect())
+        .filter_map(|(id, area)| area.map(|area| (id, area)))
+        .collect();
+    Ok(areas)
 }
 
 /// Pure event replay for `iso_week` (`YYYY-Www`), run against a GIVEN
@@ -217,7 +205,7 @@ pub(crate) async fn weekly_draft_on(
     // by_area: fold `by_direction` through the direction->area snapshot
     // (itself pure `sin90_events` replay — see [`direction_area_snapshot_on`]'s
     // doc), on the SAME connection.
-    let area_of = direction_area_snapshot_on(&mut *conn).await?;
+    let area_of = direction_area_snapshot_on(&mut *conn, &end).await?;
     let mut area_totals: BTreeMap<String, i64> = BTreeMap::new();
     for row in &attention_rows {
         let area_id = if row.direction_id.is_empty() {
@@ -244,14 +232,18 @@ pub(crate) async fn weekly_draft_on(
     .get("n");
 
     let routine_rows = sqlx::query(
-        "SELECT entity_id AS routine_id,
-                CAST(COUNT(*) AS INTEGER) AS fired
-         FROM sin90_events
-         WHERE entity = 'routine' AND kind = 'fired'
-           AND at >= ? AND at < ?
-         GROUP BY entity_id
-         ORDER BY entity_id",
+        "SELECT routine_id, SUM(fired) AS fired, SUM(completed) AS completed FROM (
+            SELECT entity_id AS routine_id, 1 AS fired, 0 AS completed FROM sin90_events
+            WHERE entity = 'routine' AND kind = 'fired' AND at >= ? AND at < ?
+            UNION ALL
+            SELECT json_extract(payload, '$.routine_id') AS routine_id, 0 AS fired, 1 AS completed
+            FROM sin90_events WHERE entity = 'block' AND kind = 'transitioned'
+              AND to_state = 'completed' AND at >= ? AND at < ?
+              AND json_extract(payload, '$.routine_id') IS NOT NULL
+         ) GROUP BY routine_id ORDER BY routine_id",
     )
+    .bind(&start)
+    .bind(&end)
     .bind(&start)
     .bind(&end)
     .fetch_all(&mut *conn)
@@ -261,9 +253,7 @@ pub(crate) async fn weekly_draft_on(
         .map(|r| RoutineDraftRow {
             routine_id: r.get("routine_id"),
             fired: r.get("fired"),
-            // Always 0 — see module doc: nothing in the event log links
-            // a completed block back to a Routine.
-            completed: 0,
+            completed: r.get("completed"),
         })
         .collect();
 
@@ -323,7 +313,7 @@ mod weekly_draft_tests {
         at: &str,
     ) -> String {
         let block = store
-            .create_block(Some(direction_id), None, minutes)
+            .create_block(Some(direction_id), None, minutes, None)
             .await
             .unwrap();
         store
@@ -688,5 +678,161 @@ mod weekly_draft_tests {
             render_weekly_draft_markdown(&draft),
             render_weekly_draft_markdown(&draft)
         );
+    }
+}
+
+#[cfg(test)]
+mod l1_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use crate::core::{DirectionPatch, NewRoutine, RoutineKind, ScheduleBlockStatus};
+
+    #[tokio::test]
+    async fn a_block_refuses_an_unknown_routine() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let err = store
+            .create_block(None, None, 30, Some("no-such-routine"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotFound(_)), "{err:?}");
+        assert!(store.list_blocks().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn past_weeks_keep_the_area_a_direction_had_then() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let a = store.create_area("A").await.unwrap();
+        let b = store.create_area("B").await.unwrap();
+        let d = store
+            .create_direction("Run", "2026-Q4", Some(&a.id))
+            .await
+            .unwrap();
+        let block = store
+            .create_block(Some(&d.id), None, 30, None)
+            .await
+            .unwrap();
+        for to in [ScheduleBlockStatus::Started, ScheduleBlockStatus::Completed] {
+            store.transition_block(&block.id, to).await.unwrap();
+        }
+        crate::store::test_hooks::set_last_event_at(
+            &store,
+            "block",
+            &block.id,
+            "2026-09-24T10:00:00Z",
+        )
+        .await
+        .unwrap();
+        crate::store::test_hooks::set_last_event_at(
+            &store,
+            "direction",
+            &d.id,
+            "2026-09-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        // Moved to B after that week ended: the past week stays on A.
+        store
+            .update_direction(
+                &d.id,
+                &DirectionPatch {
+                    area_id: Some(Some(b.id.clone())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let draft = store.weekly_draft("2026-W39").await.unwrap();
+        assert_eq!(
+            draft.by_area,
+            vec![AreaMinutes {
+                area_id: a.id.clone(),
+                minutes: 30
+            }]
+        );
+        // The same move, dated inside that week, does count for it.
+        crate::store::test_hooks::set_last_event_at(
+            &store,
+            "direction",
+            &d.id,
+            "2026-09-23T10:00:00Z",
+        )
+        .await
+        .unwrap();
+        let draft = store.weekly_draft("2026-W39").await.unwrap();
+        assert_eq!(
+            draft.by_area,
+            vec![AreaMinutes {
+                area_id: b.id.clone(),
+                minutes: 30
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn routine_linked_blocks_count_completions_in_the_completion_week() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let routine = store
+            .create_routine(&NewRoutine {
+                title: "Run".into(),
+                area_id: None,
+                direction_id: None,
+                kind: RoutineKind::Exercise,
+                cron: "0 7 * * MON".into(),
+                tz: None,
+                target_count: Some(3),
+                target_minutes: Some(30),
+            })
+            .await
+            .unwrap();
+        // L1 只做「建块时可选 routine_id」（PLAN-LIFEOS-LAYERS §3 L1）：
+        // fire 不建块，块由人或客户端带 routine_id 创建。
+        for _ in 0..4 {
+            store
+                .create_block(None, None, 30, Some(routine.id.as_str()))
+                .await
+                .unwrap();
+        }
+        let blocks = store.list_blocks().await.unwrap();
+        assert_eq!(blocks.len(), 4);
+        for (index, block) in blocks.iter().enumerate() {
+            assert_eq!(block.routine_id.as_deref(), Some(routine.id.as_str()));
+            assert_eq!(block.planned_minutes, 30);
+            let to = if index == 0 {
+                ScheduleBlockStatus::Skipped
+            } else {
+                ScheduleBlockStatus::Completed
+            };
+            store
+                .transition_block(&block.id, ScheduleBlockStatus::Started)
+                .await
+                .unwrap();
+            store.transition_block(&block.id, to).await.unwrap();
+            let at = if index == 1 {
+                "2026-09-28T00:00:00Z"
+            } else {
+                "2026-09-21T00:00:00Z"
+            };
+            crate::store::test_hooks::set_last_event_at(&store, "block", &block.id, at)
+                .await
+                .unwrap();
+        }
+        let draft = store.weekly_draft("2026-W39").await.unwrap();
+        assert_eq!(
+            draft.routines,
+            vec![RoutineDraftRow {
+                routine_id: routine.id.clone(),
+                fired: 0,
+                completed: 2
+            }]
+        );
+        assert_eq!(
+            store.weekly_draft("2026-W40").await.unwrap().routines[0].completed,
+            1
+        );
+        sqlx::query("UPDATE sin90_schedule_blocks SET routine_id = NULL, status = 'planned'")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(store.weekly_draft("2026-W39").await.unwrap(), draft);
     }
 }

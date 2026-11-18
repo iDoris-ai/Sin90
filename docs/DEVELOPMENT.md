@@ -46,6 +46,14 @@ GET       /proposals/{id}
 POST      /proposals/{id}/accept
 ```
 
+L1 编辑接口（直写需人类 actor key）：
+
+- `PATCH /directions/{id}`：`title`、`status`、`target_window`、`area_id`；状态必须沿现有状态机合法边迁移，否则返回 409。成功后发送包含完整快照的 `direction.updated`。
+- `PATCH /areas/{id}`：`current_state`、`ideal_state`；保留 `to` 状态切换参数。`GET /areas` 返回新增字段，修改发送 `area.updated`。
+- 上述可空字段省略表示保持原值，显式 `null` 表示清空。
+- `POST /schedule-blocks` 可传 `routine_id`（例行须存在且未 retired）；带 `routine_id` 的块完成后计入周草稿的 `routines[].completed`。例行 fire 不建块。review 例行保留创建复盘草稿的行为。
+- `block.transitioned` 携带 `routine_id`；周草稿按完成事件所在周统计关联时间块数量，包括此前周触发的例行。Area 归属取最新的方向创建或更新事件。
+
 ### 4. 自己的存储
 
 Sin90 不用内核记忆，数据在自己的 `data_dir`。**这是一个降低耦合的选择，不是将就** —— 它让 Sin90 整条绕开 ME-3d（内核记忆回调，全 ME-3 里最难的一刀）。
