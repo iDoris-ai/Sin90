@@ -33,6 +33,11 @@ pub(crate) async fn get_plan(tx: &mut Tx<'_>, id: &str) -> Result<Option<PeriodP
 }
 
 async fn check_relations(tx: &mut Tx<'_>, direction_id: &str, plan: &NewPeriodPlan) -> Result<()> {
+    if direction_id == crate::core::TRIAGE_DIRECTION_ID {
+        return Err(StoreError::Invalid(
+            "the triage direction is managed by Sin90 and has no plans".into(),
+        ));
+    }
     validate_plan(plan).map_err(StoreError::Invalid)?;
     let parent = match &plan.parent_id {
         Some(id) => get_plan(tx, id).await?,
@@ -274,6 +279,91 @@ mod tests {
             metric_target: None,
             routine_id: None,
             status: PlanStatus::Draft,
+        }
+    }
+
+    fn half(period: &str, parent: &str, status: PlanStatus) -> NewPeriodPlan {
+        NewPeriodPlan {
+            kind: PlanKind::Half,
+            period: period.into(),
+            parent_id: Some(parent.into()),
+            target: "half".into(),
+            metric: PlanMetric::None,
+            metric_target: None,
+            routine_id: None,
+            status,
+        }
+    }
+
+    #[tokio::test]
+    async fn nothing_new_or_revived_under_a_dropped_parent() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let d = store.create_direction("Run", "2026", None).await.unwrap();
+        let y = store
+            .create_period_plan(&d.id, &year("2026", "year"))
+            .await
+            .unwrap();
+        let h1 = store
+            .create_period_plan(&d.id, &half("2026-H1", &y.id, PlanStatus::Active))
+            .await
+            .unwrap();
+        let changed = store
+            .update_period_plan(
+                &y.id,
+                &PeriodPlanPatch {
+                    status: Some(PlanStatus::Dropped),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(changed.len(), 2);
+        // A new active child under the dropped year is refused.
+        let err = store
+            .create_period_plan(&d.id, &half("2026-H2", &y.id, PlanStatus::Active))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
+        // The cascaded child cannot be revived.
+        let err = store
+            .update_period_plan(
+                &h1.id,
+                &PeriodPlanPatch {
+                    status: Some(PlanStatus::Active),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
+        // A dropped child under it is still fine.
+        store
+            .create_period_plan(&d.id, &half("2026-H2", &y.id, PlanStatus::Dropped))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_triage_direction_has_no_plans_and_goals_are_checked_on_patch() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let err = store
+            .create_period_plan(crate::core::TRIAGE_DIRECTION_ID, &year("2026", "x"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
+        let d = store.create_direction("Run", "2026", None).await.unwrap();
+        for patch in [
+            crate::core::DirectionPatch {
+                goal_3y: Some(Some("  ".into())),
+                ..Default::default()
+            },
+            crate::core::DirectionPatch {
+                goal_from_year: Some(Some(-5)),
+                ..Default::default()
+            },
+        ] {
+            let err = store.update_direction(&d.id, &patch).await.unwrap_err();
+            assert!(matches!(err, StoreError::Invalid(_)), "{err:?}");
         }
     }
 

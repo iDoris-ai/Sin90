@@ -125,6 +125,11 @@ pub fn validate_parent(
         };
     }
     let parent = parent.ok_or("parent plan is required")?;
+    // A dropped parent keeps its subtree dropped: nothing new or revived
+    // under it (the cascade invariant of PLAN-LIFEOS-LAYERS §3 L2).
+    if parent.plan.status == PlanStatus::Dropped && plan.status != PlanStatus::Dropped {
+        return Err("parent plan is dropped; a child under it can only be dropped".into());
+    }
     let valid = matches!(
         (plan.kind, parent.plan.kind),
         (PlanKind::Half, PlanKind::Year)

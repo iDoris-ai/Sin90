@@ -1062,6 +1062,17 @@ impl Sin90Store {
         if patch.title.as_deref().is_some_and(|t| t.trim().is_empty()) {
             return Err(StoreError::Invalid("title must not be blank".into()));
         }
+        // Same rules as the SetDirectionGoal op, so both paths store the same shapes.
+        if let Some(Some(goal)) = &patch.goal_3y {
+            if goal.trim().is_empty() {
+                return Err(StoreError::Invalid("goal_3y must not be blank".into()));
+            }
+        }
+        if let Some(Some(year)) = patch.goal_from_year {
+            if !(1..=9997).contains(&year) {
+                return Err(StoreError::Invalid("goal_from_year must be 1..9997".into()));
+            }
+        }
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query("SELECT * FROM sin90_directions WHERE id = ?")
             .bind(id)

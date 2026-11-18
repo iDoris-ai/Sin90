@@ -472,6 +472,11 @@ fn validate_op(
             goal_3y,
             from_year,
         } => {
+            if direction_id == TRIAGE_DIRECTION_ID {
+                return Err(ProposalError::InvalidPeriodPlan(
+                    "the triage direction is managed by Sin90".into(),
+                ));
+            }
             if w.ctx.direction_status(direction_id).is_none() {
                 return Err(ProposalError::UnknownEntity {
                     entity: "direction",
@@ -490,6 +495,11 @@ fn validate_op(
             direction_id,
             plans,
         } => {
+            if direction_id == TRIAGE_DIRECTION_ID {
+                return Err(ProposalError::InvalidPeriodPlan(
+                    "the triage direction is managed by Sin90".into(),
+                ));
+            }
             if w.ctx.direction_status(direction_id).is_none() {
                 return Err(ProposalError::UnknownEntity {
                     entity: "direction",
