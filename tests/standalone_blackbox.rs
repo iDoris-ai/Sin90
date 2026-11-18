@@ -489,3 +489,64 @@ async fn l3_progress_real_http_and_persistent_settings() {
     drop(server);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[tokio::test]
+async fn l4_review_settings_persist_and_validate_over_http() {
+    let dir = std::env::temp_dir().join(format!("sin90-l4-blackbox-{}", sin90::core::ulid()));
+    let client = reqwest::Client::new();
+    let server = Server::spawn(&dir).await;
+    let url = format!("{}/settings/review", server.base());
+    let defaults: serde_json::Value = client.get(&url).send().await.unwrap().json().await.unwrap();
+    assert_eq!(
+        defaults,
+        serde_json::json!({"auto":true,"cadence":"weekly","weekday":7,"hour":18})
+    );
+    let setting = serde_json::json!({"auto":false,"cadence":"monthly","weekday":1,"hour":9});
+    assert_eq!(
+        client
+            .put(&url)
+            .json(&setting)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    let response = client
+        .put(&url)
+        .header("x-sin90-actor-key", "blackbox-human-key-0123456789abcdef")
+        .json(&setting)
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    for bad in [
+        serde_json::json!({"auto":true,"cadence":"biweekly","weekday":1,"hour":9}),
+        serde_json::json!({"auto":true,"cadence":"weekly","weekday":0,"hour":24}),
+    ] {
+        assert_eq!(
+            client
+                .put(&url)
+                .header("x-sin90-actor-key", "blackbox-human-key-0123456789abcdef")
+                .json(&bad)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+    }
+    drop(server);
+    let restarted = Server::spawn(&dir).await;
+    let actual: serde_json::Value = client
+        .get(format!("{}/settings/review", restarted.base()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(actual, setting);
+    drop(restarted);
+    std::fs::remove_dir_all(dir).unwrap();
+}

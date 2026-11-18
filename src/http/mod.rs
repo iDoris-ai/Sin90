@@ -28,6 +28,7 @@ pub mod ai_runs;
 mod ai_summarize;
 mod period_plans;
 mod progress;
+mod review_settings;
 pub mod state;
 
 use axum::body::Bytes;
@@ -186,6 +187,10 @@ pub fn router(state: Sin90State, mounted: bool) -> axum::Router {
         .route("/reviews/{id}", get(get_review).patch(update_review))
         .route("/reviews/{id}/finalize", post(finalize_review))
         .route("/review/weekly/draft", get(weekly_review_draft))
+        .route(
+            "/settings/review",
+            get(review_settings::get).put(review_settings::put),
+        )
         .route("/settings/ai", get(get_ai_settings).put(put_ai_settings))
         // New (T5.2.1, design §11.4 公共): NOT under `/_a24/*` — registered in
         // both standalone and mounted mode ("standalone 模式同样注册（port

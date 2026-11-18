@@ -373,6 +373,20 @@ fn validate_review_period(kind: ReviewKind, period: &str) -> Result<String> {
                 "weekly review period must be an ISO-8601 week like 2026-W39, got {period:?}"
             ))
         }),
+        ReviewKind::Monthly | ReviewKind::Quarterly | ReviewKind::Yearly => {
+            let pk = match kind {
+                ReviewKind::Monthly => crate::core::PlanKind::Month,
+                ReviewKind::Quarterly => crate::core::PlanKind::Quarter,
+                _ => crate::core::PlanKind::Year,
+            };
+            if crate::core::period_plan::valid_period(pk, period) {
+                Ok(period.to_owned())
+            } else {
+                Err(StoreError::Invalid(
+                    "period does not match review kind".into(),
+                ))
+            }
+        }
         ReviewKind::Rhythm => {
             let trimmed = period.trim();
             if trimmed.is_empty() {
@@ -739,7 +753,7 @@ async fn allocate_area_slug(tx: &mut Tx<'_>, title: &str) -> Result<String> {
 /// (spec.md M3 "outbox": `dedup_key = routine:<id>`, note the colon — the
 /// KERNEL key inside `desired.key` uses a dot instead, see
 /// [`routine_outbox_upsert_desired`]/[`routine_outbox_delete_desired`]).
-fn routine_dedup_key(id: &str) -> String {
+pub(super) fn routine_dedup_key(id: &str) -> String {
     format!("routine:{id}")
 }
 
@@ -778,7 +792,7 @@ pub(crate) fn routine_kernel_key(id: &str) -> String {
 /// `{key: "routine.<id>", spec: {cron, tz}, enabled}`. `enabled` is `true`
 /// for `active`, `false` for `paused` — `retired` never calls this, it calls
 /// [`routine_outbox_delete_desired`] instead.
-fn routine_outbox_upsert_desired(
+pub(super) fn routine_outbox_upsert_desired(
     id: &str,
     cron: &str,
     tz: &str,
@@ -856,7 +870,7 @@ pub struct OutboxRow {
 ///   version that has since moved on; see those methods' own docs for the
 ///   failure mode this closes (a v1 kernel call succeeding AFTER the row was
 ///   already collapsed onto v2 must not mark v2 `done`).
-async fn upsert_outbox(
+pub(super) async fn upsert_outbox(
     tx: &mut Tx<'_>,
     kind: &str,
     dedup_key: &str,
@@ -2883,12 +2897,18 @@ impl Sin90Store {
         // fallback only matters for a direct test/store caller that skips
         // that check).
         let mut auto_review = None;
-        if kind == "review" {
-            if let Some(week) = crate::core::iso_week_of(scheduled_for) {
-                let draft = crate::store::weekly_draft::weekly_draft_on(&mut tx, &week).await?;
-                let body = crate::store::render_weekly_draft_markdown(&draft);
-                auto_review =
-                    insert_weekly_review_draft_if_absent(&mut tx, &week, &body, &now).await?;
+        if kind == "review" && (status == "active" || trigger == FireTrigger::RunNow) {
+            if let Some(day) = super::reviews::local_day(scheduled_for) {
+                let week = super::reviews::review_week(day);
+                if trigger == FireTrigger::RunNow
+                    || super::reviews::should_draft(&mut tx, &routine_id, day).await?
+                {
+                    let draft = crate::store::weekly_draft::weekly_draft_on(&mut tx, &week).await?;
+                    let body = crate::store::render_weekly_draft_markdown(&draft);
+                    auto_review =
+                        insert_weekly_review_draft_if_absent(&mut tx, &week, &body, &now).await?;
+                    super::reviews::draft_closed_periods(&mut tx, day, &now).await?;
+                }
             }
         }
 
@@ -3595,6 +3615,14 @@ impl Sin90Store {
                 "review_id": id, "kind": kind_str, "period": period, "status": "draft",
                 "source": "human",
             }),
+            &now,
+        )
+        .await?;
+        super::reviews::draft_closed_periods(
+            &mut tx,
+            jiff::Timestamp::now()
+                .to_zoned(jiff::tz::TimeZone::system())
+                .date(),
             &now,
         )
         .await?;
@@ -5940,7 +5968,12 @@ mod review_tests {
         assert_eq!(one[0].period, "2026-09-24");
 
         let all = store.list_reviews(None, None).await.unwrap();
-        assert_eq!(all.len(), 3);
+        assert_eq!(
+            all.iter()
+                .filter(|r| matches!(r.kind, ReviewKind::Daily | ReviewKind::Weekly))
+                .count(),
+            3
+        );
     }
 }
 
@@ -7678,7 +7711,7 @@ mod review_routine_tests {
             .record_routine_fire(
                 "fire-1",
                 &format!("routine.{}", routine.id),
-                "2026-09-21T18:00:00Z", // 2026-W39, Monday
+                "2026-09-27T12:00:00Z", // Sunday, 2026-W39
                 FireTrigger::Tick,
             )
             .await
@@ -7687,7 +7720,7 @@ mod review_routine_tests {
             .record_routine_fire(
                 "fire-2",
                 &format!("routine.{}", routine.id),
-                "2026-09-24T18:00:00Z", // still 2026-W39, Thursday
+                "2026-09-27T13:00:00Z", // same Sunday, 2026-W39
                 FireTrigger::Tick,
             )
             .await
@@ -7724,7 +7757,7 @@ mod review_routine_tests {
             .record_routine_fire(
                 "fire-1",
                 &format!("routine.{}", routine.id),
-                "2026-09-21T18:00:00Z", // 2026-W39
+                "2026-09-27T12:00:00Z", // 2026-W39
                 FireTrigger::Tick,
             )
             .await
@@ -7733,7 +7766,7 @@ mod review_routine_tests {
             .record_routine_fire(
                 "fire-2",
                 &format!("routine.{}", routine.id),
-                "2026-09-28T18:00:00Z", // 2026-W40 — the FOLLOWING week
+                "2026-10-04T12:00:00Z", // 2026-W40 — the FOLLOWING week
                 FireTrigger::Tick,
             )
             .await
@@ -7768,7 +7801,7 @@ mod review_routine_tests {
             .record_routine_fire(
                 "fire-retry",
                 &format!("routine.{}", routine.id),
-                "2026-09-21T18:00:00Z",
+                "2026-09-27T12:00:00Z",
                 FireTrigger::Tick,
             )
             .await
@@ -7786,7 +7819,7 @@ mod review_routine_tests {
             .record_routine_fire(
                 "fire-retry",
                 &format!("routine.{}", routine.id),
-                "2026-09-21T18:00:00Z",
+                "2026-09-27T12:00:00Z",
                 FireTrigger::Tick,
             )
             .await
@@ -7824,7 +7857,7 @@ mod review_routine_tests {
             .record_routine_fire(
                 "fire-1",
                 &format!("routine.{}", routine.id),
-                "2026-09-21T18:00:00Z",
+                "2026-09-27T12:00:00Z",
                 FireTrigger::Tick,
             )
             .await
@@ -7862,7 +7895,7 @@ mod review_routine_tests {
             .record_routine_fire(
                 "fire-1",
                 &format!("routine.{}", routine.id),
-                "2026-09-21T18:00:00Z",
+                "2026-09-27T12:00:00Z",
                 FireTrigger::Tick,
             )
             .await
@@ -7949,7 +7982,7 @@ mod review_routine_tests {
             .record_routine_fire(
                 "fire-1",
                 &format!("routine.{}", routine.id),
-                "2026-09-24T18:00:00Z", // 2026-W39, after the fixture events above
+                "2026-09-27T13:00:00Z", // 2026-W39, after the fixture events above
                 FireTrigger::Tick,
             )
             .await
@@ -7993,28 +8026,40 @@ mod review_routine_tests {
     /// (or back to a separate pre-`tx` `self.pool()` checkout, the ORIGINAL
     /// bug) — this test goes red (`fired 0` stored vs. `fired 1` fresh).
     ///
-    /// H1 (2026-09-26 review round 2): `scheduled_for` is `now_iso8601()`
-    /// (not a hand-picked `2026-09-21T18:00:00Z`) and the target week is
-    /// DERIVED from it (`iso_week_of`), not hardcoded `"2026-W39"` — a fixed
-    /// date/week pair goes stale (and this test would start asserting
-    /// against a week that no longer contains "now") the moment real
-    /// calendar time passes it, which for `2026-W39` was already true past
-    /// 2026-09-28. Nothing about what this test actually checks (the
-    /// auto-draft's stored body vs. a fresh `weekly_draft` render) depends
-    /// on which week it runs in.
+    /// Schedule the review on Sunday of the current UTC event week: Sunday
+    /// reviews that week, whereas Monday through Saturday review the prior
+    /// week. The fire event itself is stamped with server time, not with
+    /// `scheduled_for`, so it must remain inside the reviewed week.
     #[tokio::test]
     async fn review_routine_auto_draft_fired_count_matches_a_fresh_weekly_draft_call() {
         let store = new_store().await;
         let routine = create_review_routine(&store).await;
 
         let now = crate::core::now_iso8601();
-        let week = crate::core::iso_week_of(&now)
-            .expect("now_iso8601() is always a fixed ISO-8601 timestamp");
+        let week = crate::core::iso_week_of(&now).unwrap();
+        let (start, _) = crate::core::iso_week_bounds(&week).unwrap();
+        let sunday = start[..10]
+            .parse::<jiff::civil::Date>()
+            .unwrap()
+            .checked_add(jiff::Span::new().days(6))
+            .unwrap();
+        let scheduled_for = sunday
+            .at(6, 0, 0, 0)
+            .to_zoned(jiff::tz::TimeZone::system())
+            .unwrap()
+            .timestamp()
+            .to_string();
+        assert_eq!(
+            crate::store::reviews::review_week(
+                crate::store::reviews::local_day(&scheduled_for).unwrap()
+            ),
+            week
+        );
         let outcome = store
             .record_routine_fire(
                 "fire-1",
                 &format!("routine.{}", routine.id),
-                &now,
+                &scheduled_for,
                 FireTrigger::Tick,
             )
             .await
@@ -8055,7 +8100,7 @@ mod review_routine_tests {
             .record_routine_fire(
                 "fire-1",
                 &format!("routine.{}", routine.id),
-                "2026-09-21T18:00:00Z",
+                "2026-09-27T12:00:00Z",
                 FireTrigger::Tick,
             )
             .await

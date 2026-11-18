@@ -3863,7 +3863,15 @@ mod review {
         }
 
         let all = body_json(app.clone().oneshot(get_req("/reviews")).await.unwrap()).await;
-        assert_eq!(all["reviews"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            all["reviews"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|r| matches!(r["kind"].as_str(), Some("daily" | "weekly")))
+                .count(),
+            3
+        );
 
         let daily = body_json(
             app.clone()

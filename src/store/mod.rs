@@ -18,6 +18,7 @@ pub mod packs;
 pub(crate) mod period_plans;
 pub mod progress;
 pub mod repo;
+pub mod reviews;
 pub mod weekly_draft;
 
 pub use ai_port::{AiCallSummary, AiReader};
@@ -148,12 +149,14 @@ impl Sin90Store {
             .max_connections(2)
             .connect_with(options.pragma("query_only", "ON"))
             .await?;
-        Ok(Self {
+        let store = Self {
             pool,
             ai_pool,
             data_dir: path.parent().map(|p| p.to_path_buf()),
             notify: std::sync::Arc::new(tokio::sync::Notify::new()),
-        })
+        };
+        store.get_review_settings().await?;
+        Ok(store)
     }
 
     /// In-memory database for tests. T5.1.1 (design §11.5 v2.1 M1): a
