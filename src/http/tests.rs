@@ -10665,3 +10665,111 @@ async fn l2a_http_drop_cascades_recursively_preserves_terminal_rows_and_emits_ea
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sin90_events WHERE entity = 'period_plan' AND kind = 'updated' AND to_state = 'dropped'").fetch_one(store.pool()).await.unwrap();
     assert_eq!(count, 3);
 }
+
+#[tokio::test]
+async fn l3_http_progress_and_settings_validation() {
+    let (app, sink, store) = test_app_with_store().await;
+    let d = store.create_direction("Run", "2026", None).await.unwrap();
+    let year = l2a_create_plan(&app, &d.id, "year", "2026", None).await;
+    let q = l2a_create_plan(&app, &d.id, "quarter", "2026-Q1", year["id"].as_str()).await;
+    let month = l2a_create_plan(&app, &d.id, "month", "2026-03", q["id"].as_str()).await;
+    let response = app
+        .clone()
+        .oneshot(human_req(
+            "PATCH",
+            &format!("/period-plans/{}", month["id"].as_str().unwrap()),
+            json!({"metric":"count","metric_target":31}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .clone()
+        .oneshot(get_req(&format!(
+            "/progress?direction_id={}&at=2026-03-15",
+            d.id
+        )))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    let m = body["progress"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["plan_id"] == month["id"])
+        .unwrap();
+    assert_eq!(m["status"], "at_risk");
+    assert_eq!(m["miss_streak"], 3);
+    assert_eq!(m["actual"], 0);
+    assert_eq!(m["expected"], 15.0);
+    for query in [
+        format!("/progress?direction_id={}&at=2026-02-30", d.id),
+        "/progress?at=2026-03-15".into(),
+    ] {
+        assert!(app
+            .clone()
+            .oneshot(get_req(&query))
+            .await
+            .unwrap()
+            .status()
+            .is_client_error());
+    }
+    assert_eq!(
+        app.clone()
+            .oneshot(get_req(&format!("/progress?direction_id={}", d.id)))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let s = app
+        .clone()
+        .oneshot(get_req("/settings/progress"))
+        .await
+        .unwrap();
+    assert_eq!(body_json(s).await["streak_weeks"], 3);
+    assert_eq!(
+        app.clone()
+            .oneshot(automation_req(
+                "PUT",
+                "/settings/progress",
+                json!({"streak_weeks":2})
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    for value in [
+        json!({"streak_weeks":0}),
+        json!({"streak_weeks":-1}),
+        json!({"streak_weeks":2,"other":true}),
+    ] {
+        assert_eq!(
+            app.clone()
+                .oneshot(human_req("PUT", "/settings/progress", value))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let s = app
+        .clone()
+        .oneshot(human_req(
+            "PUT",
+            "/settings/progress",
+            json!({"streak_weeks":4}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(s.status(), StatusCode::OK);
+    assert_eq!(body_json(s).await["streak_weeks"], 4);
+    assert!(sink
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(k, v)| k == "setting.changed" && v["key"] == "progress.streak_weeks"));
+}
