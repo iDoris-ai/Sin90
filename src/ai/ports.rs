@@ -581,6 +581,18 @@ pub trait AiReadModel: SettingsRead {
     /// numbers are computed in one read). `Err(ReadError)` for a malformed
     /// week label, mirroring `Sin90Store::weekly_draft`'s own
     /// `StoreError::Invalid`.
+    fn review_draft(
+        &self,
+        review: &crate::core::Review,
+    ) -> impl Future<Output = Result<SummarizeDraft, ReadError>> + Send {
+        async { self.weekly_draft(&review.period).await }
+    }
+    fn yearly_plan_ops(
+        &self,
+        _period: &str,
+    ) -> impl Future<Output = Result<Vec<crate::core::Sin90Op>, ReadError>> + Send {
+        async { Ok(Vec::new()) }
+    }
     fn weekly_draft(
         &self,
         iso_week: &str,

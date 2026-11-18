@@ -63,11 +63,11 @@ fn iso_week(day: Date) -> String {
     format!("{:04}-W{:02}", iso.year(), iso.week())
 }
 
-struct Completion {
-    day: Date,
-    direction: String,
-    routine: Option<String>,
-    minutes: Option<i64>,
+pub(super) struct Completion {
+    pub day: Date,
+    pub direction: String,
+    pub routine: Option<String>,
+    pub minutes: Option<i64>,
 }
 fn actual(p: &PeriodPlan, events: &[Completion], start: Date, end: Date) -> i64 {
     events
@@ -83,6 +83,46 @@ fn actual(p: &PeriodPlan, events: &[Completion], start: Date, end: Date) -> i64 
             _ => None,
         })
         .sum()
+}
+
+/// Shared calendar-day completion replay for progress and calendar reviews.
+pub(super) fn completion_from_event(
+    row: &sqlx::sqlite::SqliteRow,
+    tasks: &mut BTreeMap<String, String>,
+    tz: &TimeZone,
+) -> Result<Option<Completion>> {
+    let entity: String = row.get("entity");
+    let id: String = row.get("entity_id");
+    let kind: String = row.get("kind");
+    let payload: Value = serde_json::from_str(&row.get::<String, _>("payload"))?;
+    if let ("task", Some(d)) = (entity.as_str(), payload.get("direction_id")) {
+        tasks.insert(id.clone(), d.as_str().unwrap_or("").into());
+    }
+    let state: Option<String> = row.get("to_state");
+    if kind != "transitioned"
+        || !((entity == "block" && state.as_deref() == Some("completed"))
+            || (entity == "task" && state.as_deref() == Some("done")))
+    {
+        return Ok(None);
+    }
+    let timestamp: Timestamp = row
+        .get::<String, _>("at")
+        .parse()
+        .map_err(|e| StoreError::Internal(format!("invalid event timestamp: {e}")))?;
+    Ok(Some(Completion {
+        day: timestamp.to_zoned(tz.clone()).date(),
+        direction: if entity == "task" {
+            tasks.get(&id).cloned().unwrap_or_default()
+        } else {
+            payload["direction_id"].as_str().unwrap_or("").into()
+        },
+        routine: payload["routine_id"].as_str().map(str::to_owned),
+        minutes: if entity == "block" {
+            Some(payload["minutes"].as_i64().unwrap_or(0))
+        } else {
+            None
+        },
+    }))
 }
 
 impl Sin90Store {
@@ -169,38 +209,11 @@ impl Sin90Store {
             if entity == "routine" && matches!(kind.as_str(), "created" | "updated") {
                 routines.insert(id.clone(), payload.clone());
             }
-            if let ("task", Some(d)) = (entity.as_str(), payload.get("direction_id")) {
-                tasks.insert(id.clone(), d.as_str().unwrap_or("").into());
+            if let Some(completion) = completion_from_event(&row, &mut tasks, &tz)? {
+                if completion.day <= at {
+                    completions.push(completion);
+                }
             }
-            let state: Option<String> = row.get("to_state");
-            if kind != "transitioned"
-                || !((entity == "block" && state.as_deref() == Some("completed"))
-                    || (entity == "task" && state.as_deref() == Some("done")))
-            {
-                continue;
-            }
-            let timestamp: Timestamp = row
-                .get::<String, _>("at")
-                .parse()
-                .map_err(|e| StoreError::Internal(format!("invalid event timestamp: {e}")))?;
-            let day = timestamp.to_zoned(tz.clone()).date();
-            if day > at {
-                continue;
-            }
-            completions.push(Completion {
-                day,
-                direction: if entity == "task" {
-                    tasks.get(&id).cloned().unwrap_or_default()
-                } else {
-                    payload["direction_id"].as_str().unwrap_or("").into()
-                },
-                routine: payload["routine_id"].as_str().map(str::to_owned),
-                minutes: if entity == "block" {
-                    Some(payload["minutes"].as_i64().unwrap_or(0))
-                } else {
-                    None
-                },
-            });
         }
         let plans: Vec<_> = plans
             .into_values()

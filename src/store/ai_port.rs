@@ -568,6 +568,24 @@ impl AiReadModel for AiReader {
     /// (§11.5 v2.1 M1), so there is nothing to commit — the transaction is
     /// always rolled back at the end, same "this is a read" posture
     /// `AiSink::precheck`'s own final `tx.rollback()` already has.
+    async fn review_draft(
+        &self,
+        review: &crate::core::Review,
+    ) -> Result<SummarizeDraft, ReadError> {
+        if review.kind == crate::core::ReviewKind::Weekly {
+            return self.weekly_draft(&review.period).await;
+        }
+        let mut tx = self.0.begin().await.map_err(rerr)?;
+        crate::store::reviews::calendar_draft(&mut tx, review.kind, &review.period)
+            .await
+            .map_err(rerr)
+    }
+    async fn yearly_plan_ops(&self, period: &str) -> Result<Vec<crate::core::Sin90Op>, ReadError> {
+        let mut tx = self.0.begin().await.map_err(rerr)?;
+        crate::store::reviews::yearly_plans(&mut tx, period)
+            .await
+            .map_err(rerr)
+    }
     async fn weekly_draft(&self, iso_week: &str) -> Result<SummarizeDraft, ReadError> {
         let mut conn = self.0.acquire().await.map_err(rerr)?;
         let mut tx = conn.begin().await.map_err(rerr)?;
@@ -715,10 +733,25 @@ fn allowed_ops(cap: Capability, ops: &[Sin90Op]) -> Result<(), SinkError> {
     if ops.is_empty() {
         return Err(SinkError::Invalid("proposal has no ops".into()));
     }
+    if cap == Capability::Summarize
+        && ops
+            .iter()
+            .any(|op| matches!(op, Sin90Op::UpsertPeriodPlans { .. }))
+        && !ops
+            .iter()
+            .any(|op| matches!(op, Sin90Op::DraftReviewBody { .. }))
+    {
+        return Err(SinkError::Invalid(
+            "annual plans require a review body in the same proposal".into(),
+        ));
+    }
     let ok = |op: &Sin90Op| -> bool {
         match cap {
             Capability::Classify => matches!(op, Sin90Op::AssignTaskDirection { .. }),
-            Capability::Summarize => matches!(op, Sin90Op::DraftReviewBody { .. }),
+            Capability::Summarize => matches!(
+                op,
+                Sin90Op::DraftReviewBody { .. } | Sin90Op::UpsertPeriodPlans { .. }
+            ),
             Capability::Propose => matches!(
                 op,
                 Sin90Op::CarryOverTask { .. }
@@ -789,6 +822,27 @@ async fn dry_run(
     // string `reject_proposal`'s own resolution would derive once the row
     // this call is about to insert exists.
     let capability_source = cap.as_str();
+    if cap == Capability::Summarize
+        && ops
+            .iter()
+            .any(|op| matches!(op, Sin90Op::UpsertPeriodPlans { .. }))
+    {
+        for op in ops {
+            if let Sin90Op::DraftReviewBody { review_id, .. } = op {
+                let kind: Option<String> =
+                    sqlx::query_scalar("SELECT kind FROM sin90_reviews WHERE id=?")
+                        .bind(review_id)
+                        .fetch_optional(&mut **tx)
+                        .await
+                        .map_err(|e| SinkError::Store(e.to_string()))?;
+                if kind.as_deref() != Some("yearly") {
+                    return Err(SinkError::Invalid(
+                        "period plan updates require a yearly review".into(),
+                    ));
+                }
+            }
+        }
+    }
     let snapshot = build_snapshot(tx, ops)
         .await
         .map_err(|e| SinkError::Store(e.to_string()))?;

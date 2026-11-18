@@ -103,6 +103,7 @@ async fn run_standalone(
         Some(dir) => Sin90Store::open(&dir.join("sin90.db")).await?,
         None => Sin90Store::open_memory().await?,
     };
+    store.get_review_settings().await?;
     let state = Sin90State::new(store, Arc::new(NullEventSink), keys);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     tracing::info!(port, "sin90: standalone listening");

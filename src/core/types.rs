@@ -165,6 +165,9 @@ pub enum Energy {
 pub enum ReviewKind {
     Daily,
     Weekly,
+    Monthly,
+    Quarterly,
+    Yearly,
     Rhythm,
 }
 

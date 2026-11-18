@@ -207,7 +207,9 @@ fn summarize_input_error(e: SummarizeInputError) -> Response {
         SummarizeInputError::UnsupportedKind(kind) => error_response(
             StatusCode::BAD_REQUEST,
             "unsupported_kind",
-            &format!("summarize only supports weekly reviews, got {kind:?}"),
+            &format!(
+                "summarize supports weekly, monthly, quarterly and yearly reviews, got {kind:?}"
+            ),
         ),
         SummarizeInputError::NotDraft(id, status) => error_response(
             StatusCode::CONFLICT,
@@ -243,7 +245,11 @@ pub(crate) async fn dedup_summarize(
     let pending = store.list_pending_proposals().await?;
     let mut drafts = Vec::new();
     for p in pending {
-        if let [Sin90Op::DraftReviewBody { review_id: rid, .. }] = p.ops.as_slice() {
+        if let Some(Sin90Op::DraftReviewBody { review_id: rid, .. }) = p
+            .ops
+            .iter()
+            .find(|op| matches!(op, Sin90Op::DraftReviewBody { .. }))
+        {
             if rid == review_id {
                 drafts.push(ProposalDraft {
                     id: p.id,
@@ -292,16 +298,20 @@ pub(crate) async fn dedup_summarize(
     let rejected = store
         .list_rejected_ops(Capability::Summarize.as_str())
         .await?;
-    let Some((latest_hash, proposed_at)) =
-        rejected.iter().rev().find_map(|r| match r.ops.as_slice() {
-            [Sin90Op::DraftReviewBody {
+    let Some((latest_hash, proposed_at)) = rejected.iter().rev().find_map(|r| {
+        match r
+            .ops
+            .iter()
+            .find(|op| matches!(op, Sin90Op::DraftReviewBody { .. }))
+        {
+            Some(Sin90Op::DraftReviewBody {
                 review_id: rid,
                 base_body_sha256,
                 ..
-            }] if rid == review_id => Some((base_body_sha256.clone(), r.proposed_at.clone())),
+            }) if rid == review_id => Some((base_body_sha256.clone(), r.proposed_at.clone())),
             _ => None,
-        })
-    else {
+        }
+    }) else {
         return Ok(None);
     };
     let current = store.get_review(review_id).await?;
@@ -317,10 +327,7 @@ pub(crate) async fn dedup_summarize(
     // week's data changed, it must not silently keep the suppression
     // forever; the safer failure is showing the human a proposal again,
     // not re-creating the exact permanent lock this leg exists to close.
-    let week_changed = match store
-        .week_activity_since(&current.period, &proposed_at)
-        .await
-    {
+    let week_changed = match store.review_activity_since(&current, &proposed_at).await {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(

@@ -511,6 +511,58 @@ pub fn parse_summarize_reply(
         .map_err(|_e| "bad_output")
 }
 
+/// Annual model output may adjust only the proposed targets, within the existing
+/// next-two-year scaffold. Facts still pass the normal narrative number gate.
+fn parse_annual_reply(
+    text: &str,
+    fs: &[Fact],
+    titles: &[String],
+    fallback: &[Sin90Op],
+) -> Result<(Option<String>, Vec<Sin90Op>), &'static str> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct AnnualReply {
+        narrative: String,
+        #[serde(default)]
+        year_plans: Option<Vec<Sin90Op>>,
+    }
+    let reply: AnnualReply =
+        serde_json::from_str(strip_json_fence(text)).map_err(|_| "bad_output")?;
+    let narrative = fill_narrative(&reply.narrative, fs, titles).map_err(|_| "bad_output")?;
+    let plans = reply.year_plans.unwrap_or_else(|| fallback.to_vec());
+    if plans.len() != fallback.len() {
+        return Err("bad_output");
+    }
+    for (candidate, original) in plans.iter().zip(fallback) {
+        let (
+            Sin90Op::UpsertPeriodPlans {
+                direction_id: cd,
+                plans: cp,
+            },
+            Sin90Op::UpsertPeriodPlans {
+                direction_id: od,
+                plans: op,
+            },
+        ) = (candidate, original)
+        else {
+            return Err("bad_output");
+        };
+        if cd != od || cp.len() != op.len() {
+            return Err("bad_output");
+        }
+        for (c, o) in cp.iter().zip(op) {
+            crate::core::validate_plan(c).map_err(|_| "bad_output")?;
+            let mut shape = c.clone();
+            shape.target = o.target.clone();
+            shape.metric_target = o.metric_target;
+            if shape != *o {
+                return Err("bad_output");
+            }
+        }
+    }
+    Ok((Some(narrative), plans))
+}
+
 // ---------------------------------------------------------------- rationale
 
 fn build_rationale(engine: Engine, produced_narrative: bool) -> String {
@@ -548,7 +600,10 @@ pub async fn select_review<R: AiReadModel>(
         .await
         .map_err(|e| SummarizeInputError::ReadFailed(e.to_string()))?
         .ok_or_else(|| SummarizeInputError::UnknownReview(review_id.to_string()))?;
-    if review.kind != ReviewKind::Weekly {
+    if !matches!(
+        review.kind,
+        ReviewKind::Weekly | ReviewKind::Monthly | ReviewKind::Quarterly | ReviewKind::Yearly
+    ) {
         return Err(SummarizeInputError::UnsupportedKind(review.kind));
     }
     if review.status != ReviewStatus::Draft {
@@ -612,12 +667,20 @@ where
     S: AiSink,
     R: AiReadModel,
 {
-    let draft = match read.weekly_draft(&review.period).await {
+    let draft = match read.review_draft(review).await {
         Ok(d) => d,
         Err(e) => {
             tracing::warn!(error = %e, review_id = %review.id, "summarize: weekly_draft read failed");
             return SummarizeItemResult::ReadFailed(e.to_string());
         }
+    };
+    let yearly_ops = if review.kind == ReviewKind::Yearly {
+        match read.yearly_plan_ops(&review.period).await {
+            Ok(ops) => ops,
+            Err(e) => return SummarizeItemResult::ReadFailed(e.to_string()),
+        }
+    } else {
+        Vec::new()
     };
     let fs = facts(&draft);
     let facts_md = render_facts(&draft.week, &fs);
@@ -635,10 +698,14 @@ where
         return SummarizeItemResult::Skipped;
     }
 
-    let titles = read.done_titles(&review.period).await.unwrap_or_else(|e| {
+    let titles = if review.kind == ReviewKind::Weekly {
+        read.done_titles(&review.period).await.unwrap_or_else(|e| {
         tracing::warn!(error = %e, review_id = %review.id, "summarize: done_titles read failed, treating as empty");
         Vec::new()
-    });
+    })
+    } else {
+        Vec::new()
+    };
     let base_body_sha256 = body_sha256(&review.body);
 
     let settings = read.settings().await.unwrap_or_else(|e| {
@@ -652,7 +719,14 @@ where
     let titles_for_build = titles.clone();
     let fs_for_parse = fs.clone();
     let titles_for_parse = titles.clone();
-    let outcome: Outcome<Option<String>> = run_item(
+    let annual = review.kind == ReviewKind::Yearly;
+    let review_context = format!(
+        "Review kind: {:?}; calendar period: {}",
+        review.kind, review.period
+    );
+    let plans_for_build = yearly_ops.clone();
+    let plans_for_parse = yearly_ops.clone();
+    let outcome: Outcome<(Option<String>, Vec<Sin90Op>)> = run_item(
         run_id,
         Capability::Summarize,
         &steps,
@@ -660,9 +734,20 @@ where
         model,
         sink,
         read,
-        move |engine| build_summarize_request(&fs_for_build, &titles_for_build, engine),
+        move |engine| {
+            let mut request = build_summarize_request(&fs_for_build, &titles_for_build, engine);
+            request.messages.push(ModelMessage {role: Role::User, content: review_context.clone()});
+            if annual {
+                request.messages.push(ModelMessage { role: Role::User, content: format!(
+                    "Annual review: use the supplied results to revise next two years and next year half/quarter targets. Return optional year_plans containing this exact scaffold, changing only target and metric_target. These are future suggestions, never facts. Scaffold: {}", serde_json::to_string(&plans_for_build).expect("serializable ops")) });
+                request.schema.get_mut("properties").and_then(Value::as_object_mut).expect("schema properties").insert("year_plans".into(),json!({"type":"array","items":{"type":"object"}}));
+                request.max_tokens = 4096;
+            }
+            request
+        },
         move |reply: &ModelReply| {
-            parse_summarize_reply(&reply.text, &fs_for_parse, &titles_for_parse)
+            if annual { parse_annual_reply(&reply.text,&fs_for_parse,&titles_for_parse,&plans_for_parse) }
+            else { parse_summarize_reply(&reply.text, &fs_for_parse, &titles_for_parse).map(|n| (n,Vec::new())) }
         },
         || None, // summarize has no ReflexDecisive step (§11.3.3)
         // L3-equivalent (design §11.4.2/§11.3.3): reflex ALWAYS has an
@@ -671,18 +756,29 @@ where
         // the OUTER `Some` means "decisive", the inner `None` means "no
         // narrative" (mirrors `ai::propose`'s own `Some(ProposeDecision {
         // .. })` always-decisive reflex fallback).
-        || Some(None::<String>),
+        || Some((None::<String>,yearly_ops.clone())),
         crate::core::now_iso8601,
         crate::core::ulid,
     )
     .await;
 
     match outcome {
-        Outcome::Produced { value, engine, rec } => {
-            let produced_narrative = value.is_some();
-            let body = compose_body(&facts_md, value.as_deref());
+        Outcome::Produced {
+            value: (value, yearly_ops),
+            engine,
+            rec,
+        } => {
+            // Annual fallback still proposes future plans when the facts body
+            // already matches. Give that proposal a meaningful review update
+            // so DraftReviewBody retains its no-change and CAS checks.
+            let narrative = value.as_deref().or_else(|| {
+                (!yearly_ops.is_empty())
+                    .then_some("建议沿用年度目标，并将下一年度目标拆分为半年和季度计划。")
+            });
+            let produced_narrative = narrative.is_some();
+            let body = compose_body(&facts_md, narrative);
             let new_hash = body_sha256(&body);
-            if new_hash == base_body_sha256 {
+            if new_hash == base_body_sha256 && yearly_ops.is_empty() {
                 // §11.4.2's "比较并交换": identical body -> no proposal, but
                 // the decision itself was real (`ok = 1`, R6's own posture —
                 // `run_item` never writes a `Produced` row itself, §11.3.5's
@@ -694,11 +790,15 @@ where
             }
             let draft_op = ProposalDraft {
                 id: format!("ai-summarize-{}", crate::core::ulid()),
-                ops: vec![Sin90Op::DraftReviewBody {
-                    review_id: review.id.clone(),
-                    base_body_sha256: base_body_sha256.clone(),
-                    body,
-                }],
+                ops: {
+                    let mut ops = vec![Sin90Op::DraftReviewBody {
+                        review_id: review.id.clone(),
+                        base_body_sha256: base_body_sha256.clone(),
+                        body,
+                    }];
+                    ops.extend(yearly_ops);
+                    ops
+                },
                 rationale: Some(build_rationale(engine, produced_narrative)),
             };
             let draft_id = draft_op.id.clone();
@@ -1565,7 +1665,10 @@ mod tests {
         ] {
             store.transition_task(&task.id, to).await.unwrap();
         }
-        crate::store::test_hooks::set_last_event_at(&store, "task", &task.id, &now)
+        let reviewed_week =
+            crate::store::reviews::review_week(crate::store::reviews::local_day(&now).unwrap());
+        let (completion_at, _) = crate::core::iso_week_bounds(&reviewed_week).unwrap();
+        crate::store::test_hooks::set_last_event_at(&store, "task", &task.id, &completion_at)
             .await
             .unwrap();
 
@@ -1688,5 +1791,46 @@ mod tests {
             "{result:?}"
         );
         assert_ne!(result, SummarizeItemResult::Nothing);
+    }
+}
+
+#[cfg(test)]
+mod annual_tests {
+    use super::*;
+    use crate::core::{NewPeriodPlan, PlanKind, PlanMetric, PlanStatus};
+    #[test]
+    fn annual_model_can_revise_targets_but_cannot_forge_facts_or_add_scope() {
+        let fallback = vec![Sin90Op::UpsertPeriodPlans {
+            direction_id: "work".into(),
+            plans: vec![NewPeriodPlan {
+                kind: PlanKind::Year,
+                period: "2027".into(),
+                parent_id: None,
+                target: "original".into(),
+                metric: PlanMetric::Count,
+                metric_target: Some(100),
+                routine_id: None,
+                status: PlanStatus::Active,
+            }],
+        }];
+        let mut revised = fallback.clone();
+        let Sin90Op::UpsertPeriodPlans { plans, .. } = &mut revised[0] else {
+            unreachable!()
+        };
+        plans[0].target = "revised".into();
+        plans[0].metric_target = Some(80);
+        let reply = json!({"narrative":"继续推进。","year_plans":revised}).to_string();
+        assert_eq!(
+            parse_annual_reply(&reply, &[], &[], &fallback).unwrap().1,
+            revised
+        );
+        let bad = json!({"narrative":"完成了100次。","year_plans":revised}).to_string();
+        assert!(parse_annual_reply(&bad, &[], &[], &fallback).is_err());
+        let Sin90Op::UpsertPeriodPlans { plans, .. } = &mut revised[0] else {
+            unreachable!()
+        };
+        plans[0].period = "2030".into();
+        let bad = json!({"narrative":"继续推进。","year_plans":revised}).to_string();
+        assert!(parse_annual_reply(&bad, &[], &[], &fallback).is_err());
     }
 }
