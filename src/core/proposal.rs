@@ -15,6 +15,7 @@
 //! breaking change across every implementor, so this widens it all the way M0
 //! needs in one pass).
 
+use super::period_plan::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -48,6 +49,15 @@ pub struct NewTask {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Sin90Op {
+    SetDirectionGoal {
+        direction_id: DirectionId,
+        goal_3y: String,
+        from_year: i32,
+    },
+    UpsertPeriodPlans {
+        direction_id: DirectionId,
+        plans: Vec<NewPeriodPlan>,
+    },
     /// New (design §3.3): an AI-proposed Area. Direct creation (used by the
     /// human-facing HTTP route) does not go through this — only the AI path
     /// does, per §7.1's "AI does not write directly" gate.
@@ -210,6 +220,8 @@ pub struct Sin90Proposal {
 /// `TransitionTask`'s task belongs to an *open* week. Those are enforced by
 /// the store inside the apply transaction, under the same write lock.
 pub trait ValidationCtx {
+    /// Current plans, including provenance and CAS timestamps, for the Working overlay.
+    fn period_plans(&self, direction_id: &str) -> Vec<PeriodPlan>;
     fn task_status(&self, id: &str) -> Option<TaskStatus>;
     fn week_status(&self, id: &str) -> Option<WeekStatus>;
     fn rhythm_is_retired(&self, id: &str) -> Option<bool>;
@@ -269,6 +281,8 @@ pub trait ValidationCtx {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ProposalError {
+    #[error("invalid period plan: {0}")]
+    InvalidPeriodPlan(String),
     #[error("proposal has no ops")]
     Empty,
     #[error("unknown {entity}: {id}")]
@@ -355,6 +369,7 @@ pub enum ProposalError {
 /// so `[t→InProgress, t→Done]` passes and `[t→InProgress, t→InProgress]` fails,
 /// exactly as apply would behave under the write lock.
 struct Working<'c> {
+    period_plans: std::collections::HashMap<String, Vec<PeriodPlan>>,
     ctx: &'c dyn ValidationCtx,
     task: std::collections::HashMap<String, TaskStatus>,
     /// New (design §11.2.3, T5.2.1): overlay for `AssignTaskDirection` — lets
@@ -373,6 +388,7 @@ impl<'c> Working<'c> {
     fn new(ctx: &'c dyn ValidationCtx) -> Self {
         Self {
             ctx,
+            period_plans: std::collections::HashMap::new(),
             task: std::collections::HashMap::new(),
             task_directions: std::collections::HashMap::new(),
             review_hash: std::collections::HashMap::new(),
@@ -451,6 +467,69 @@ fn validate_op(
     capability_source: &str,
 ) -> Result<(), ProposalError> {
     match op {
+        Sin90Op::SetDirectionGoal {
+            direction_id,
+            goal_3y,
+            from_year,
+        } => {
+            if w.ctx.direction_status(direction_id).is_none() {
+                return Err(ProposalError::UnknownEntity {
+                    entity: "direction",
+                    id: direction_id.clone(),
+                });
+            }
+            non_blank("goal_3y", goal_3y)?;
+            if !(1..=9997).contains(from_year) {
+                return Err(ProposalError::InvalidPeriodPlan(
+                    "from_year must be 1..9997".into(),
+                ));
+            }
+            Ok(())
+        }
+        Sin90Op::UpsertPeriodPlans {
+            direction_id,
+            plans,
+        } => {
+            if w.ctx.direction_status(direction_id).is_none() {
+                return Err(ProposalError::UnknownEntity {
+                    entity: "direction",
+                    id: direction_id.clone(),
+                });
+            }
+            let current = w
+                .period_plans
+                .entry(direction_id.clone())
+                .or_insert_with(|| w.ctx.period_plans(direction_id));
+            for plan in plans {
+                let index = current
+                    .iter()
+                    .position(|p| p.plan.kind == plan.kind && p.plan.period == plan.period);
+                if index.is_some_and(|i| current[i].source == PlanSource::User) {
+                    continue;
+                }
+                validate_plan(plan).map_err(ProposalError::InvalidPeriodPlan)?;
+                let parent = plan
+                    .parent_id
+                    .as_ref()
+                    .and_then(|id| current.iter().find(|p| &p.id == id));
+                validate_parent(direction_id, plan, parent)
+                    .map_err(ProposalError::InvalidPeriodPlan)?;
+                let updated = PeriodPlan {
+                    id: index.map_or_else(String::new, |i| current[i].id.clone()),
+                    direction_id: direction_id.clone(),
+                    plan: plan.clone(),
+                    source: PlanSource::Ai,
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                };
+                if let Some(i) = index {
+                    current[i] = updated;
+                } else {
+                    current.push(updated);
+                }
+            }
+            Ok(())
+        }
         Sin90Op::CreateArea { title } => {
             non_blank("title", title)?;
             Ok(())
@@ -795,6 +874,9 @@ mod tests {
     }
 
     impl ValidationCtx for MockCtx {
+        fn period_plans(&self, _direction_id: &str) -> Vec<PeriodPlan> {
+            Vec::new()
+        }
         fn task_status(&self, id: &str) -> Option<TaskStatus> {
             self.tasks.get(id).copied()
         }

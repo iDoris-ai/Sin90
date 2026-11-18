@@ -15,6 +15,7 @@
 pub mod ai_port;
 pub mod attention;
 pub mod packs;
+pub(crate) mod period_plans;
 pub mod repo;
 pub mod weekly_draft;
 

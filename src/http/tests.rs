@@ -10374,3 +10374,294 @@ async fn l1_block_routine_link_roundtrips_through_http_and_events() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+async fn l2a_create_plan(
+    app: &axum::Router,
+    direction: &str,
+    kind: &str,
+    period: &str,
+    parent: Option<&str>,
+) -> Value {
+    let resp = app.clone().oneshot(human_req("POST", "/period-plans", json!({
+        "direction_id":direction, "kind":kind, "period":period, "parent_id":parent, "target":"human target"
+    }))).await.unwrap();
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    body
+}
+
+async fn l2a_submit(app: &axum::Router, id: &str, ops: Value) {
+    let resp = app
+        .clone()
+        .oneshot(automation_req(
+            "POST",
+            "/proposals",
+            json!({
+                "id":id, "status":"pending", "source":"local_brain", "ops":ops
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "{}",
+        body_json(resp).await
+    );
+}
+
+#[tokio::test]
+async fn l2a_http_upsert_preserves_user_rows_and_pending_human_edits() {
+    let (app, _, store) = test_app_with_store().await;
+    let d = store.create_direction("Run", "2026", None).await.unwrap();
+    let human = l2a_create_plan(&app, &d.id, "year", "2026", None).await;
+    l2a_submit(&app, "l2a-seed", json!([
+        {"op":"set_direction_goal", "direction_id":d.id, "goal_3y":"Marathon", "from_year":2026},
+        {"op":"upsert_period_plans", "direction_id":d.id, "plans":[
+            {"kind":"year", "period":"2026", "target":"must skip"},
+            {"kind":"year", "period":"2027", "target":"AI original"}
+        ]}
+    ])).await;
+    let resp = app
+        .clone()
+        .oneshot(human_req("POST", "/proposals/l2a-seed/accept", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let result = body_json(resp).await;
+    assert_eq!(result["skipped_period_plans"][0]["id"], human["id"]);
+    let plans = store
+        .list_period_plans(Some(&d.id), None, None)
+        .await
+        .unwrap();
+    assert_eq!(plans.len(), 2);
+    assert_eq!(plans[0].plan.target, "human target");
+    assert_eq!(plans[1].source, crate::core::PlanSource::Ai);
+    let ai_id = plans[1].id.clone();
+    l2a_submit(
+        &app,
+        "l2a-pending",
+        json!([{"op":"upsert_period_plans", "direction_id":d.id, "plans":[
+            {"kind":"year", "period":"2027", "target":"stale AI overwrite"},
+            {"kind":"year", "period":"2028", "target":"other row still applies"}
+        ]}]),
+    )
+    .await;
+    let edited = app
+        .clone()
+        .oneshot(human_req(
+            "PATCH",
+            &format!("/period-plans/{ai_id}"),
+            json!({"target":"human revision", "metric":"count", "metric_target":12}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(edited.status(), StatusCode::OK);
+    assert_eq!(body_json(edited).await["source"], "user");
+    let resp = app
+        .clone()
+        .oneshot(human_req(
+            "POST",
+            "/proposals/l2a-pending/accept",
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let receipt = body_json(resp).await;
+    assert_eq!(receipt["skipped_period_plans"][0]["id"], ai_id);
+    let retry = app
+        .clone()
+        .oneshot(human_req(
+            "POST",
+            "/proposals/l2a-pending/accept",
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_json(retry).await, receipt);
+    let plans = store
+        .list_period_plans(Some(&d.id), None, None)
+        .await
+        .unwrap();
+    assert_eq!(plans.len(), 3);
+    assert_eq!(plans[1].plan.target, "human revision");
+    assert_eq!(plans[1].plan.metric_target, Some(12));
+    assert_eq!(plans[2].plan.target, "other row still applies");
+    let directions = app.clone().oneshot(get_req("/directions")).await.unwrap();
+    let directions = body_json(directions).await;
+    let direction = directions["directions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["id"] == d.id)
+        .unwrap();
+    assert_eq!(direction["goal_3y"], "Marathon");
+    assert_eq!(direction["goal_from_year"], 2026);
+    let updated = app
+        .clone()
+        .oneshot(human_req(
+            "PATCH",
+            &format!("/directions/{}", d.id),
+            json!({"goal_3y":"Ultra", "goal_from_year":2027}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_json(updated).await["goal_3y"], "Ultra");
+    let cleared = app
+        .clone()
+        .oneshot(human_req(
+            "PATCH",
+            &format!("/directions/{}", d.id),
+            json!({"goal_3y":null, "goal_from_year":null}),
+        ))
+        .await
+        .unwrap();
+    assert!(body_json(cleared).await["goal_3y"].is_null());
+}
+
+#[tokio::test]
+async fn l2a_http_period_parent_filters_and_actor_validation() {
+    let (app, _, store) = test_app_with_store().await;
+    let d = store.create_direction("Run", "2026", None).await.unwrap();
+    let other = store.create_direction("Read", "2026", None).await.unwrap();
+    for (kind, period) in [
+        ("year", "2026-Q1"),
+        ("half", "2026-H3"),
+        ("quarter", "2026-Q0"),
+        ("month", "2026-13"),
+        ("month", "2026-1"),
+        ("year", "２０２６"),
+        ("month", "2026-😀"),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(human_req(
+                "POST",
+                "/period-plans",
+                json!({"direction_id":d.id, "kind":kind, "period":period, "target":"x"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{kind} {period}");
+    }
+    let year = l2a_create_plan(&app, &d.id, "year", "2026", None).await;
+    let year_id = year["id"].as_str().unwrap();
+    let half = l2a_create_plan(&app, &d.id, "half", "2026-H1", Some(year_id)).await;
+    for (direction, kind, period, parent) in [
+        (&d.id, "half", "2026-H2", None),
+        (&d.id, "month", "2026-01", Some(year_id)),
+        (&other.id, "quarter", "2026-Q1", Some(year_id)),
+        (&d.id, "quarter", "2026-Q3", half["id"].as_str()),
+        (&d.id, "quarter", "2027-Q1", Some(year_id)),
+        (&d.id, "year", "2027", Some(year_id)),
+    ] {
+        let resp = app.clone().oneshot(human_req("POST", "/period-plans", json!({"direction_id":direction, "kind":kind, "period":period, "parent_id":parent, "target":"x"}))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{kind} {period}");
+    }
+    let duplicate = app
+        .clone()
+        .oneshot(human_req(
+            "POST",
+            "/period-plans",
+            json!({"direction_id":d.id, "kind":"year", "period":"2026", "target":"duplicate"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+    let denied = app
+        .clone()
+        .oneshot(automation_req(
+            "POST",
+            "/period-plans",
+            json!({"direction_id":d.id, "kind":"year", "period":"2027", "target":"x"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let denied = app
+        .clone()
+        .oneshot(automation_req(
+            "PATCH",
+            &format!("/period-plans/{year_id}"),
+            json!({"target":"x"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let resp = app
+        .clone()
+        .oneshot(get_req(&format!(
+            "/period-plans?direction_id={}&kind=half&period=2026-H1",
+            d.id
+        )))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["period_plans"], json!([half]));
+    let resp = app
+        .oneshot(get_req("/period-plans?kind=month&period=2026-Q1"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn l2a_http_drop_cascades_recursively_preserves_terminal_rows_and_emits_each_event() {
+    let (app, sink, store) = test_app_with_store().await;
+    let d = store.create_direction("Run", "2026", None).await.unwrap();
+    let year = l2a_create_plan(&app, &d.id, "year", "2026", None).await;
+    let half = l2a_create_plan(&app, &d.id, "half", "2026-H1", year["id"].as_str()).await;
+    let quarter = l2a_create_plan(&app, &d.id, "quarter", "2026-Q1", half["id"].as_str()).await;
+    let month = l2a_create_plan(&app, &d.id, "month", "2026-01", quarter["id"].as_str()).await;
+    let missed = l2a_create_plan(&app, &d.id, "month", "2026-02", quarter["id"].as_str()).await;
+    for (plan, status) in [
+        (&half, "active"),
+        (&quarter, "done"),
+        (&month, "active"),
+        (&missed, "missed"),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(human_req(
+                "PATCH",
+                &format!("/period-plans/{}", plan["id"].as_str().unwrap()),
+                json!({"status":status}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    sink.0.lock().unwrap().clear();
+    let resp = app
+        .clone()
+        .oneshot(human_req(
+            "PATCH",
+            &format!("/period-plans/{}", year["id"].as_str().unwrap()),
+            json!({"status":"dropped"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let plans = store
+        .list_period_plans(Some(&d.id), None, None)
+        .await
+        .unwrap();
+    for p in &plans {
+        let expected = if p.id == quarter["id"].as_str().unwrap() {
+            crate::core::PlanStatus::Done
+        } else if p.id == missed["id"].as_str().unwrap() {
+            crate::core::PlanStatus::Missed
+        } else {
+            crate::core::PlanStatus::Dropped
+        };
+        assert_eq!(p.plan.status, expected);
+    }
+    let emitted = sink.0.lock().unwrap().clone();
+    assert_eq!(emitted.len(), 3);
+    assert!(emitted
+        .iter()
+        .all(|(k, v)| k == "period_plan.updated" && v["status"] == "dropped"));
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sin90_events WHERE entity = 'period_plan' AND kind = 'updated' AND to_state = 'dropped'").fetch_one(store.pool()).await.unwrap();
+    assert_eq!(count, 3);
+}

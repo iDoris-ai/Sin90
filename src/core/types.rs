@@ -201,6 +201,8 @@ pub struct Area {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Direction {
+    pub goal_3y: Option<String>,
+    pub goal_from_year: Option<i32>,
     pub id: DirectionId,
     /// New (design §3.2): optional link up to an `Area`. Nullable so an
     /// uncategorized direction is still legal.
@@ -216,6 +218,10 @@ pub struct Direction {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct DirectionPatch {
+    #[serde(deserialize_with = "deserialize_double_option")]
+    pub goal_3y: Option<Option<String>>,
+    #[serde(deserialize_with = "deserialize_double_option")]
+    pub goal_from_year: Option<Option<i32>>,
     pub title: Option<String>,
     pub status: Option<DirectionStatus>,
     pub target_window: Option<String>,
@@ -450,7 +456,7 @@ pub enum FireTrigger {
 /// `None` that `default()` set, never reaching this function. No extra
 /// crate (e.g. `serde_with`) needed — this is the same few-line pattern
 /// that crate's `serde_with::rust::double_option` module wraps.
-fn deserialize_double_option<'de, D, T>(
+pub(crate) fn deserialize_double_option<'de, D, T>(
     deserializer: D,
 ) -> std::result::Result<Option<Option<T>>, D::Error>
 where

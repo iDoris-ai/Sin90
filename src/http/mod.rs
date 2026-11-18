@@ -26,6 +26,7 @@ mod ai_classify;
 mod ai_propose;
 pub mod ai_runs;
 mod ai_summarize;
+mod period_plans;
 pub mod state;
 
 use axum::body::Bytes;
@@ -149,6 +150,11 @@ pub fn router(state: Sin90State, mounted: bool) -> axum::Router {
         .route("/areas/{id}", patch(transition_area))
         .route("/directions", post(create_direction).get(list_directions))
         .route("/directions/{id}", patch(update_direction))
+        .route(
+            "/period-plans",
+            get(period_plans::list).post(period_plans::create),
+        )
+        .route("/period-plans/{id}", patch(period_plans::update))
         .route("/tasks", post(create_task).get(list_tasks))
         .route("/tasks/{id}", patch(transition_task))
         .route("/schedule-blocks", post(create_block).get(list_blocks))
