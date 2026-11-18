@@ -26,9 +26,9 @@ Area（五系统种子包）、Direction（area_id、状态机）、Week / Sched
 
 ### L1 · 小改与修 bug（先做）
 
-- **方向可编辑**：`PATCH /directions/{id}`，可改 `title`、`status`（按现有状态机合法边）、`target_window`、`area_id`。今天 `POST /directions` 只能建不能改，「人可以改」走不通。发 `direction.updated` 事件，事件里带改后的快照（weekly_draft 依赖的 direction_id → area_id 映射改为按最新的 `direction.created|updated` 回放）。
-- **Area 加「现在 / 理想」**：`sin90_areas` 加 `current_state TEXT NULL`、`ideal_state TEXT NULL`；`PATCH /areas/{id}` 可改。
-- **例行 ↔ 时间块关联（bug）**：今天 ScheduleBlock 不记它来自哪个 Routine，周复盘草稿里 `routines[].completed` 写死为 0，所以「每周跑 3 次」无法追踪。`sin90_schedule_blocks` 加 `routine_id TEXT NULL REFERENCES sin90_routines(id)`；`POST /schedule-blocks` 可带；routine fire 生成的块自动带上；`block.transitioned` 事件带 `routine_id`；weekly draft 的 `completed` 从事件算。
+- **方向可编辑**：`PATCH /directions/{id}`，可改 `title`、`status`（按现有状态机合法边）、`target_window`、`area_id`。今天 `POST /directions` 只能建不能改，「人可以改」走不通。发 `direction.updated` 事件，事件里带改后的快照。**历史按当时算**：weekly_draft / attention 里 direction → area 的映射按事件发生时刻回放（某周的块归到当时所属的 area），改 area 不重写过去的周；`sin90_attention_daily` 的物化不受影响（它按 direction 记，area 在读取时按时刻映射）。
+- **Area 加「现在 / 理想」**：`sin90_areas` 加 `current_state TEXT NULL`、`ideal_state TEXT NULL`。今天的 `PATCH /areas/{id}` 是状态流转（`transition_area`），不是通用更新；**扩展它的请求体**：`to`（流转，可选）与 `current_state` / `ideal_state`（可选）至少给一个，分别生效；发 `area.updated`。
+- **例行 ↔ 时间块关联（bug）**：今天 ScheduleBlock 不记它来自哪个 Routine，周复盘草稿里 `routines[].completed` 写死为 0，所以「每周跑 3 次」无法追踪。`sin90_schedule_blocks` 加 `routine_id TEXT NULL REFERENCES sin90_routines(id)`；**只做「建块时可选 `routine_id`」**（SFU-8 选第二种，fire 时自动建块不做，留 FU）：`POST /schedule-blocks` 可带 `routine_id`（须存在且非 retired）；`block.transitioned` 事件带 `routine_id`；weekly draft 的 `routines[].completed` = 本周带该 `routine_id` 且转为 completed 的块数，从事件算。
 
 ### L2 · 三年目标与阶段计划（核心）
 
@@ -49,23 +49,32 @@ Area（五系统种子包）、Direction（area_id、状态机）、Week / Sched
   | status | `draft` / `active` / `done` / `missed` / `dropped` |
   | created_at / updated_at | |
 
-  唯一约束 `(direction_id, kind, period)`。周不进这张表：周仍是 `sin90_weeks`，它属于哪个月按 ISO 周的周四所在月份算。
+  唯一约束 `(direction_id, kind, period)`。周不进这张表：周仍是 `sin90_weeks`。**月 / 季 / 年的统计一律按日历日**：块按完成时刻、任务按完成时刻归到所在的月 / 季 / 年（本机时区），不按周归属，因此跨月的周会被拆到两个月里。
+- **层级的删除**：上层 plan 转为 `dropped` 时，其下仍为 `draft` / `active` 的子 plan 一并转为 `dropped`（同一事务，各发事件）；`done` / `missed` 的不动。
 - **路由**：`GET /period-plans?direction_id=&kind=&period=`、`PATCH /period-plans/{id}`（人改，改后 `source=user`）、`POST /period-plans`（人手建）。
 - **新 Op**：
   - `SetDirectionGoal { direction_id, goal_3y, from_year }`
-  - `UpsertPeriodPlans { direction_id, plans: Vec<NewPeriodPlan> }`：按 `(kind, period)` 新建或覆盖；**`source=user` 的行不被 AI 覆盖**（返回冲突，留给人决定），这是「人可以改」的保障。
+  - `UpsertPeriodPlans { direction_id, plans: Vec<NewPeriodPlan> }`：按 `(kind, period)` 新建或覆盖；**`source=user` 的行不被 AI 覆盖**，这是「人可以改」的保障。语义是**跳过该行、其余照落**，采纳结果里列出被跳过的行。判断要做两次：`validate`（基于 `Working` 视图）和 apply 时的 CAS（按行的 `source` 与 `updated_at`）——提案生成后、采纳前人又改了某行，采纳时必须再判一次。
 - **新 AI 能力 `decompose`**：输入方向 + 三年目标 + 已有计划 + 近期实际（attention），输出一个 `UpsertPeriodPlans` 提案，从年拆到半年、季、月。走现有 ladder（本机模型优先，规则兜底：把上一层的量化目标按时间均分）。路由 `POST /ai/decompose { direction_id, down_to: "month" }`。
 
 ### L3 · 进度与往上传导（计算，不存表）
 
 - `GET /progress?direction_id=&at=YYYY-MM-DD` 返回该方向每个 period plan 的：实际值（按 metric 从事件算：`count` = 关联 routine 的已完成块数或该方向完成的任务数；`minutes` = 该方向已完成块的分钟数）、应达值（按时间进度线性）、状态 `on_track` / `behind` / `at_risk`，以及**最近几周的周达标序列**和**连续未达标周数**。
-- 设置 `progress.streak_weeks`（默认 3）：连续未达标周数 ≥ 阈值时，所在的月 / 季 plan 状态才变 `at_risk`；不到阈值只标 `behind`，不往上传。
+- **周目标从哪来**（「周达标」的判据）：
+  - plan 关联了 routine：周目标 = routine 的 `target_count` 或 `target_minutes`（routine 本身就是每周节奏）。
+  - 没关联 routine、有量化目标：周目标 = 所在月 plan 的 `metric_target` 按该周落在这个月里的天数比例折算（`target × 本周在月内天数 ÷ 月天数`，向上取整）。
+  - `metric=none` 的 plan **不参与传导**，只显示。
+  - 周实际值按日历日落在这周的部分计算，与上面的月统计口径一致。
+- 设置 `progress.streak_weeks`（默认 3）：某方向连续未达标周数 ≥ 阈值时，所在的月 / 季 plan 状态才变 `at_risk`；不到阈值只标 `behind`，不往上传。
 - 纯回放事件，不依赖可变表，与 attention 同一原则。
 
 ### L4 · 复盘扩展
 
 - `ReviewKind` 加 `monthly`（period `YYYY-MM`）、`quarterly`（`YYYY-Qn`）、`yearly`（`YYYY`）。
-- **自动复盘设置**：`GET/PUT /settings/review { auto: bool, cadence: "weekly"|"biweekly"|"monthly", weekday: 1..7, hour }`，默认 `{auto: true, weekly, weekday: 7 (周日), hour: 18}`。实现为一条系统 Routine（kind=review），改设置即改它的 cron，关掉即 pause。到点 fire：起草当周 weekly；若这周包含月末 / 季末 / 年末，同时起草 monthly / quarterly / yearly。
+- **自动复盘设置**：`GET/PUT /settings/review { auto: bool, cadence: "weekly"|"biweekly"|"monthly", weekday: 1..7, hour }`，默认 `{auto: true, weekly, weekday: 7 (周日), hour: 18}`。实现为一条系统 Routine（kind=review），改设置即改它的 cron（按本机时区），关掉即 pause。
+  - **复盘哪一周**：fire 在周日 → 复盘本 ISO 周（当天结束的这周）；fire 在周一到周六 → 复盘**上一** ISO 周（刚结束的那周）。今天的 `iso_week_of(scheduled_for)` 要按这条改。
+  - **cadence**：cron 一律按周触发；`biweekly` 在 fire 里跳过 ISO 周号为奇数的那次；`monthly` 只在「这次复盘的那周或之前一周内包含月末」时起草，其余跳过。
+  - **月 / 季 / 年复盘**：在月末之后的**第一次**自动（或手动）复盘时起草，统计范围是完整的日历月 / 季 / 年（与 L3 口径一致），不管月末落在周几。
 - `summarize` 扩展到月 / 季 / 年：事实来自 L3 的 progress。**yearly 额外产出一个 `UpsertPeriodPlans` 提案**：根据今年结果修正后两年的 year 段，并生成明年的半年 / 季拆分——这就是「年度结果生成下一年」。
 - 复盘的「影响范围」不存：由该次复盘产出的提案里 op 触及的层（today / week / month / quarter / year / goal_3y）推导，给界面显示用。
 
@@ -84,11 +93,11 @@ Area（五系统种子包）、Direction（area_id、状态机）、Week / Sched
 
 | 片 | 内容 | 关键验收 |
 |---|---|---|
-| L1 | 方向 PATCH、Area 现在/理想、routine_id 关联 | 改方向后 weekly draft 的 by_area 用新 area；routine 生成的块完成后，weekly draft 的 `routines[].completed` 不再是 0 |
-| L2a | period_plans 表、路由、两个新 Op | AI 的 Upsert 不覆盖 `source=user` 的行；period 格式非法 400 |
+| L1 | 方向 PATCH、Area 现在/理想、routine_id 关联 | 改方向 area 后，新一周的 by_area 用新 area、过去的周不变；带 routine_id 的块完成后 `routines[].completed` +1；状态非法边被拒 |
+| L2a | period_plans 表、路由、两个新 Op | AI 的 Upsert 跳过 `source=user` 的行、其余照落；提案生成后人改了某行，采纳时该行仍被跳过；上层 dropped 级联；period 格式非法 400 |
 | L2b | `decompose` 能力 | 无模型时规则兜底能从 year 拆到 month；提案经人采纳才落库 |
-| L3 | `/progress` 与传导 | 停一周：状态 `behind` 不上传；连续 3 周：月 plan `at_risk`；数字只来自事件回放 |
-| L4 | 复盘扩展与自动设置 | 默认周日 18:00 起草周复盘；关掉 auto 后不再自动起草；包含月末的那周同时出 monthly；yearly 产出下一年的 Upsert 提案 |
+| L3 | `/progress` 与传导 | 停一周：`behind` 不上传；连续 3 周：月 plan `at_risk`；`metric=none` 不参与；月末落在周二的那周，周一二的完成算上个月、周三起算本月；数字只来自事件回放 |
+| L4 | 复盘扩展与自动设置 | 默认周日 18:00 起草本周复盘；weekday 改成周一时复盘上一周；关掉 auto 后不再自动起草；月末（落在周二）之后的第一次复盘出完整日历月的 monthly；yearly 产出下一年的 Upsert 提案 |
 | L5 | CreateDirection 扩展 + 提案内引用 | 一个提案能建方向并挂上三年目标和年度段 |
 
 每片：`cargo test`、clippy `-D warnings`、fmt；HTTP 层有黑盒测试；一轮评审即合。
@@ -96,6 +105,7 @@ Area（五系统种子包）、Direction（area_id、状态机）、Week / Sched
 ## 6. FU（这次不做）
 
 - 日历视图 / 时间块具体时刻。
+- routine fire 时自动建块（SFU-8 的另一种选择）。
 - 多个目标挂在同一方向（本方案一个方向一个三年目标）。
 - 复盘被输入实时触发（jason 明确不要默认开启）。
 - 精力分配（Rhythm）与阶段计划的联动。
