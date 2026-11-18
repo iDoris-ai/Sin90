@@ -7,7 +7,7 @@ use serde_json::Value;
 use sqlx::Row;
 
 use super::{repo::append_event, Result, Sin90Store, StoreError};
-use crate::core::{now_iso8601, PeriodPlan, PlanKind, PlanMetric};
+use crate::core::{now_iso8601, PeriodPlan, PlanKind, PlanMetric, PlanStatus};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProgressWeek {
@@ -286,7 +286,10 @@ impl Sin90Store {
                 };
                 week = next;
             }
-            let status = if !quantified || miss_streak == 0 {
+            // A dropped plan is the user's decision to stop: it keeps its
+            // numbers but raises no risk and passes none upward.
+            let tracked = quantified && p.plan.status != PlanStatus::Dropped;
+            let status = if !tracked || miss_streak == 0 {
                 "on_track"
             } else if miss_streak >= threshold {
                 "at_risk"
@@ -331,10 +334,11 @@ impl Sin90Store {
                 let Some(parent) = plans.iter().find(|p| p.id == id) else {
                     break;
                 };
-                if let Some(row) = result
-                    .iter_mut()
-                    .find(|r| r.plan_id == id && parent.plan.metric != PlanMetric::None)
-                {
+                if let Some(row) = result.iter_mut().find(|r| {
+                    r.plan_id == id
+                        && parent.plan.metric != PlanMetric::None
+                        && parent.plan.status != PlanStatus::Dropped
+                }) {
                     row.status = "at_risk".into();
                 }
                 parent_id = parent.plan.parent_id.as_deref();
@@ -430,6 +434,36 @@ mod tests {
         .await
         .unwrap();
         tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dropped_month_raises_no_risk_and_the_quarter_stays_on_track() {
+        let (store, d, p) = plans(PlanMetric::Count, "2026-03").await;
+        store
+            .update_period_plan(
+                &p[2].id,
+                &crate::core::PeriodPlanPatch {
+                    status: Some(PlanStatus::Dropped),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let rows = store.progress(&d, Some("2026-03-15")).await.unwrap();
+        assert_eq!(row(&rows, &p[2]).miss_streak, 3);
+        assert_eq!(row(&rows, &p[2]).status, "on_track");
+        assert_eq!(row(&rows, &p[1]).status, "on_track");
+        assert_eq!(row(&rows, &p[0]).status, "on_track");
+    }
+
+    #[tokio::test]
+    async fn completions_after_at_are_not_counted() {
+        let (store, d, p) = plans(PlanMetric::Count, "2026-03").await;
+        completion(&store, &d, "2026-03-20", true, None).await;
+        let rows = store.progress(&d, Some("2026-03-10")).await.unwrap();
+        assert_eq!(row(&rows, &p[2]).actual, Some(0));
+        let rows = store.progress(&d, Some("2026-03-25")).await.unwrap();
+        assert_eq!(row(&rows, &p[2]).actual, Some(1));
     }
 
     #[tokio::test]

@@ -36,3 +36,9 @@ routine 和分钟数取完成事件。完成时刻转换成本机时区后，按
 `PUT /settings/progress` 接受同形对象，需要人类 actor key，阈值为正整数。
 设置以 JSON 数字保存在现有 `sin90_settings['progress.streak_weeks']`，
 与 `setting.changed` 事件在同一事务写入。
+
+## 状态与传导的补充口径
+
+- **已放弃（`dropped`）的计划**仍然返回 actual / expected / weeks / miss_streak，方便回看，但 `status` 恒为 `on_track`：它不产生风险，也不把风险传给上层。已放弃的上层计划同样不会被标成 `at_risk`。放弃一个落后的月目标，是用户的明确决定，不应让还在进行的季、年计划一直显示风险。
+- **`metric=none` 的中间层**本身不标状态，但风险会**穿过**它，继续传给更上层的量化计划。例如「量化月 → none 季 → 量化年」，月计划到了 `at_risk` 时，年计划也会变成 `at_risk`。
+- **`at` 之后的完成**不计入。
