@@ -37,9 +37,9 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::core::{
-    Alloc, AreaStatus, Energy, FireTrigger, NewReview, NewRoutine, ReviewKind, ReviewPatch,
-    RoutinePatch, RoutineStatus, ScheduleBlockStatus, Sin90Proposal, TaskKind, TaskStatus,
-    WeekStatus,
+    Alloc, AreaPatch, DirectionPatch, Energy, FireTrigger, NewReview, NewRoutine, ReviewKind,
+    ReviewPatch, RoutinePatch, RoutineStatus, ScheduleBlockStatus, Sin90Proposal, TaskKind,
+    TaskStatus, WeekStatus,
 };
 use crate::store::{AutoReviewCreated, RoutineFireOutcome, StoreError};
 
@@ -148,6 +148,7 @@ pub fn router(state: Sin90State, mounted: bool) -> axum::Router {
         .route("/areas", post(create_area).get(list_areas))
         .route("/areas/{id}", patch(transition_area))
         .route("/directions", post(create_direction).get(list_directions))
+        .route("/directions/{id}", patch(update_direction))
         .route("/tasks", post(create_task).get(list_tasks))
         .route("/tasks/{id}", patch(transition_task))
         .route("/schedule-blocks", post(create_block).get(list_blocks))
@@ -202,12 +203,6 @@ struct NewAreaReq {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AreaTransitionReq {
-    to: AreaStatus,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct NewDirectionReq {
     title: String,
     target_window: String,
@@ -247,6 +242,8 @@ struct TaskTransitionReq {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NewBlockReq {
+    #[serde(default)]
+    routine_id: Option<String>,
     #[serde(default)]
     direction_id: Option<String>,
     #[serde(default)]
@@ -375,16 +372,19 @@ async fn transition_area(
     if let Err(r) = state.require_human(&headers) {
         return r;
     }
-    let req: AreaTransitionReq = match parse(&body, "area transition") {
+    let req: AreaPatch = match parse(&body, "area transition") {
         Ok(b) => b,
         Err(r) => return r,
     };
-    match state.store.transition_area(&id, req.to).await {
+    match state.store.update_area(&id, &req).await {
         Ok(a) => {
-            state.emit(
-                "area.transitioned",
-                serde_json::json!({ "area_id": a.id, "to": a.status }),
-            );
+            if req.to.is_some() {
+                state.emit(
+                    "area.transitioned",
+                    serde_json::json!({"area_id": a.id, "to": a.status}),
+                );
+            }
+            state.emit("area.updated", serde_json::json!(a));
             Json(a).into_response()
         }
         Err(e) => map_err(e),
@@ -416,6 +416,28 @@ async fn create_direction(
                 serde_json::json!({ "id": d.id, "title": d.title, "area_id": d.area_id }),
             );
             (StatusCode::CREATED, Json(d)).into_response()
+        }
+        Err(e) => map_err(e),
+    }
+}
+
+async fn update_direction(
+    State(state): State<Sin90State>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    body: Bytes,
+) -> Response {
+    if let Err(r) = state.require_human(&headers) {
+        return r;
+    }
+    let patch: DirectionPatch = match parse(&body, "direction patch") {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    match state.store.update_direction(&id, &patch).await {
+        Ok(d) => {
+            state.emit("direction.updated", serde_json::json!(d));
+            Json(d).into_response()
         }
         Err(e) => map_err(e),
     }
@@ -517,6 +539,7 @@ async fn create_block(
             req.direction_id.as_deref(),
             req.task_id.as_deref(),
             req.planned_minutes,
+            req.routine_id.as_deref(),
         )
         .await
     {
@@ -548,7 +571,7 @@ async fn transition_block(
         Ok(b) => {
             state.emit(
                 "block.transitioned",
-                serde_json::json!({ "block_id": b.id, "to": b.status }),
+                serde_json::json!({ "block_id": b.id, "to": b.status, "routine_id": b.routine_id }),
             );
             Json(b).into_response()
         }

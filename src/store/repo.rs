@@ -13,14 +13,14 @@ use std::collections::HashMap;
 
 use crate::core::{
     body_sha256, canonical_iso_date, canonical_iso_week, check_alloc, check_area_transition,
-    check_review_transition, check_rhythm_transition, check_routine_transition,
-    check_schedule_block_transition, check_task_transition, check_week_transition, now_iso8601,
-    review_is_terminal, routine_is_terminal, ulid, validate, validate_cron, validate_tz,
-    week_is_open, Alloc, Area, AreaStatus, Direction, DirectionStatus, Energy, FireTrigger,
-    NewReview, NewRoutine, ProposalSource, ProposalStatus, Review, ReviewKind, ReviewSnap,
-    ReviewStatus, Rhythm, RhythmStatus, Routine, RoutinePatch, RoutineStatus, ScheduleBlock,
-    ScheduleBlockStatus, Sin90Op, Sin90Proposal, Task, TaskKind, TaskStatus, ValidationCtx, Week,
-    WeekStatus,
+    check_direction_transition, check_review_transition, check_rhythm_transition,
+    check_routine_transition, check_schedule_block_transition, check_task_transition,
+    check_week_transition, now_iso8601, review_is_terminal, routine_is_terminal, ulid, validate,
+    validate_cron, validate_tz, week_is_open, Alloc, Area, AreaPatch, AreaStatus, Direction,
+    DirectionPatch, DirectionStatus, Energy, FireTrigger, NewReview, NewRoutine, ProposalSource,
+    ProposalStatus, Review, ReviewKind, ReviewSnap, ReviewStatus, Rhythm, RhythmStatus, Routine,
+    RoutinePatch, RoutineStatus, ScheduleBlock, ScheduleBlockStatus, Sin90Op, Sin90Proposal, Task,
+    TaskKind, TaskStatus, ValidationCtx, Week, WeekStatus,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -932,6 +932,8 @@ impl Sin90Store {
         .await?;
         tx.commit().await?;
         Ok(Area {
+            current_state: None,
+            ideal_state: None,
             id,
             title: title.to_string(),
             slug,
@@ -944,7 +946,7 @@ impl Sin90Store {
 
     pub async fn list_areas(&self) -> Result<Vec<Area>> {
         let rows = sqlx::query(
-            "SELECT id, title, slug, status, sort_key, created_at, updated_at
+            "SELECT id, title, slug, status, sort_key, current_state, ideal_state, created_at, updated_at
              FROM sin90_areas
              ORDER BY created_at DESC, rowid DESC",
         )
@@ -953,6 +955,8 @@ impl Sin90Store {
         rows.into_iter()
             .map(|r| {
                 Ok(Area {
+                    current_state: r.get("current_state"),
+                    ideal_state: r.get("ideal_state"),
                     id: r.get("id"),
                     title: r.get("title"),
                     slug: r.get("slug"),
@@ -970,47 +974,130 @@ impl Sin90Store {
     /// action per §7.1's "direct-write is for humans" convention, same as
     /// `transition_block`/`transition_task`.
     pub async fn transition_area(&self, id: &str, to: AreaStatus) -> Result<Area> {
-        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
-        let row = sqlx::query(
-            "SELECT title, slug, status, sort_key, created_at FROM sin90_areas WHERE id = ?",
+        self.update_area(
+            id,
+            &AreaPatch {
+                to: Some(to),
+                ..Default::default()
+            },
         )
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some(row) = row else {
-            return Err(StoreError::NotFound(format!("area {id}")));
-        };
-        let from: AreaStatus = from_wire(&row.get::<String, _>("status"))?;
-        check_area_transition(from, to)?;
-        let now = now_iso8601();
-        let to_str = to_wire(&to)?;
-        sqlx::query("UPDATE sin90_areas SET status = ?, updated_at = ? WHERE id = ?")
-            .bind(&to_str)
-            .bind(&now)
+        .await
+    }
+
+    pub async fn update_area(&self, id: &str, patch: &AreaPatch) -> Result<Area> {
+        if patch.to.is_none() && patch.current_state.is_none() && patch.ideal_state.is_none() {
+            return Err(StoreError::Invalid(
+                "give at least one of to, current_state, ideal_state".into(),
+            ));
+        }
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let row = sqlx::query("SELECT * FROM sin90_areas WHERE id = ?")
             .bind(id)
-            .execute(&mut *tx)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("area {id}")))?;
+        let from: AreaStatus = from_wire(&row.get::<String, _>("status"))?;
+        if let Some(to) = patch.to {
+            check_area_transition(from, to)?;
+        }
+        let updated = Area {
+            id: id.to_string(),
+            title: row.get("title"),
+            slug: row.get("slug"),
+            status: patch.to.unwrap_or(from),
+            sort_key: row.get("sort_key"),
+            current_state: patch
+                .current_state
+                .clone()
+                .unwrap_or_else(|| row.get("current_state")),
+            ideal_state: patch
+                .ideal_state
+                .clone()
+                .unwrap_or_else(|| row.get("ideal_state")),
+            created_at: row.get("created_at"),
+            updated_at: now_iso8601(),
+        };
+        sqlx::query("UPDATE sin90_areas SET status = ?, current_state = ?, ideal_state = ?, updated_at = ? WHERE id = ?")
+            .bind(to_wire(&updated.status)?).bind(&updated.current_state).bind(&updated.ideal_state)
+            .bind(&updated.updated_at).bind(id).execute(&mut *tx).await?;
+        if let Some(to) = patch.to {
+            append_event(
+                &mut tx,
+                "area",
+                id,
+                "transitioned",
+                Some(&to_wire(&from)?),
+                Some(&to_wire(&to)?),
+                &json!({"area_id": id}),
+                &updated.updated_at,
+            )
             .await?;
+        }
         append_event(
             &mut tx,
             "area",
             id,
-            "transitioned",
-            Some(&to_wire(&from)?),
-            Some(&to_str),
-            &json!({"area_id": id}),
-            &now,
+            "updated",
+            None,
+            None,
+            &serde_json::to_value(&updated)?,
+            &updated.updated_at,
         )
         .await?;
         tx.commit().await?;
-        Ok(Area {
+        Ok(updated)
+    }
+
+    pub async fn update_direction(&self, id: &str, patch: &DirectionPatch) -> Result<Direction> {
+        // The triage direction is a system row classify falls back to
+        // (migration 0014): renaming it, abandoning it or putting it in an
+        // Area would break that path, so it cannot be edited here.
+        if id == crate::core::TRIAGE_DIRECTION_ID {
+            return Err(StoreError::Conflict(
+                "the triage direction is managed by Sin90 and cannot be edited".into(),
+            ));
+        }
+        if patch.title.as_deref().is_some_and(|t| t.trim().is_empty()) {
+            return Err(StoreError::Invalid("title must not be blank".into()));
+        }
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let row = sqlx::query("SELECT * FROM sin90_directions WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("direction {id}")))?;
+        let from: DirectionStatus = from_wire(&row.get::<String, _>("status"))?;
+        if let Some(to) = patch.status {
+            check_direction_transition(from, to)?;
+        }
+        let updated = Direction {
             id: id.to_string(),
-            title: row.get("title"),
-            slug: row.get("slug"),
-            status: to,
-            sort_key: row.get("sort_key"),
+            title: patch.title.clone().unwrap_or_else(|| row.get("title")),
+            status: patch.status.unwrap_or(from),
+            target_window: patch
+                .target_window
+                .clone()
+                .unwrap_or_else(|| row.get("target_window")),
+            area_id: patch.area_id.clone().unwrap_or_else(|| row.get("area_id")),
             created_at: row.get("created_at"),
-            updated_at: now,
-        })
+            updated_at: now_iso8601(),
+        };
+        sqlx::query("UPDATE sin90_directions SET title = ?, status = ?, target_window = ?, area_id = ?, updated_at = ? WHERE id = ?")
+            .bind(&updated.title).bind(to_wire(&updated.status)?).bind(&updated.target_window)
+            .bind(&updated.area_id).bind(&updated.updated_at).bind(id).execute(&mut *tx).await?;
+        append_event(
+            &mut tx,
+            "direction",
+            id,
+            "updated",
+            None,
+            None,
+            &serde_json::to_value(&updated)?,
+            &updated.updated_at,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(updated)
     }
 
     // ----- direct entity creation (user/planner actions, not AI proposals) ---
@@ -1304,14 +1391,31 @@ impl Sin90Store {
         direction_id: Option<&str>,
         task_id: Option<&str>,
         planned_minutes: u32,
+        routine_id: Option<&str>,
     ) -> Result<ScheduleBlock> {
         let id = ulid();
         let now = now_iso8601();
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(routine_id) = routine_id {
+            let status: Option<String> =
+                sqlx::query_scalar("SELECT status FROM sin90_routines WHERE id = ?")
+                    .bind(routine_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            match status.as_deref() {
+                None => return Err(StoreError::NotFound(format!("routine {routine_id}"))),
+                Some("retired") => {
+                    return Err(StoreError::Conflict(format!(
+                        "routine {routine_id} is retired"
+                    )))
+                }
+                Some(_) => {}
+            }
+        }
         sqlx::query(
             "INSERT INTO sin90_schedule_blocks
-                 (id, direction_id, task_id, status, planned_minutes, created_at, updated_at)
-             VALUES (?, ?, ?, 'planned', ?, ?, ?)",
+                 (id, direction_id, task_id, status, planned_minutes, created_at, updated_at, routine_id)
+             VALUES (?, ?, ?, 'planned', ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(direction_id)
@@ -1319,6 +1423,7 @@ impl Sin90Store {
         .bind(planned_minutes as i64)
         .bind(&now)
         .bind(&now)
+        .bind(routine_id)
         .execute(&mut *tx)
         .await?;
         append_event(
@@ -1328,12 +1433,13 @@ impl Sin90Store {
             "created",
             None,
             Some("planned"),
-            &json!({"id": id, "direction_id": direction_id, "planned_minutes": planned_minutes}),
+            &json!({"id": id, "direction_id": direction_id, "planned_minutes": planned_minutes, "routine_id": routine_id}),
             &now,
         )
         .await?;
         tx.commit().await?;
         Ok(ScheduleBlock {
+            routine_id: routine_id.map(str::to_string),
             id,
             direction_id: direction_id.map(str::to_string),
             task_id: task_id.map(str::to_string),
@@ -1354,7 +1460,7 @@ impl Sin90Store {
     ) -> Result<ScheduleBlock> {
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query(
-            "SELECT status, planned_minutes, direction_id, task_id, created_at
+            "SELECT status, planned_minutes, direction_id, task_id, routine_id, created_at
              FROM sin90_schedule_blocks WHERE id = ?",
         )
         .bind(id)
@@ -1369,6 +1475,7 @@ impl Sin90Store {
         let minutes: i64 = row.get("planned_minutes");
         let direction_id: Option<String> = row.get("direction_id");
         let task_id: Option<String> = row.get("task_id");
+        let routine_id: Option<String> = row.get("routine_id");
         let created_at: String = row.get("created_at");
         let now = now_iso8601();
         let to_wire_str = to_wire(&to)?;
@@ -1413,6 +1520,7 @@ impl Sin90Store {
             Some(&to_wire_str),
             &json!({
                 "block_id": id,
+                "routine_id": routine_id,
                 "direction_id": direction_id,
                 "week_id": week_id,
                 "direction_title": direction_title,
@@ -1424,6 +1532,7 @@ impl Sin90Store {
         .await?;
         tx.commit().await?;
         Ok(ScheduleBlock {
+            routine_id,
             id: id.to_string(),
             direction_id,
             task_id,
@@ -1696,7 +1805,7 @@ impl Sin90Store {
         .collect::<Result<Vec<_>>>()?;
 
         let deep_block = sqlx::query(
-            "SELECT id, direction_id, task_id, status, planned_minutes, created_at, updated_at
+            "SELECT id, direction_id, task_id, routine_id, status, planned_minutes, created_at, updated_at
              FROM sin90_schedule_blocks
              WHERE status = 'planned'
              ORDER BY created_at ASC
@@ -1706,6 +1815,7 @@ impl Sin90Store {
         .await?
         .map(|r| {
             Ok::<_, StoreError>(ScheduleBlock {
+                routine_id: r.get("routine_id"),
                 id: r.get("id"),
                 direction_id: r.get("direction_id"),
                 task_id: r.get("task_id"),
@@ -2822,7 +2932,7 @@ impl Sin90Store {
 
     pub async fn list_blocks(&self) -> Result<Vec<ScheduleBlock>> {
         let rows = sqlx::query(
-            "SELECT id, direction_id, task_id, status, planned_minutes, created_at, updated_at
+            "SELECT id, direction_id, task_id, routine_id, status, planned_minutes, created_at, updated_at
              FROM sin90_schedule_blocks
              ORDER BY created_at DESC, rowid DESC",
         )
@@ -2831,6 +2941,7 @@ impl Sin90Store {
         rows.into_iter()
             .map(|r| {
                 Ok(ScheduleBlock {
+                    routine_id: r.get("routine_id"),
                     id: r.get("id"),
                     direction_id: r.get("direction_id"),
                     task_id: r.get("task_id"),
@@ -7678,7 +7789,7 @@ mod review_routine_tests {
 
         let in_week = "2026-09-22T09:00:00Z"; // 2026-W39
         let block = store
-            .create_block(Some(&direction.id), None, 90)
+            .create_block(Some(&direction.id), None, 90, None)
             .await
             .unwrap();
         store

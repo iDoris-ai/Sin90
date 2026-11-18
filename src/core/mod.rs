@@ -26,11 +26,11 @@ pub use transitions::{
     week_transition_allowed, TransitionError,
 };
 pub use types::{
-    Alloc, Area, AreaId, AreaStatus, Direction, DirectionId, DirectionStatus, Energy, FireTrigger,
-    NewReview, NewRoutine, ProposalStatus, Review, ReviewId, ReviewKind, ReviewPatch, ReviewStatus,
-    Rhythm, RhythmId, RhythmStatus, Routine, RoutineId, RoutineKind, RoutinePatch, RoutineStatus,
-    ScheduleBlock, ScheduleBlockId, ScheduleBlockStatus, Task, TaskId, TaskKind, TaskStatus, Week,
-    WeekId, WeekStatus, TRIAGE_DIRECTION_ID,
+    Alloc, Area, AreaId, AreaPatch, AreaStatus, Direction, DirectionId, DirectionPatch,
+    DirectionStatus, Energy, FireTrigger, NewReview, NewRoutine, ProposalStatus, Review, ReviewId,
+    ReviewKind, ReviewPatch, ReviewStatus, Rhythm, RhythmId, RhythmStatus, Routine, RoutineId,
+    RoutineKind, RoutinePatch, RoutineStatus, ScheduleBlock, ScheduleBlockId, ScheduleBlockStatus,
+    Task, TaskId, TaskKind, TaskStatus, Week, WeekId, WeekStatus, TRIAGE_DIRECTION_ID,
 };
 pub use util::{
     canonical_iso_date, canonical_iso_week, is_fixed_iso8601, iso8601_after_secs, iso_week_bounds,

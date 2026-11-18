@@ -126,3 +126,99 @@ async fn a_real_process_serves_http_and_a_second_process_sees_what_the_first_wro
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn l1_edit_routes_persist_across_real_process_restart() {
+    let dir = std::env::temp_dir().join(format!("sin90-l1-blackbox-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let client = reqwest::Client::new();
+    let key = "blackbox-human-key-0123456789abcdef";
+    let area_id;
+    let direction_id;
+    {
+        let server = Server::spawn(&dir).await;
+        let area: serde_json::Value = client
+            .post(format!("{}/areas", server.base()))
+            .header("x-sin90-actor-key", key)
+            .json(&serde_json::json!({"title":"Health"}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        area_id = area["id"].as_str().unwrap().to_string();
+        let resp = client
+            .patch(format!("{}/areas/{area_id}", server.base()))
+            .header("x-sin90-actor-key", key)
+            .json(&serde_json::json!({"current_state":"现在", "ideal_state":"理想"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let direction: serde_json::Value = client
+            .post(format!("{}/directions", server.base()))
+            .header("x-sin90-actor-key", key)
+            .json(&serde_json::json!({"title":"Run", "target_window":"2026-Q4"}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        direction_id = direction["id"].as_str().unwrap().to_string();
+        let uri = format!("{}/directions/{direction_id}", server.base());
+        let resp = client
+            .patch(&uri)
+            .header("x-sin90-actor-key", key)
+            .json(&serde_json::json!({"status":"achieved"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409);
+        let resp = client.patch(&uri).header("x-sin90-actor-key", key).json(&serde_json::json!({"title":"Jog", "status":"active", "target_window":"2027-Q1", "area_id":area_id})).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+    {
+        let server = Server::spawn(&dir).await;
+        let areas: serde_json::Value = client
+            .get(format!("{}/areas", server.base()))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let area = areas["areas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == area_id)
+            .unwrap();
+        assert_eq!(area["current_state"], "现在");
+        assert_eq!(area["ideal_state"], "理想");
+        let directions: serde_json::Value = client
+            .get(format!("{}/directions", server.base()))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let d = directions["directions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["id"] == direction_id)
+            .unwrap();
+        assert_eq!(d["title"], "Jog");
+        assert_eq!(d["status"], "active");
+        assert_eq!(d["area_id"], area_id);
+        assert_eq!(d["target_window"], "2027-Q1");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
