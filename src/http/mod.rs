@@ -27,6 +27,7 @@ mod ai_propose;
 pub mod ai_runs;
 mod ai_summarize;
 mod period_plans;
+mod progress;
 pub mod state;
 
 use axum::body::Bytes;
@@ -155,6 +156,11 @@ pub fn router(state: Sin90State, mounted: bool) -> axum::Router {
             get(period_plans::list).post(period_plans::create),
         )
         .route("/period-plans/{id}", patch(period_plans::update))
+        .route("/progress", get(progress::get))
+        .route(
+            "/settings/progress",
+            get(progress::settings).put(progress::put_settings),
+        )
         .route("/tasks", post(create_task).get(list_tasks))
         .route("/tasks/{id}", patch(transition_task))
         .route("/schedule-blocks", post(create_block).get(list_blocks))

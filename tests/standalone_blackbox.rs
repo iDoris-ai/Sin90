@@ -390,3 +390,102 @@ async fn l2a_real_http_proposals_protect_edits_and_cascade_survives_restart() {
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+async fn l3_progress_real_http_and_persistent_settings() {
+    let dir = std::env::temp_dir().join(format!("sin90-l3-blackbox-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let server = Server::spawn(&dir).await;
+    let client = reqwest::Client::new();
+    let key = "blackbox-human-key-0123456789abcdef";
+    let d: serde_json::Value = client
+        .post(format!("{}/directions", server.base()))
+        .header("x-sin90-actor-key", key)
+        .json(&serde_json::json!({"title":"Run", "target_window":"2026"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let direction = d["id"].as_str().unwrap();
+    let mut parent: Option<String> = None;
+    for (kind, period) in [
+        ("year", "2026"),
+        ("quarter", "2026-Q1"),
+        ("month", "2026-03"),
+    ] {
+        let plan: serde_json::Value = client.post(format!("{}/period-plans", server.base()))
+            .header("x-sin90-actor-key", key)
+            .json(&serde_json::json!({"direction_id":direction, "kind":kind, "period":period,"parent_id":parent,"target":"Run", "metric":"count", "metric_target":31}))
+            .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        parent = Some(plan["id"].as_str().unwrap().to_owned());
+    }
+    let progress: serde_json::Value = client
+        .get(format!(
+            "{}/progress?direction_id={direction}&at=2026-03-15",
+            server.base()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let month = progress["progress"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["plan_id"].as_str() == parent.as_deref())
+        .unwrap();
+    assert_eq!(month["status"], "at_risk");
+    assert_eq!(month["actual"], 0);
+    assert_eq!(month["miss_streak"], 3);
+    assert_eq!(month["expected"], 15.0);
+    client
+        .put(format!("{}/settings/progress", server.base()))
+        .header("x-sin90-actor-key", key)
+        .json(&serde_json::json!({"streak_weeks":4}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    drop(server);
+    let server = Server::spawn(&dir).await;
+    let settings: serde_json::Value = client
+        .get(format!("{}/settings/progress", server.base()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(settings["streak_weeks"], 4);
+    let progress: serde_json::Value = client
+        .get(format!(
+            "{}/progress?direction_id={direction}&at=2026-03-15",
+            server.base()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let month = progress["progress"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["plan_id"].as_str() == parent.as_deref())
+        .unwrap();
+    assert_eq!(month["status"], "behind");
+    drop(server);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
