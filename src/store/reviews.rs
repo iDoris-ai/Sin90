@@ -13,6 +13,28 @@ use std::collections::BTreeMap;
 /// through `PUT /settings/review` (human only), not the Routine routes: the
 /// next settings write overwrites the cron. `GET /settings/review` is a plain
 /// read like the other list routes and needs no human key.
+/// The IANA name for the review Routine's `tz`. Under Agent24's module
+/// sandbox the zone can be known without its name (no readable
+/// `/etc/localtime` link, no `TZ`); then the current offset is written as an
+/// `Etc/GMT` zone so 18:00 still fires at local 18:00. Never fails: a missing
+/// name must not stop the module from starting.
+pub(crate) fn system_tz_name(zone: &TimeZone, now: Timestamp) -> String {
+    if let Some(name) = zone.iana_name() {
+        return name.to_string();
+    }
+    let seconds = zone.to_offset(now).seconds();
+    if seconds % 3600 != 0 || seconds == 0 {
+        return "UTC".to_string();
+    }
+    // Etc/GMT signs are inverted: UTC+7 is Etc/GMT-7.
+    let hours = seconds / 3600;
+    format!(
+        "Etc/GMT{}{}",
+        if hours > 0 { '-' } else { '+' },
+        hours.abs()
+    )
+}
+
 pub const SYSTEM_REVIEW_ID: &str = "00000000000000000000000001";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -74,10 +96,8 @@ impl Sin90Store {
             let weekday = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
                 [usize::from(settings.weekday - 1)];
             let cron = format!("0 {} * * {}", settings.hour, weekday);
-            let zone = TimeZone::system();
-            let tz = zone.iana_name().ok_or_else(|| {
-                StoreError::Invalid("system timezone must have an IANA name".into())
-            })?;
+            let tz = system_tz_name(&TimeZone::system(), Timestamp::now());
+            let tz = tz.as_str();
             let status = if settings.auto { "active" } else { "paused" };
             sqlx::query("INSERT INTO sin90_routines(id,title,kind,cron,tz,status,created_at,updated_at) VALUES (?,'自动复盘','review',?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET cron=excluded.cron,tz=excluded.tz,status=excluded.status,updated_at=excluded.updated_at")
                 .bind(SYSTEM_REVIEW_ID).bind(&cron).bind(tz).bind(status).bind(&now).bind(&now).execute(&mut *tx).await?;
@@ -875,5 +895,19 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn a_zone_without_a_name_falls_back_to_its_offset() {
+        let now = Timestamp::now();
+        let plus7 = TimeZone::fixed(jiff::tz::offset(7));
+        assert_eq!(system_tz_name(&plus7, now), "Etc/GMT-7");
+        let minus5 = TimeZone::fixed(jiff::tz::offset(-5));
+        assert_eq!(system_tz_name(&minus5, now), "Etc/GMT+5");
+        assert_eq!(system_tz_name(&TimeZone::UTC, now), "UTC");
+        let named = TimeZone::get("Asia/Bangkok").unwrap();
+        assert_eq!(system_tz_name(&named, now), "Asia/Bangkok");
+        // The fallback is itself a zone the routine validator accepts.
+        assert!(TimeZone::get("Etc/GMT-7").is_ok());
     }
 }
