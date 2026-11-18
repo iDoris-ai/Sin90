@@ -811,7 +811,15 @@ async fn dry_run(
     let mut event_ids = Vec::new();
     let mut dry: Result<(), SinkError> = Ok(());
     for op in ops {
-        if let Err(e) = apply_op(&mut sp, op, &mut event_ids, capability_source).await {
+        if let Err(e) = apply_op(
+            &mut sp,
+            op,
+            &mut event_ids,
+            capability_source,
+            &mut Vec::new(),
+        )
+        .await
+        {
             dry = Err(classify_apply_err(e));
             break;
         }
@@ -1135,6 +1143,30 @@ mod tests {
 
     use super::*;
     use crate::core::{Energy, NewTask, TaskKind};
+
+    #[test]
+    fn l2a_existing_capabilities_cannot_submit_goal_or_period_ops() {
+        let ops = [
+            Sin90Op::SetDirectionGoal {
+                direction_id: "d".into(),
+                goal_3y: "goal".into(),
+                from_year: 2026,
+            },
+            Sin90Op::UpsertPeriodPlans {
+                direction_id: "d".into(),
+                plans: Vec::new(),
+            },
+        ];
+        for capability in [
+            Capability::Classify,
+            Capability::Summarize,
+            Capability::Propose,
+        ] {
+            for op in &ops {
+                assert!(allowed_ops(capability, std::slice::from_ref(op)).is_err());
+            }
+        }
+    }
 
     fn rec(id: &str, run_id: &str, ok: bool, error_kind: Option<&'static str>) -> AiCallRecord {
         AiCallRecord {

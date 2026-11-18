@@ -32,6 +32,8 @@ use crate::store::{Result, Sin90Store, StoreError, WeekAttention};
 /// Receipt of a successful (or idempotently-replayed) proposal apply.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AppliedProposal {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_period_plans: Vec<crate::core::SkippedPeriodPlan>,
     pub proposal_id: String,
     /// Ids of events appended by this apply, in order.
     pub event_ids: Vec<String>,
@@ -1060,6 +1062,17 @@ impl Sin90Store {
         if patch.title.as_deref().is_some_and(|t| t.trim().is_empty()) {
             return Err(StoreError::Invalid("title must not be blank".into()));
         }
+        // Same rules as the SetDirectionGoal op, so both paths store the same shapes.
+        if let Some(Some(goal)) = &patch.goal_3y {
+            if goal.trim().is_empty() {
+                return Err(StoreError::Invalid("goal_3y must not be blank".into()));
+            }
+        }
+        if let Some(Some(year)) = patch.goal_from_year {
+            if !(1..=9997).contains(&year) {
+                return Err(StoreError::Invalid("goal_from_year must be 1..9997".into()));
+            }
+        }
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query("SELECT * FROM sin90_directions WHERE id = ?")
             .bind(id)
@@ -1071,6 +1084,10 @@ impl Sin90Store {
             check_direction_transition(from, to)?;
         }
         let updated = Direction {
+            goal_3y: patch.goal_3y.clone().unwrap_or_else(|| row.get("goal_3y")),
+            goal_from_year: patch
+                .goal_from_year
+                .unwrap_or_else(|| row.get("goal_from_year")),
             id: id.to_string(),
             title: patch.title.clone().unwrap_or_else(|| row.get("title")),
             status: patch.status.unwrap_or(from),
@@ -1082,9 +1099,9 @@ impl Sin90Store {
             created_at: row.get("created_at"),
             updated_at: now_iso8601(),
         };
-        sqlx::query("UPDATE sin90_directions SET title = ?, status = ?, target_window = ?, area_id = ?, updated_at = ? WHERE id = ?")
+        sqlx::query("UPDATE sin90_directions SET title = ?, status = ?, target_window = ?, area_id = ?, goal_3y = ?, goal_from_year = ?, updated_at = ? WHERE id = ?")
             .bind(&updated.title).bind(to_wire(&updated.status)?).bind(&updated.target_window)
-            .bind(&updated.area_id).bind(&updated.updated_at).bind(id).execute(&mut *tx).await?;
+            .bind(&updated.area_id).bind(&updated.goal_3y).bind(updated.goal_from_year).bind(&updated.updated_at).bind(id).execute(&mut *tx).await?;
         append_event(
             &mut tx,
             "direction",
@@ -1136,6 +1153,8 @@ impl Sin90Store {
         .await?;
         tx.commit().await?;
         Ok(Direction {
+            goal_3y: None,
+            goal_from_year: None,
             id,
             area_id: area_id.map(str::to_string),
             title: title.to_string(),
@@ -2884,7 +2903,7 @@ impl Sin90Store {
 
     pub async fn list_directions(&self) -> Result<Vec<Direction>> {
         let rows = sqlx::query(
-            "SELECT id, area_id, title, status, target_window, created_at, updated_at
+            "SELECT id, area_id, title, status, target_window, goal_3y, goal_from_year, created_at, updated_at
              FROM sin90_directions
              ORDER BY created_at DESC, rowid DESC",
         )
@@ -2893,6 +2912,8 @@ impl Sin90Store {
         rows.into_iter()
             .map(|r| {
                 Ok(Direction {
+                    goal_3y: r.get("goal_3y"),
+                    goal_from_year: r.get("goal_from_year"),
                     id: r.get("id"),
                     area_id: r.get("area_id"),
                     title: r.get("title"),
@@ -3218,11 +3239,20 @@ impl Sin90Store {
         validate(&proposal, &snapshot, &capability_source)?; // Err → tx drops → rollback → back to pending
 
         let mut event_ids = Vec::new();
+        let mut skipped_period_plans = Vec::new();
         for op in &ops {
-            apply_op(&mut tx, op, &mut event_ids, &capability_source).await?;
+            apply_op(
+                &mut tx,
+                op,
+                &mut event_ids,
+                &capability_source,
+                &mut skipped_period_plans,
+            )
+            .await?;
         }
 
         let receipt = AppliedProposal {
+            skipped_period_plans,
             proposal_id: proposal_id.to_string(),
             event_ids,
         };
@@ -3829,6 +3859,7 @@ impl Sin90Store {
 /// `task_parents` for the new `CreateArea`/`CreateTask` ops.
 #[derive(Default)]
 pub(crate) struct DbSnapshot {
+    period_plans: HashMap<String, Vec<crate::core::PeriodPlan>>,
     tasks: HashMap<String, TaskStatus>,
     task_parents: HashMap<String, Option<String>>,
     weeks: HashMap<String, WeekStatus>,
@@ -3851,6 +3882,12 @@ pub(crate) struct DbSnapshot {
 }
 
 impl ValidationCtx for DbSnapshot {
+    fn period_plans(&self, direction_id: &str) -> Vec<crate::core::PeriodPlan> {
+        self.period_plans
+            .get(direction_id)
+            .cloned()
+            .unwrap_or_default()
+    }
     fn task_status(&self, id: &str) -> Option<TaskStatus> {
         self.tasks.get(id).copied()
     }
@@ -3884,6 +3921,20 @@ pub(crate) async fn build_snapshot(tx: &mut Tx<'_>, ops: &[Sin90Op]) -> Result<D
     let mut snap = DbSnapshot::default();
     for op in ops {
         match op {
+            Sin90Op::SetDirectionGoal { direction_id, .. }
+            | Sin90Op::UpsertPeriodPlans { direction_id, .. } => {
+                load_direction_status(tx, direction_id, &mut snap).await?;
+                let rows = sqlx::query("SELECT * FROM sin90_period_plans WHERE direction_id = ?")
+                    .bind(direction_id)
+                    .fetch_all(&mut **tx)
+                    .await?;
+                snap.period_plans.insert(
+                    direction_id.clone(),
+                    rows.into_iter()
+                        .map(super::period_plans::row_to_plan)
+                        .collect::<Result<Vec<_>>>()?,
+                );
+            }
             Sin90Op::CreateArea { .. } | Sin90Op::CreateDirection { .. } => {}
             Sin90Op::CreateTask { parent_task_id, .. } => {
                 if let Some(pid) = parent_task_id {
@@ -4087,9 +4138,66 @@ pub(crate) async fn apply_op(
     op: &Sin90Op,
     event_ids: &mut Vec<String>,
     capability_source: &str,
+    skipped: &mut Vec<crate::core::SkippedPeriodPlan>,
 ) -> Result<()> {
     let now = now_iso8601();
     match op {
+        Sin90Op::SetDirectionGoal {
+            direction_id,
+            goal_3y,
+            from_year,
+        } => {
+            if goal_3y.trim().is_empty() || !(1..=9997).contains(from_year) {
+                return Err(StoreError::Invalid("invalid direction goal".into()));
+            }
+            let row = sqlx::query("UPDATE sin90_directions SET goal_3y = ?, goal_from_year = ?, updated_at = ? WHERE id = ? RETURNING *")
+                .bind(goal_3y).bind(from_year).bind(&now).bind(direction_id).fetch_optional(&mut **tx).await?
+                .ok_or_else(|| StoreError::NotFound(format!("direction {direction_id}")))?;
+            let snapshot = json!({"id": direction_id, "area_id": row.get::<Option<String>, _>("area_id"), "title": row.get::<String, _>("title"), "status": row.get::<String, _>("status"), "target_window": row.get::<String, _>("target_window"), "goal_3y": goal_3y, "goal_from_year": from_year, "created_at": row.get::<String, _>("created_at"), "updated_at": now});
+            event_ids.push(
+                append_event(
+                    tx,
+                    "direction",
+                    direction_id,
+                    "updated",
+                    None,
+                    None,
+                    &snapshot,
+                    &now,
+                )
+                .await?,
+            );
+        }
+        Sin90Op::UpsertPeriodPlans {
+            direction_id,
+            plans,
+        } => {
+            for plan in plans {
+                let row = sqlx::query("SELECT * FROM sin90_period_plans WHERE direction_id = ? AND kind = ? AND period = ?")
+                    .bind(direction_id).bind(to_wire(&plan.kind)?).bind(&plan.period).fetch_optional(&mut **tx).await?;
+                let old = row.map(super::period_plans::row_to_plan).transpose()?;
+                let updated = super::period_plans::write_plan(
+                    tx,
+                    direction_id,
+                    plan,
+                    crate::core::PlanSource::Ai,
+                    old.as_ref(),
+                    event_ids,
+                )
+                .await?;
+                if updated.is_none() {
+                    // Read again so a CAS miss also reports the current row identity.
+                    let id: String = sqlx::query_scalar("SELECT id FROM sin90_period_plans WHERE direction_id = ? AND kind = ? AND period = ?")
+                        .bind(direction_id).bind(to_wire(&plan.kind)?).bind(&plan.period).fetch_one(&mut **tx).await?;
+                    skipped.push(crate::core::SkippedPeriodPlan {
+                        id,
+                        direction_id: direction_id.clone(),
+                        kind: plan.kind,
+                        period: plan.period.clone(),
+                    });
+                }
+            }
+        }
         Sin90Op::CreateArea { title } => {
             let id = ulid();
             let slug = allocate_area_slug(tx, title).await?;

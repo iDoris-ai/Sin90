@@ -222,3 +222,171 @@ async fn l1_edit_routes_persist_across_real_process_restart() {
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+async fn l2a_real_http_proposals_protect_edits_and_cascade_survives_restart() {
+    use serde_json::{json, Value};
+    async fn write(
+        client: &reqwest::Client,
+        method: reqwest::Method,
+        url: String,
+        body: Value,
+        expected: u16,
+    ) -> Value {
+        let response = client
+            .request(method, url)
+            .header("x-sin90-actor-key", "blackbox-human-key-0123456789abcdef")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let result: Value = response.json().await.unwrap();
+        assert_eq!(status, expected, "{result}");
+        result
+    }
+    const PATCH: reqwest::Method = reqwest::Method::PATCH;
+    const POST: reqwest::Method = reqwest::Method::POST;
+    let dir = std::env::temp_dir().join(format!("sin90-l2a-blackbox-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let client = reqwest::Client::new();
+    let direction_id;
+    let human_year_id;
+    {
+        let server = Server::spawn(&dir).await;
+        let base = server.base();
+        let direction = write(
+            &client,
+            POST,
+            format!("{base}/directions"),
+            json!({"title":"Run", "target_window":"2026"}),
+            201,
+        )
+        .await;
+        direction_id = direction["id"].as_str().unwrap().to_string();
+        write(
+            &client,
+            PATCH,
+            format!("{base}/directions/{direction_id}"),
+            json!({"goal_3y":"Marathon", "goal_from_year":2026}),
+            200,
+        )
+        .await;
+        let year = write(&client, POST, format!("{base}/period-plans"), json!({"direction_id":direction_id, "kind":"year", "period":"2026", "target":"Human annual goal"}), 201).await;
+        human_year_id = year["id"].as_str().unwrap().to_string();
+        let quarter = write(&client, POST, format!("{base}/period-plans"), json!({"direction_id":direction_id, "kind":"quarter", "period":"2026-Q1", "parent_id":human_year_id, "target":"Quarter"}), 201).await;
+        write(&client, POST, format!("{base}/period-plans"), json!({"direction_id":direction_id, "kind":"month", "period":"2026-01", "parent_id":quarter["id"], "target":"Month"}), 201).await;
+        write(&client, POST, format!("{base}/period-plans"), json!({"direction_id":direction_id, "kind":"month", "period":"2026-13", "parent_id":quarter["id"], "target":"Invalid"}), 400).await;
+        write(&client, POST, format!("{base}/period-plans"), json!({"direction_id":direction_id, "kind":"month", "period":"2026-02", "parent_id":human_year_id, "target":"Invalid parent"}), 400).await;
+        write(
+            &client,
+            POST,
+            format!("{base}/proposals"),
+            json!({"id":"seed", "status":"pending", "source":"local_brain", "ops":[
+                {"op":"upsert_period_plans", "direction_id":direction_id, "plans":[
+                    {"kind":"year", "period":"2026", "target":"Skip human"},
+                    {"kind":"year", "period":"2027", "target":"AI annual goal"}
+                ]}
+            ]}),
+            202,
+        )
+        .await;
+        let receipt = write(
+            &client,
+            POST,
+            format!("{base}/proposals/seed/accept"),
+            json!({}),
+            200,
+        )
+        .await;
+        assert_eq!(receipt["skipped_period_plans"][0]["id"], human_year_id);
+        let plans: Value = client
+            .get(format!("{base}/period-plans?kind=year&period=2027"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let ai_id = plans["period_plans"][0]["id"].as_str().unwrap();
+        write(&client, POST, format!("{base}/proposals"), json!({"id":"pending", "status":"pending", "source":"local_brain", "ops":[
+            {"op":"set_direction_goal", "direction_id":direction_id, "goal_3y":"Ultra", "from_year":2027},
+            {"op":"upsert_period_plans", "direction_id":direction_id, "plans":[
+                {"kind":"year", "period":"2027", "target":"Stale AI goal"},
+                {"kind":"year", "period":"2028", "target":"New AI goal"}
+            ]}
+        ]}), 202).await;
+        write(
+            &client,
+            PATCH,
+            format!("{base}/period-plans/{ai_id}"),
+            json!({"target":"Human revision"}),
+            200,
+        )
+        .await;
+        let receipt = write(
+            &client,
+            POST,
+            format!("{base}/proposals/pending/accept"),
+            json!({}),
+            200,
+        )
+        .await;
+        assert_eq!(receipt["skipped_period_plans"][0]["id"], ai_id);
+        write(
+            &client,
+            PATCH,
+            format!("{base}/period-plans/{human_year_id}"),
+            json!({"status":"dropped"}),
+            200,
+        )
+        .await;
+    }
+    {
+        let server = Server::spawn(&dir).await;
+        let plans: Value = client
+            .get(format!(
+                "{}/period-plans?direction_id={direction_id}",
+                server.base()
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let plans = plans["period_plans"].as_array().unwrap();
+        assert_eq!(plans.len(), 5);
+        for plan in plans {
+            let period = plan["period"].as_str().unwrap();
+            if period.starts_with("2026") {
+                assert_eq!(plan["status"], "dropped");
+            }
+            if period == "2027" {
+                assert_eq!(plan["target"], "Human revision");
+                assert_eq!(plan["source"], "user");
+            }
+            if period == "2028" {
+                assert_eq!(plan["target"], "New AI goal");
+                assert_eq!(plan["source"], "ai");
+            }
+        }
+        let directions: Value = client
+            .get(format!("{}/directions", server.base()))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let d = directions["directions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["id"] == direction_id)
+            .unwrap();
+        assert_eq!(d["goal_3y"], "Ultra");
+        assert_eq!(d["goal_from_year"], 2027);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
