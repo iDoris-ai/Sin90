@@ -1,0 +1,351 @@
+{
+  "id": "graduate",
+  "lang": "en",
+  "version": 1,
+  "title": "Demo: The First Year After Graduation",
+  "persona": "Zhou, 23, six months out of college, living alone and working their first job in a big city. Evenings usually slip away scrolling on their phone and ordering takeout—sitting too long, sleeping too late. Their curiosity is still very much alive, they just aren't sure where to direct their energy yet.",
+  "guide": "This is a demo template showing how Sin90 works: each of the six life areas features a 'Now → Ideal' vision, a guiding direction, and a 3-year goal. This year's goals break down into quarterly and monthly milestones; weekly rhythms are sustained with daily routines; and today starts with three small, actionable tasks. You can edit this template directly into your own plan, or clear everything under 'Data' to start from scratch. A backup is created automatically before any changes, so you can restore at any time.",
+  "areas": [
+    {
+      "key": "work",
+      "title": "Work",
+      "current_state": "Less than a year into the job, relying on overtime to compensate for inexperience; doing plenty of tasks, but nothing tangible to show for it yet.",
+      "ideal_state": "Become the go-to person the team can always rely on in one core area, with 3 standout portfolio pieces under your belt.",
+      "directions": [
+        {
+          "key": "work-core",
+          "title": "Build portable core skills: structured communication + one hard skill",
+          "goal_3y": "In 3 years: lead a complete project end-to-end, with a public portfolio of 3 substantial projects",
+          "years": [
+            {
+              "target": "Master the fundamentals: write a monthly work retrospective, and learn one hard skill (e.g. SQL / Python for data analysis)",
+              "metric": "count",
+              "metric_target": 12
+            },
+            {
+              "target": "Lead a small project from initial requirements to final launch",
+              "metric": "none"
+            },
+            {
+              "target": "Own a full-scale project independently, bringing the portfolio count to 3",
+              "metric": "count",
+              "metric_target": 3
+            }
+          ],
+          "quarter": {
+            "target": "Get comfortable with the basics of the hard skill, build your first mini-project, and write a retrospective on it",
+            "metric": "count",
+            "metric_target": 1
+          },
+          "month": {
+            "target": "Protect three 90-minute blocks of uninterrupted deep work each week",
+            "metric": "count",
+            "metric_target": 12,
+            "routine": "deep-work"
+          }
+        }
+      ]
+    },
+    {
+      "key": "health",
+      "title": "Health",
+      "current_state": "Sitting at a desk all day, living on takeout, staying up until 1 AM, and getting winded climbing a few flights of stairs.",
+      "ideal_state": "Consistent sleep schedule, weekly strength training, eating mostly whole foods, and enjoying steady energy all day long.",
+      "directions": [
+        {
+          "key": "health-base",
+          "title": "Build a physical foundation that lasts a lifetime: Sleep · Strength · Nutrition",
+          "goal_3y": "In 3 years: sleep consistently at 23:30 and wake at 7:30; barbell squat your bodyweight; complete a 10 km run; keep body fat in a healthy range",
+          "years": [
+            {
+              "target": "Stick to resistance training twice a week for 40 weeks; master four foundational movements: squat, glute bridge, push-up, and row",
+              "metric": "count",
+              "metric_target": 80,
+              "routine": "strength"
+            },
+            {
+              "target": "Strength training 3 times a week + 150 minutes of moderate cardio weekly; start running regularly",
+              "metric": "none"
+            },
+            {
+              "target": "Complete a 10 km run, and squat your own bodyweight",
+              "metric": "none"
+            }
+          ],
+          "quarter": {
+            "target": "Strength train twice a week, hit 8,000 steps a day; adopt the eating order: veggies first, protein second, carbs last",
+            "metric": "count",
+            "metric_target": 24,
+            "routine": "strength"
+          },
+          "month": {
+            "target": "Complete 8 strength sessions; hit daily protein target of body weight (kg) × 1.2–1.6 g (about 70–100 g for 60 kg)",
+            "metric": "count",
+            "metric_target": 8,
+            "routine": "strength"
+          }
+        }
+      ]
+    },
+    {
+      "key": "learning",
+      "title": "Learning",
+      "current_state": "Spending 2–3 hours on short videos every day; occasionally picking up a book, only to forget it right after.",
+      "ideal_state": "Have your own personal knowledge map: a solid grasp of AI, philosophy, history, and art—read a book, write a reflection.",
+      "directions": [
+        {
+          "key": "learning-io",
+          "title": "Cultivate a lifelong habit of 'Input → Output'",
+          "goal_3y": "In 3 years: read 36 books, write 36 reading reflections, and map out your personal mental model across AI, philosophy, history, and art",
+          "years": [
+            {
+              "target": "Read 12 books, write 12 reflections: 3 in each of the 4 areas (AI: build a hands-on mini tool with AI; Philosophy: Sophie's World, Meditations; History: Sapiens, A History of the World; Art: The Story of Art)",
+              "metric": "count",
+              "metric_target": 12
+            },
+            {
+              "target": "Read another 12 books, organizing the 12 reflections into 4 themed public essays",
+              "metric": "count",
+              "metric_target": 12
+            },
+            {
+              "target": "Read 12 more books, finalize all 4 knowledge maps, and give a talk or share them publicly",
+              "metric": "count",
+              "metric_target": 12
+            }
+          ],
+          "quarter": {
+            "target": "Read 3 books and write 3 reflections; visit an art gallery or museum once a month",
+            "metric": "count",
+            "metric_target": 3
+          },
+          "month": {
+            "target": "Read 30 minutes every day; finish 1 book and write 1 reflection",
+            "metric": "minutes",
+            "metric_target": 900,
+            "routine": "reading"
+          }
+        }
+      ]
+    },
+    {
+      "key": "relation",
+      "title": "Relationships",
+      "current_state": "Friends scattered after graduation, barely exchanging a few words a week with family, and conversations with colleagues never leave work.",
+      "ideal_state": "Have 3–5 close confidants you can talk deeply with, stay warmly connected with family, and remain open to meeting new people.",
+      "directions": [
+        {
+          "key": "relation-deep",
+          "title": "Nurture fewer, deeper connections intentionally",
+          "goal_3y": "In 3 years: have 5 close friends you can confide in, call family weekly, and meet 10 intriguing new friends each year",
+          "years": [
+            {
+              "target": "Reach out to 1 person intentionally each week, and meet up in person once a month",
+              "metric": "count",
+              "metric_target": 52
+            },
+            {
+              "target": "Join an interest-based community and make 10 new friends",
+              "metric": "count",
+              "metric_target": 10
+            },
+            {
+              "target": "Have a meaningful, in-depth catchup with each of your 5 close friends once a quarter",
+              "metric": "none"
+            }
+          ],
+          "quarter": {
+            "target": "Reach out 12 times, meet up in person 3 times",
+            "metric": "count",
+            "metric_target": 12
+          },
+          "month": {
+            "target": "Call home every Sunday evening; catch up with an old friend over a meal",
+            "metric": "count",
+            "metric_target": 4,
+            "routine": "family-call"
+          }
+        }
+      ]
+    },
+    {
+      "key": "wealth",
+      "title": "Wealth",
+      "current_state": "Living paycheck to paycheck, never tracking expenses, with no emergency fund.",
+      "ideal_state": "Steady income growth, a 6-month living expense emergency cushion, and consistent long-term investing.",
+      "directions": [
+        {
+          "key": "wealth-system",
+          "title": "Set up the four-account money system: Daily Living · Emergency · Investments · Primary Account",
+          "goal_3y": "In 3 years: 6 months of living expenses saved in emergency funds, 20% of monthly income saved reliably, and 24 consecutive months of index fund DCA investing",
+          "years": [
+            {
+              "target": "Track spending for 12 months, building up a 3-month living expense emergency fund",
+              "metric": "none"
+            },
+            {
+              "target": "Grow the emergency cushion to 6 months, then start monthly index fund DCA investing",
+              "metric": "none"
+            },
+            {
+              "target": "Maintain index fund DCA for 24 months straight, doing an annual review of your net worth curve",
+              "metric": "none"
+            }
+          ],
+          "quarter": {
+            "target": "Set up the four separate accounts, automating a 20% transfer the day your paycheck hits",
+            "metric": "none"
+          },
+          "month": {
+            "target": "Track expenses for 30 consecutive days, reviewing at month-end to see where your money really went",
+            "metric": "none"
+          }
+        }
+      ]
+    },
+    {
+      "key": "creation",
+      "title": "Exploration & Creation",
+      "current_state": "Evenings are lost to scrolling feeds; it's been a long time since you made something simply because you wanted to.",
+      "ideal_state": "Have a meaningful long-term personal project, steadily express your creative voice, and stay eager to try things you've never done before.",
+      "directions": [
+        {
+          "key": "creation-works",
+          "title": "Finish one original piece of work every quarter",
+          "goal_3y": "In 3 years: finish 12 personal creations (writing, photography, coding tools, music all count!), and share at least 6 of them publicly",
+          "years": [
+            {
+              "target": "Complete 4 creations—one each quarter; try one brand-new experience every month",
+              "metric": "count",
+              "metric_target": 4
+            },
+            {
+              "target": "Complete 4 more pieces, sharing at least 2 publicly",
+              "metric": "count",
+              "metric_target": 4
+            },
+            {
+              "target": "Complete 4 more pieces, putting together a showcase or releasing a collection",
+              "metric": "count",
+              "metric_target": 4
+            }
+          ],
+          "quarter": {
+            "target": "Complete 1 creative piece (e.g. a street photography series, or a simple webpage)",
+            "metric": "count",
+            "metric_target": 1
+          },
+          "month": {
+            "target": "Carve out 2 uninterrupted hours every Saturday morning for creative work, rain or shine",
+            "metric": "minutes",
+            "metric_target": 480,
+            "routine": "create"
+          }
+        }
+      ]
+    }
+  ],
+  "routines": [
+    {
+      "key": "deep-work",
+      "title": "90 minutes of morning deep work on weekdays",
+      "kind": "deep_work",
+      "cron": "30 9 * * MON,WED,FRI",
+      "area": "work",
+      "direction": "work-core",
+      "target_minutes": 90
+    },
+    {
+      "key": "strength",
+      "title": "45-minute strength workout (Squat · Glute Bridge · Push-up · Row)",
+      "kind": "exercise",
+      "cron": "30 19 * * TUE,SAT",
+      "area": "health",
+      "direction": "health-base",
+      "target_count": 2
+    },
+    {
+      "key": "reading",
+      "title": "Read for 30 minutes before bed (phone left in the living room)",
+      "kind": "read",
+      "cron": "0 22 * * *",
+      "area": "learning",
+      "direction": "learning-io",
+      "target_minutes": 30
+    },
+    {
+      "key": "family-call",
+      "title": "Call family on Sunday evening",
+      "kind": "other",
+      "cron": "0 20 * * SUN",
+      "area": "relation",
+      "direction": "relation-deep",
+      "target_count": 1
+    },
+    {
+      "key": "save",
+      "title": "Transfer 20% to savings on payday",
+      "kind": "other",
+      "cron": "0 10 10 * *",
+      "area": "wealth",
+      "direction": "wealth-system",
+      "target_count": 1
+    },
+    {
+      "key": "create",
+      "title": "2 hours of creative time on Saturday morning",
+      "kind": "other",
+      "cron": "0 10 * * SAT",
+      "area": "creation",
+      "direction": "creation-works",
+      "target_minutes": 120
+    }
+  ],
+  "today": [
+    {
+      "title": "Head over to the Directions tab, read through the examples, and tweak one 3-year goal to fit your life",
+      "direction": "work-core",
+      "energy": "mid",
+      "est_minutes": 20,
+      "kind": "other"
+    },
+    {
+      "title": "Complete your first 45-minute strength session (follow along with a workout video if you're new)",
+      "direction": "health-base",
+      "energy": "high",
+      "est_minutes": 45,
+      "kind": "other"
+    },
+    {
+      "title": "Send a friendly text to an old friend you haven't spoken with in a while",
+      "direction": "relation-deep",
+      "energy": "low",
+      "est_minutes": 10,
+      "kind": "other"
+    }
+  ],
+  "inbox": [
+    "Book an annual health checkup",
+    "Visit an art exhibition this weekend",
+    "Pick the book to read this month",
+    "Draft a high-protein grocery list: eggs, chicken breast, tofu, Greek yogurt, fish"
+  ],
+  "week_blocks": [
+    {
+      "direction": "work-core",
+      "minutes": 90
+    },
+    {
+      "direction": "health-base",
+      "minutes": 45
+    },
+    {
+      "direction": "learning-io",
+      "minutes": 60
+    },
+    {
+      "direction": "creation-works",
+      "minutes": 120
+    }
+  ]
+}
