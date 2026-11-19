@@ -86,6 +86,42 @@
   - 最后在设置里记下 `template = {id, lang, loaded_at}`。
 - **时区重新同步**（v0.6.1 的待办）：启动时如果系统复盘 Routine 的 `tz` 与 `system_tz_name` 不一致，就更新它，并补发一次 scheduler upsert。
 
+#### S1 实现约束（#93 评审补充，必须照做）
+
+1. **自动加载只做一次**
+   - reset 和 import 清库后，在**同一个事务**里写入 `template.autoload_done=true`。
+   - 自动加载只在「`autoload_done` 未设置，并且是全新库」时触发。这样用户清成空白后重启，示范不会又冒出来。
+   - 加载器先写 `autoload_done`，并把整个加载放在一个事务里，中途失败就整体回滚，不会留下半套示范。
+2. **保留系统单例**
+   - `sin90_attention_watermark` 不清空。reset 和 import 之后只执行 `attention_rebuild`。
+   - 「补回系统种子」的清单：待定方向、系统复盘 Routine、`review` 设置、水位线行 `(1,0)`。
+3. **import 不能原样恢复的表**
+   - `sin90_outbox` 不导入。清空之后，对每条 Routine 重新生成：
+     - active → 生成 upsert
+     - paused → 生成 upsert，`enabled=false`
+     - 导入前存在、导入后已没有的 → 生成 delete
+   - `sin90_settings` 只按白名单导入：`review`、`progress.streak_weeks`、`template.*`。`ai.*` 永远不导入。导入后要保证 `review` 行存在。
+   - 事件表连同原始 `seq` 一起恢复，否则「导入后 progress 一致」不成立。
+4. **外键**
+   - 事务内设 `PRAGMA defer_foreign_keys=ON`，提交前执行 `PRAGMA foreign_key_check`，有违规就回滚并返回 400。
+   - 原因：`carried_from`、`parent_task_id`、`parent_id` 都是自引用，插入顺序不对会撞外键。
+5. **校验不能绕过**：import 对每条 Routine 重跑 `validate_cron` 和 `validate_tz`，对每条计划重跑 `validate_plan` 和 `validate_parent`，不合格返回 400。
+6. **schema 必须完全一致**：备份的 `schema` 必须等于当前迁移号，新的旧的都返回 400，并提示「用对应版本导出」。
+7. **备份文件名与路径**
+   - `restore-backup` 的 `name` 只允许匹配 `^[A-Za-z0-9._-]+\.json$`，解析后的路径必须落在 `backups/` 内，做法参照 `finalize_review` 的防逃逸。
+   - `data_dir` 为空（独立运行时没带 `--data-dir`）时，reset、import、restore 一律返回 409，不允许在没有备份的情况下继续。
+   - 「最多保留 10 份」只统计 `auto-*` 文件，用户自己导出的文件不删。
+8. **加载器细节**
+   - 方向的 `target_window` 用当年（`YYYY`）。创建后通过 `update_direction` 把状态设为 active，并写入 `goal_3y` 和 `goal_from_year`。
+   - 任务的 `kind` 取模板里的值，没写就用 `other`。
+   - 「本周的块」的做法：建出当前周（`sin90_weeks`），再建若干 planned 状态的 block。block 本身没有周列。
+   - graduate 模板和现有的 `/packs/install`（五个系统的种子）**并存**：packs 只建系统和方向，不变；graduate 是一套完整示范。
+9. **语言**：没有 `LANG` 或 `LC_ALL` 时默认用 zh，因为 macOS 的 GUI 和 launchd 进程通常不带 `LANG`。`POST /data/reset` 可以显式传 `lang`，桌面端会传。
+10. **中途创建的计划，进度从创建日开始算（改 L3 的 progress）**
+    - `expected` 和周达标序列的起点取「期间起点」和「计划创建日」中较晚的那个。创建之前的周不算未达标。
+    - 原因：11 月加载的年度计划，或者任何时候新建的计划，不应该一创建就显示落后。
+11. **`template` 设置拆成三行**：`template.id`、`template.lang`、`template.loaded_at`，符合 0009 中「value 是标量」的约定。
+
 ### S2 · AI 拆分（v0.6 方案里的 L2b）
 
 - `POST /ai/decompose {direction_id, down_to: "month"}`：
