@@ -91,7 +91,12 @@
 1. **自动加载只做一次**
    - reset 和 import 清库后，在**同一个事务**里写入 `template.autoload_done=true`。
    - 自动加载只在「`autoload_done` 未设置，并且是全新库」时触发。这样用户清成空白后重启，示范不会又冒出来。
-   - 加载器先写 `autoload_done`，并把整个加载放在一个事务里，中途失败就整体回滚，不会留下半套示范。
+   - **原子加载靠「暂存库 + 一次替换」实现**，不是把现有写入函数套进一个外层事务。原因是 `create_area`、`create_direction` 等函数各自 `BEGIN IMMEDIATE`，SQLite 只有一个写者，外层事务会把它们卡到 `busy_timeout` 再失败。
+     1. 新建一个内存库，先写入 `autoload_done`，再走现有写入路径把模板加载进去。事件和表结构与手动操作完全一致。
+     2. 把暂存库导出成备份。
+     3. 用 import 同一个「清空 + 写入」事务，一次性替换目标库。
+     - 中途任何一步失败，目标库都不受影响，不会留下半套示范。失败后不会自动重试，等用户手动「加载示范」。
+   - **写入顺序**：import / reset 的事务里，`template.autoload_done=true` 必须在 settings 白名单导入**之后**写。否则备份里带的 `template.*` 旧值会把它盖掉。
 2. **保留系统单例**
    - `sin90_attention_watermark` 不清空。reset 和 import 之后只执行 `attention_rebuild`。
    - 「补回系统种子」的清单：待定方向、系统复盘 Routine、`review` 设置、水位线行 `(1,0)`。
@@ -120,6 +125,9 @@
 10. **中途创建的计划，进度从创建日开始算（改 L3 的 progress）**
     - `expected` 和周达标序列的起点取「期间起点」和「计划创建日」中较晚的那个。创建之前的周不算未达标。
     - 原因：11 月加载的年度计划，或者任何时候新建的计划，不应该一创建就显示落后。
+    - **这是对 L3 进度语义的有意改动**，需要同步修改现有测试。那些用例先建过去期间的计划，再断言历史周未达标（如 `progress.rs` 的 `one_missed_week_stays_local…`、`src/http/tests.rs` 的连续三周用例）。改法是把这些用例中计划的 `created_at` 设到期间起点。
+    - 导入备份时保留计划原来的 `created_at`。进度从事件重放，payload 里带着 `created_at`，所以导入前后的 progress 一致。
+    - 手工补录过去期间的计划时，创建之前的周不再算未达标。这是可以接受的：补录的人知道那几周没在跟踪，系统不应该据此判定落后。
 11. **`template` 设置拆成三行**：`template.id`、`template.lang`、`template.loaded_at`，符合 0009 中「value 是标量」的约定。
 
 ### S2 · AI 拆分（v0.6 方案里的 L2b）
