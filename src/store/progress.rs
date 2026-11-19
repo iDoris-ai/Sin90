@@ -221,7 +221,14 @@ impl Sin90Store {
             .collect();
         let mut result: Vec<PlanProgress> = Vec::new();
         for p in &plans {
-            let (start, end) = bounds(p);
+            let (period_start, end) = bounds(p);
+            let created = p
+                .created_at
+                .parse::<Timestamp>()
+                .map_err(|_| StoreError::Invalid("invalid plan creation timestamp".into()))?
+                .to_zoned(tz.clone())
+                .date();
+            let start = period_start.max(created);
             let quantified = p.plan.metric != PlanMetric::None;
             let mut weeks = Vec::new();
             let mut miss_streak = 0;
@@ -313,9 +320,12 @@ impl Sin90Store {
             };
             result.push(PlanProgress {
                 plan_id: p.id.clone(),
-                actual: quantified.then(|| actual(p, &completions, start, end)),
+                actual: quantified.then(|| actual(p, &completions, period_start, end)),
                 expected: if quantified {
                     p.plan.metric_target.map(|t| {
+                        if start > end {
+                            return 0.0;
+                        }
                         let elapsed = if at < start {
                             0
                         } else {
@@ -403,6 +413,12 @@ mod tests {
                 .await
                 .unwrap();
             result.push(p);
+        }
+        super::super::test_hooks::backdate_plan_creation(&store, "2026-01-01T00:00:00Z")
+            .await
+            .unwrap();
+        for p in &mut result {
+            p.created_at = "2026-01-01T00:00:00Z".into();
         }
         (store, d.id, result)
     }
@@ -555,6 +571,9 @@ mod tests {
                         status: PlanStatus::Active,
                     },
                 )
+                .await
+                .unwrap();
+            super::super::test_hooks::backdate_plan_creation(&store, "2026-01-01T00:00:00Z")
                 .await
                 .unwrap();
             for day in ["2026-03-30", "2026-03-31", "2026-04-01"] {
@@ -792,5 +811,71 @@ mod tests {
             store.progress(&d, Some("2026-03-15")).await.unwrap(),
             before
         );
+    }
+}
+
+#[cfg(test)]
+mod creation_tests {
+    use super::*;
+    use crate::core::*;
+    #[tokio::test]
+    async fn newly_created_plans_exclude_prior_weeks_and_start_expected_at_creation() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let d = store
+            .create_direction("new goal", "2026", None)
+            .await
+            .unwrap();
+        let year = store
+            .create_period_plan(
+                &d.id,
+                &NewPeriodPlan {
+                    kind: PlanKind::Year,
+                    period: "2026".into(),
+                    parent_id: None,
+                    target: "goal".into(),
+                    metric: PlanMetric::Count,
+                    metric_target: Some(365),
+                    routine_id: None,
+                    status: PlanStatus::Active,
+                },
+            )
+            .await
+            .unwrap();
+        crate::store::test_hooks::backdate_plan_creation(&store, "2026-11-19T00:00:00Z")
+            .await
+            .unwrap();
+        let before = store
+            .progress_in(&d.id, Some("2026-11-18"), TimeZone::UTC)
+            .await
+            .unwrap();
+        assert_eq!(before[0].expected, Some(0.0));
+        assert!(before[0].weeks.is_empty());
+        let rows = store
+            .progress_in(&d.id, Some("2026-11-19"), TimeZone::UTC)
+            .await
+            .unwrap();
+        assert_eq!(rows[0].plan_id, year.id);
+        assert!(rows[0].weeks.is_empty());
+        assert_eq!(rows[0].miss_streak, 0);
+        assert_eq!(rows[0].status, "on_track");
+        assert_eq!(rows[0].expected, Some(365.0 / 43.0));
+        let end = store
+            .progress_in(&d.id, Some("2026-12-31"), TimeZone::UTC)
+            .await
+            .unwrap();
+        assert_eq!(end[0].expected, Some(365.0));
+        assert!(end[0]
+            .weeks
+            .iter()
+            .all(|w| w.iso_week.as_str() >= "2026-W47"));
+        crate::store::test_hooks::backdate_plan_creation(&store, "2027-01-02T00:00:00Z")
+            .await
+            .unwrap();
+        let expired = store
+            .progress_in(&d.id, Some("2027-01-03"), TimeZone::UTC)
+            .await
+            .unwrap();
+        assert_eq!(expired[0].expected, Some(0.0));
+        assert!(expired[0].weeks.is_empty());
     }
 }
