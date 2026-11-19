@@ -1,0 +1,155 @@
+{
+  "id": "graduate",
+  "lang": "zh",
+  "version": 1,
+  "title": "示范：刚毕业的第一年",
+  "persona": "小周，23 岁，刚毕业半年，在一座大城市做第一份工作，一个人住。下班后大多在刷手机，常点外卖，坐得久、睡得晚。好奇心还在，只是不知道该往哪里用力。",
+  "guide": "这是一套示范数据，用来演示 Sin90 怎么用：五个人生系统各有「现在 → 理想」、一个方向和三年目标；今年的目标拆到了季度和本月；每周的节奏用例行习惯来跑；今天有三件必做的小事。你可以直接在上面改成你自己的，也可以在「数据」里一键清空，从零开始；改之前会自动备份，随时能恢复。",
+  "areas": [
+    {
+      "key": "work",
+      "title": "工作 Work",
+      "current_state": "入职不到一年，靠加班补能力；做了不少事，却没有一件能拿出来展示。",
+      "ideal_state": "在一个方向上成为团队里「交给他就放心」的人，手上有 3 件拿得出手的作品。",
+      "directions": [
+        {
+          "key": "work-core",
+          "title": "打造可迁移的核心能力：结构化表达 + 一门硬技能",
+          "goal_3y": "三年后能独立负责一个完整项目，并有 3 件可公开展示的作品集",
+          "years": [
+            { "target": "把本职做扎实：每月写一篇工作复盘，学会一门硬技能（如 SQL / Python 数据分析）", "metric": "count", "metric_target": 12 },
+            { "target": "主导一个小项目，从需求到上线完整走一遍", "metric": "none" },
+            { "target": "独立负责一个完整项目，作品集累计 3 件", "metric": "count", "metric_target": 3 }
+          ],
+          "quarter": { "target": "完成硬技能入门，做出第 1 件小作品并写成一篇复盘", "metric": "count", "metric_target": 1 },
+          "month": { "target": "每周 3 次、每次 90 分钟不被打断的深度工作", "metric": "count", "metric_target": 12, "routine": "deep-work" }
+        }
+      ]
+    },
+    {
+      "key": "health",
+      "title": "健康 Health",
+      "current_state": "久坐一整天，外卖为主，凌晨一点才睡，爬几层楼就喘。",
+      "ideal_state": "睡眠规律、每周力量训练、饮食以原型食物为主，一整天精力都稳定。",
+      "directions": [
+        {
+          "key": "health-base",
+          "title": "建立能坚持一辈子的身体底子：睡眠 · 力量 · 饮食",
+          "goal_3y": "三年后：固定 23:30 睡、7:30 起；能负重深蹲自身体重；跑完一次 10 公里；体脂在健康区间",
+          "years": [
+            { "target": "每周 2 次抗阻训练坚持 40 周，学会深蹲、臀桥、俯卧撑、划船四个基本动作", "metric": "count", "metric_target": 80, "routine": "strength" },
+            { "target": "每周 3 次力量 + 每周 150 分钟中等强度有氧，开始跑步", "metric": "none" },
+            { "target": "跑完一次 10 公里，深蹲达到自身体重", "metric": "none" }
+          ],
+          "quarter": { "target": "每周 2 次力量训练，每天步行 8000 步；吃饭顺序固定为：先蔬菜，再蛋白质，最后主食", "metric": "count", "metric_target": 24, "routine": "strength" },
+          "month": { "target": "完成 8 次力量训练；每天蛋白质吃够「体重(kg) × 1.2–1.6 克」（60 公斤约 70–100 克）", "metric": "count", "metric_target": 8, "routine": "strength" }
+        }
+      ]
+    },
+    {
+      "key": "learning",
+      "title": "学习 Learning",
+      "current_state": "每天刷两三个小时短视频，偶尔读书，读完就忘。",
+      "ideal_state": "有自己的知识地图：对 AI、哲学、历史、艺术都有基本框架，读一本、写一篇。",
+      "directions": [
+        {
+          "key": "learning-io",
+          "title": "养成「输入 → 输出」的终身学习习惯",
+          "goal_3y": "三年读 36 本书、写 36 篇读书笔记，画出 AI、哲学、历史、艺术四个方向的个人知识地图",
+          "years": [
+            { "target": "读 12 本、写 12 篇：四个方向各 3 本（AI：动手用 AI 做一个小工具；哲学：《苏菲的世界》《沉思录》；历史：《人类简史》《全球通史》；艺术：《艺术的故事》）", "metric": "count", "metric_target": 12 },
+            { "target": "再读 12 本，并把 12 篇笔记整理成四个主题的文章公开", "metric": "count", "metric_target": 12 },
+            { "target": "再读 12 本，完成四张知识地图，做一次分享", "metric": "count", "metric_target": 12 }
+          ],
+          "quarter": { "target": "读 3 本、写 3 篇笔记；每月去一次美术馆或博物馆", "metric": "count", "metric_target": 3 },
+          "month": { "target": "每天读 30 分钟，读完 1 本并写 1 篇笔记", "metric": "minutes", "metric_target": 900, "routine": "reading" }
+        }
+      ]
+    },
+    {
+      "key": "relation",
+      "title": "关系 Relation",
+      "current_state": "毕业后朋友各奔东西，和家人一周说不上几句话，同事只聊工作。",
+      "ideal_state": "有 3–5 个能深谈的人，和家人保持稳定的联系，也愿意认识新的人。",
+      "directions": [
+        {
+          "key": "relation-deep",
+          "title": "主动经营少而深的关系",
+          "goal_3y": "三年后有 5 个能深谈的朋友，每周和家人通一次电话，每年认识 10 个有意思的新朋友",
+          "years": [
+            { "target": "每周主动联系 1 个人，每月见 1 次面", "metric": "count", "metric_target": 52 },
+            { "target": "参加一个兴趣社群，认识 10 个新朋友", "metric": "count", "metric_target": 10 },
+            { "target": "和 5 个朋友每季度深谈一次", "metric": "none" }
+          ],
+          "quarter": { "target": "主动联系 12 次，线下见面 3 次", "metric": "count", "metric_target": 12 },
+          "month": { "target": "每周日晚上给家里打一个电话；约一位老朋友吃饭", "metric": "count", "metric_target": 4, "routine": "family-call" }
+        }
+      ]
+    },
+    {
+      "key": "wealth",
+      "title": "财富 Wealth",
+      "current_state": "每月花光，不记账，没有应急的钱。",
+      "ideal_state": "收入稳步增长，存着 6 个月生活费的应急金，开始长期定投。",
+      "directions": [
+        {
+          "key": "wealth-system",
+          "title": "搭好钱的四个账户：生活 · 应急 · 投资 · 主账户",
+          "goal_3y": "三年后：6 个月生活费的应急金，每月固定存下收入的 20%，指数基金定投坚持满 24 个月",
+          "years": [
+            { "target": "记账 12 个月，攒出 3 个月生活费的应急金", "metric": "none" },
+            { "target": "应急金到 6 个月，开始每月指数基金定投", "metric": "none" },
+            { "target": "定投坚持满 24 个月，每年复盘一次资产曲线", "metric": "none" }
+          ],
+          "quarter": { "target": "建好四个账户，发工资当天自动转出 20%", "metric": "none" },
+          "month": { "target": "连续记账 30 天，月底看一次钱都花在了哪里", "metric": "none", "routine": "save" }
+        }
+      ]
+    },
+    {
+      "key": "creation",
+      "title": "探索与创造 Creation",
+      "current_state": "下班只剩刷手机，很久没做过一件「自己想做」的东西。",
+      "ideal_state": "有一个长期的个人项目，持续表达自己，也愿意去试没做过的事。",
+      "directions": [
+        {
+          "key": "creation-works",
+          "title": "每个季度完成一件自己的作品",
+          "goal_3y": "三年完成 12 件个人作品（写作、摄影、编程小工具、音乐都算），并公开分享其中 6 件",
+          "years": [
+            { "target": "完成 4 件作品，每季度 1 件；每月尝试一件从没做过的事", "metric": "count", "metric_target": 4 },
+            { "target": "再完成 4 件，公开分享 2 件", "metric": "count", "metric_target": 4 },
+            { "target": "再完成 4 件，办一次小展或发一个合集", "metric": "count", "metric_target": 4 }
+          ],
+          "quarter": { "target": "完成 1 件作品（比如一组城市街拍，或一个小网页）", "metric": "count", "metric_target": 1 },
+          "month": { "target": "每周六上午 2 小时创作时间，雷打不动", "metric": "minutes", "metric_target": 480, "routine": "create" }
+        }
+      ]
+    }
+  ],
+  "routines": [
+    { "key": "deep-work", "title": "工作日上午 90 分钟深度工作", "kind": "deep_work", "cron": "30 9 * * MON-FRI", "area": "work", "direction": "work-core", "target_minutes": 90 },
+    { "key": "strength", "title": "力量训练 45 分钟（深蹲 · 臀桥 · 俯卧撑 · 划船）", "kind": "exercise", "cron": "30 19 * * TUE,SAT", "area": "health", "direction": "health-base", "target_count": 2 },
+    { "key": "reading", "title": "睡前读书 30 分钟（手机放客厅）", "kind": "read", "cron": "0 22 * * *", "area": "learning", "direction": "learning-io", "target_minutes": 30 },
+    { "key": "family-call", "title": "周日晚上给家里打个电话", "kind": "other", "cron": "0 20 * * SUN", "area": "relation", "direction": "relation-deep", "target_count": 1 },
+    { "key": "save", "title": "发工资当天把 20% 转进储蓄账户", "kind": "other", "cron": "0 10 10 * *", "area": "wealth", "direction": "wealth-system", "target_count": 1 },
+    { "key": "create", "title": "周六上午 2 小时创作时间", "kind": "other", "cron": "0 10 * * SAT", "area": "creation", "direction": "creation-works", "target_minutes": 120 }
+  ],
+  "today": [
+    { "title": "到「方向」页读一遍示范，把一个三年目标改成你自己的", "direction": "work-core", "energy": "mid", "est_minutes": 20 },
+    { "title": "做第一次 45 分钟力量训练（不会就跟视频做）", "direction": "health-base", "energy": "high", "est_minutes": 45 },
+    { "title": "给一位很久没联系的朋友发条消息", "direction": "relation-deep", "energy": "low", "est_minutes": 10 }
+  ],
+  "inbox": [
+    "预约今年的体检",
+    "周末去美术馆看一个展",
+    "选这个月要读的书",
+    "列一份蛋白质食物清单：鸡蛋、鸡胸、豆腐、希腊酸奶、鱼"
+  ],
+  "week_blocks": [
+    { "direction": "work-core", "minutes": 90 },
+    { "direction": "health-base", "minutes": 45 },
+    { "direction": "learning-io", "minutes": 60 },
+    { "direction": "creation-works", "minutes": 120 }
+  ]
+}
