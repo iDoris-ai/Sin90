@@ -103,7 +103,7 @@ async fn run_standalone(
         Some(dir) => Sin90Store::open(&dir.join("sin90.db")).await?,
         None => Sin90Store::open_memory().await?,
     };
-    store.get_review_settings().await?;
+    store.initialize_data().await?;
     let state = Sin90State::new(store, Arc::new(NullEventSink), keys);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     tracing::info!(port, "sin90: standalone listening");
@@ -156,6 +156,7 @@ async fn run_as_agent24_module() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(offer = ?module.offer().provides, "sin90: handshake accepted");
 
     let store = Sin90Store::open(&module.data_dir().join("sin90.db")).await?;
+    store.initialize_data().await?;
     // `wire_kernel_clients` is the actual decision (decoupled from "is
     // `events` specifically granted" — design §5); tested directly in
     // `adapter_agent24`'s own test module with an injected `Offer`, so this

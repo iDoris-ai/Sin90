@@ -74,59 +74,74 @@ impl Sin90Store {
     }
     async fn review_settings(&self, replacement: Option<ReviewSettings>) -> Result<ReviewSettings> {
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
-        let old: Option<String> =
-            sqlx::query_scalar("SELECT value FROM sin90_settings WHERE key='review'")
-                .fetch_optional(&mut *tx)
-                .await?;
-        let settings = match &replacement {
-            Some(s) => s.clone(),
-            None => old
-                .as_deref()
-                .map(serde_json::from_str)
-                .transpose()?
-                .unwrap_or_default(),
-        };
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sin90_routines WHERE id=?)")
-                .bind(SYSTEM_REVIEW_ID)
-                .fetch_one(&mut *tx)
-                .await?;
-        if replacement.is_some() || !exists {
-            let now = now_iso8601();
-            let weekday = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
-                [usize::from(settings.weekday - 1)];
-            let cron = format!("0 {} * * {}", settings.hour, weekday);
-            let tz = system_tz_name(&TimeZone::system(), Timestamp::now());
-            let tz = tz.as_str();
-            let status = if settings.auto { "active" } else { "paused" };
-            sqlx::query("INSERT INTO sin90_routines(id,title,kind,cron,tz,status,created_at,updated_at) VALUES (?,'自动复盘','review',?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET cron=excluded.cron,tz=excluded.tz,status=excluded.status,updated_at=excluded.updated_at")
-                .bind(SYSTEM_REVIEW_ID).bind(&cron).bind(tz).bind(status).bind(&now).bind(&now).execute(&mut *tx).await?;
-            sqlx::query("INSERT INTO sin90_settings(key,value,updated_at) VALUES ('review',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at")
-                .bind(serde_json::to_string(&settings)?).bind(&now).execute(&mut *tx).await?;
-            append_event(&mut tx,"routine",SYSTEM_REVIEW_ID,if exists {"updated"} else {"created"},None,Some(status),&json!({"routine_id":SYSTEM_REVIEW_ID,"kind":"review","cron":cron,"tz":tz,"status":status}),&now).await?;
-            append_event(
-                &mut tx,
-                "settings.review",
-                "review",
-                "updated",
-                None,
-                None,
-                &json!(settings),
-                &now,
-            )
-            .await?;
-            upsert_outbox(
-                &mut tx,
-                "scheduler.upsert",
-                &routine_dedup_key(SYSTEM_REVIEW_ID),
-                &routine_outbox_upsert_desired(SYSTEM_REVIEW_ID, &cron, tz, settings.auto),
-            )
-            .await?;
-        }
+        let settings = review_settings_in(&mut tx, replacement).await?;
         tx.commit().await?;
         self.notify.notify_one();
         Ok(settings)
     }
+}
+pub(super) async fn review_settings_in(
+    tx: &mut Tx<'_>,
+    replacement: Option<ReviewSettings>,
+) -> Result<ReviewSettings> {
+    let old: Option<String> =
+        sqlx::query_scalar("SELECT value FROM sin90_settings WHERE key='review'")
+            .fetch_optional(&mut **tx)
+            .await?;
+    let settings = match &replacement {
+        Some(s) => s.clone(),
+        None => old
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?
+            .unwrap_or_default(),
+    };
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sin90_routines WHERE id=?)")
+        .bind(SYSTEM_REVIEW_ID)
+        .fetch_one(&mut **tx)
+        .await?;
+    let current_tz: Option<String> = sqlx::query_scalar("SELECT tz FROM sin90_routines WHERE id=?")
+        .bind(SYSTEM_REVIEW_ID)
+        .fetch_optional(&mut **tx)
+        .await?;
+    let wanted_tz = system_tz_name(&TimeZone::system(), Timestamp::now());
+    if replacement.is_some()
+        || old.is_none()
+        || !exists
+        || current_tz.as_deref() != Some(&wanted_tz)
+    {
+        let now = now_iso8601();
+        let weekday =
+            ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"][usize::from(settings.weekday - 1)];
+        let cron = format!("0 {} * * {}", settings.hour, weekday);
+        let tz = system_tz_name(&TimeZone::system(), Timestamp::now());
+        let tz = tz.as_str();
+        let status = if settings.auto { "active" } else { "paused" };
+        sqlx::query("INSERT INTO sin90_routines(id,title,kind,cron,tz,status,created_at,updated_at) VALUES (?,'自动复盘','review',?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET cron=excluded.cron,tz=excluded.tz,status=excluded.status,updated_at=excluded.updated_at")
+                .bind(SYSTEM_REVIEW_ID).bind(&cron).bind(tz).bind(status).bind(&now).bind(&now).execute(&mut **tx).await?;
+        sqlx::query("INSERT INTO sin90_settings(key,value,updated_at) VALUES ('review',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at")
+                .bind(serde_json::to_string(&settings)?).bind(&now).execute(&mut **tx).await?;
+        append_event(tx,"routine",SYSTEM_REVIEW_ID,if exists {"updated"} else {"created"},None,Some(status),&json!({"routine_id":SYSTEM_REVIEW_ID,"kind":"review","cron":cron,"tz":tz,"status":status}),&now).await?;
+        append_event(
+            tx,
+            "settings.review",
+            "review",
+            "updated",
+            None,
+            None,
+            &json!(settings),
+            &now,
+        )
+        .await?;
+        upsert_outbox(
+            tx,
+            "scheduler.upsert",
+            &routine_dedup_key(SYSTEM_REVIEW_ID),
+            &routine_outbox_upsert_desired(SYSTEM_REVIEW_ID, &cron, tz, settings.auto),
+        )
+        .await?;
+    }
+    Ok(settings)
 }
 pub(crate) fn local_day(s: &str) -> Option<Date> {
     s.parse::<Timestamp>()

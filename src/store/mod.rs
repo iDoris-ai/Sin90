@@ -14,11 +14,13 @@
 
 pub mod ai_port;
 pub mod attention;
+pub mod data;
 pub mod packs;
 pub(crate) mod period_plans;
 pub mod progress;
 pub mod repo;
 pub mod reviews;
+mod templates;
 pub mod weekly_draft;
 
 pub use ai_port::{AiCallSummary, AiReader};
@@ -255,6 +257,18 @@ impl Sin90Store {
 pub mod test_hooks {
     use crate::store::{Result, Sin90Store};
     use sqlx::Row;
+
+    /// Historical progress fixtures must predate the calendar being inspected.
+    pub async fn backdate_plan_creation(store: &Sin90Store, at: &str) -> Result<()> {
+        let mut tx = store.pool().begin().await?;
+        sqlx::query("UPDATE sin90_period_plans SET created_at=?")
+            .bind(at)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE sin90_events SET payload=json_set(payload,'$.created_at',?) WHERE entity='period_plan' AND kind IN ('created','updated')").bind(at).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
 
     /// Rename a direction via raw SQL — historical event payloads must NOT change.
     pub async fn rename_direction(store: &Sin90Store, id: &str, new_title: &str) -> Result<()> {

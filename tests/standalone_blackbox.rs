@@ -21,8 +21,12 @@ struct Server {
 
 impl Server {
     async fn spawn(data_dir: &std::path::Path) -> Self {
+        Self::spawn_with_locale(data_dir, None).await
+    }
+    async fn spawn_with_locale(data_dir: &std::path::Path, locale: Option<&str>) -> Self {
         let port = pick_free_port();
-        let child = Command::new(env!("CARGO_BIN_EXE_sin90"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sin90"));
+        command
             .args([
                 "serve",
                 "--port",
@@ -36,9 +40,11 @@ impl Server {
                 "blackbox-automation-key-0123456789abcdef",
             )
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn the real sin90 binary");
+            .stderr(Stdio::null());
+        if let Some(locale) = locale {
+            command.env("LANG", locale).env("LC_ALL", locale);
+        }
+        let child = command.spawn().expect("spawn the real sin90 binary");
         let server = Self { child, port };
         server.wait_until_ready().await;
         server
@@ -301,7 +307,9 @@ async fn l2a_real_http_proposals_protect_edits_and_cascade_survives_restart() {
         .await;
         assert_eq!(receipt["skipped_period_plans"][0]["id"], human_year_id);
         let plans: Value = client
-            .get(format!("{base}/period-plans?kind=year&period=2027"))
+            .get(format!(
+                "{base}/period-plans?direction_id={direction_id}&kind=year&period=2027"
+            ))
             .send()
             .await
             .unwrap()
@@ -423,6 +431,17 @@ async fn l3_progress_real_http_and_persistent_settings() {
             .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
         parent = Some(plan["id"].as_str().unwrap().to_owned());
     }
+    // These are historical fixtures: their creation predates the inspected period.
+    let fixture_pool =
+        sqlx::SqlitePool::connect(&format!("sqlite:{}", dir.join("sin90.db").display()))
+            .await
+            .unwrap();
+    sqlx::query("UPDATE sin90_events SET payload=json_set(payload,'$.created_at','2026-01-01T00:00:00Z') WHERE entity='period_plan' AND kind IN ('created','updated')").execute(&fixture_pool).await.unwrap();
+    sqlx::query("UPDATE sin90_period_plans SET created_at='2026-01-01T00:00:00Z'")
+        .execute(&fixture_pool)
+        .await
+        .unwrap();
+    fixture_pool.close().await;
     let progress: serde_json::Value = client
         .get(format!(
             "{}/progress?direction_id={direction}&at=2026-03-15",
@@ -549,4 +568,88 @@ async fn l4_review_settings_persist_and_validate_over_http() {
     assert_eq!(actual, setting);
     drop(restarted);
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn s1_real_startup_selects_each_language_and_restart_keeps_data_or_blank_reset() {
+    let client = reqwest::Client::new();
+    for (locale, lang) in [
+        ("zh_CN.UTF-8", "zh"),
+        ("en_US.UTF-8", "en"),
+        ("th_TH.UTF-8", "th"),
+        ("", "zh"),
+    ] {
+        let dir = std::env::temp_dir().join(format!("sin90-s1-startup-{}", sin90::core::ulid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let snapshot: serde_json::Value;
+        {
+            let server = Server::spawn_with_locale(&dir, Some(locale)).await;
+            let status: serde_json::Value = client
+                .get(format!("{}/data/status", server.base()))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(status["template"]["lang"], lang);
+            assert_eq!(
+                status["counts"],
+                serde_json::json!({"areas":6,"directions":7,"tasks":7,"plans":30,"routines":7})
+            );
+            snapshot = client
+                .post(format!("{}/data/export", server.base()))
+                .header("x-sin90-actor-key", "blackbox-human-key-0123456789abcdef")
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        }
+        {
+            let server = Server::spawn_with_locale(&dir, Some(locale)).await;
+            let after: serde_json::Value = client
+                .post(format!("{}/data/export", server.base()))
+                .header("x-sin90-actor-key", "blackbox-human-key-0123456789abcdef")
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(snapshot["tables"], after["tables"]);
+            client
+                .post(format!("{}/data/reset", server.base()))
+                .header("x-sin90-actor-key", "blackbox-human-key-0123456789abcdef")
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+        }
+        {
+            let server = Server::spawn_with_locale(&dir, Some(locale)).await;
+            let status: serde_json::Value = client
+                .get(format!("{}/data/status", server.base()))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(status["counts"]["areas"], 0);
+            assert!(status["template"].is_null());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

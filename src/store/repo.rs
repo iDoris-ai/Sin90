@@ -1591,7 +1591,40 @@ impl Sin90Store {
         energy: Energy,
         est_minutes: Option<u32>,
     ) -> Result<Task> {
+        self.create_task_in_week(
+            title,
+            direction_id,
+            parent_task_id,
+            kind,
+            energy,
+            est_minutes,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn create_task_in_week(
+        &self,
+        title: &str,
+        direction_id: Option<&str>,
+        parent_task_id: Option<&str>,
+        kind: TaskKind,
+        energy: Energy,
+        est_minutes: Option<u32>,
+        week_id: Option<&str>,
+    ) -> Result<Task> {
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(week) = week_id {
+            let status: Option<String> =
+                sqlx::query_scalar("SELECT status FROM sin90_weeks WHERE id=?")
+                    .bind(week)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if !matches!(status.as_deref(), Some("planning" | "active")) {
+                return Err(StoreError::Invalid("week must be open".into()));
+            }
+        }
         if let Some(parent_id) = parent_task_id {
             let parent_row = sqlx::query("SELECT parent_task_id FROM sin90_tasks WHERE id = ?")
                 .bind(parent_id)
@@ -1630,10 +1663,11 @@ impl Sin90Store {
                  (id, direction_id, week_id, parent_task_id, title, status, kind, energy,
                   est_minutes, sort_key, carried_from, created_at, updated_at,
                   triage_via, triage_entered_at)
-             VALUES (?, ?, NULL, ?, ?, 'backlog', ?, ?, ?, 0, NULL, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, 'backlog', ?, ?, ?, 0, NULL, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(direction_id)
+        .bind(week_id)
         .bind(parent_task_id)
         .bind(title)
         .bind(to_wire(&kind)?)
@@ -1652,7 +1686,7 @@ impl Sin90Store {
             "created",
             None,
             Some("backlog"),
-            &json!({"id": id, "direction_id": direction_id, "parent_task_id": parent_task_id, "title": title}),
+            &json!({"id": id, "direction_id": direction_id, "parent_task_id": parent_task_id, "title": title, "week_id": week_id}),
             &now,
         )
         .await?;
@@ -1660,7 +1694,7 @@ impl Sin90Store {
         Ok(Task {
             id,
             direction_id: direction_id.map(str::to_string),
-            week_id: None,
+            week_id: week_id.map(str::to_string),
             parent_task_id: parent_task_id.map(str::to_string),
             title: title.to_string(),
             status: TaskStatus::Backlog,

@@ -10691,6 +10691,9 @@ async fn l3_http_progress_and_settings_validation() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    crate::store::test_hooks::backdate_plan_creation(&store, "2026-01-01T00:00:00Z")
+        .await
+        .unwrap();
     let response = app
         .clone()
         .oneshot(get_req(&format!(
@@ -10780,4 +10783,239 @@ async fn l3_http_progress_and_settings_validation() {
         .unwrap()
         .iter()
         .any(|(k, v)| k == "setting.changed" && v["key"] == "progress.streak_weeks"));
+}
+
+#[tokio::test]
+async fn data_routes_require_human_and_reads_are_public() {
+    let dir = std::env::temp_dir().join(format!("sin90-http-auth-{}", crate::core::ulid()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = Sin90Store::open_memory_with_data_dir(dir.clone())
+        .await
+        .unwrap();
+    let app = router(
+        Sin90State::new(
+            store.clone(),
+            Arc::new(RecordingSink::default()),
+            ActorKeys {
+                human: HUMAN.into(),
+                automation: AUTOMATION.into(),
+            },
+        ),
+        false,
+    );
+    for path in ["/data/status", "/templates"] {
+        let response = app.clone().oneshot(get_req(path)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    for path in [
+        "/data/export",
+        "/data/import",
+        "/data/reset",
+        "/data/restore-backup",
+    ] {
+        for key in [None, Some(AUTOMATION)] {
+            let mut req = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(key) = key {
+                req = req.header("x-sin90-actor-key", key);
+            }
+            let response = app
+                .clone()
+                .oneshot(req.body(Body::from("{}")).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+    }
+    let response = app
+        .clone()
+        .oneshot(human_req("POST", "/data/export", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut backup = body_json(response).await;
+    assert_eq!(backup["format"], "sin90-backup");
+    backup["schema"] = json!(backup["schema"].as_i64().unwrap() + 1);
+    let response = app
+        .oneshot(human_req("POST", "/data/import", json!({"backup":backup})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_json(response).await["error"]["code"],
+        "invalid_request"
+    );
+    assert!(store.list_areas().await.unwrap().is_empty());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn data_http_reset_export_import_restore_shapes() {
+    let dir = std::env::temp_dir().join(format!("sin90-http-data-{}", crate::core::ulid()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = Sin90Store::open_memory_with_data_dir(dir.clone())
+        .await
+        .unwrap();
+    let state = Sin90State::new(
+        store,
+        Arc::new(RecordingSink::default()),
+        ActorKeys {
+            human: HUMAN.into(),
+            automation: AUTOMATION.into(),
+        },
+    );
+    let app = router(state, false);
+    let response = app
+        .clone()
+        .oneshot(human_req(
+            "POST",
+            "/data/reset",
+            json!({"template":"graduate","lang":"en"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_json(response).await, json!({"ok":true}));
+    let response = app.clone().oneshot(get_req("/data/status")).await.unwrap();
+    let status = body_json(response).await;
+    assert_eq!(status["template"]["lang"], "en");
+    assert_eq!(status["counts"]["areas"], 6);
+    assert!(status["backups"][0]["bytes"].as_u64().unwrap() > 0);
+    let response = app
+        .clone()
+        .oneshot(human_req("POST", "/data/export", json!({})))
+        .await
+        .unwrap();
+    let backup = body_json(response).await;
+    let response = app
+        .clone()
+        .oneshot(human_req("POST", "/data/reset", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app.clone().oneshot(get_req("/data/status")).await.unwrap();
+    let status = body_json(response).await;
+    assert_eq!(status["counts"]["areas"], 0);
+    let name = status["backups"][0]["name"].clone();
+    let response = app
+        .clone()
+        .oneshot(human_req(
+            "POST",
+            "/data/restore-backup",
+            json!({"name":name}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .clone()
+        .oneshot(human_req("POST", "/data/import", json!({"backup":backup})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app.oneshot(get_req("/data/status")).await.unwrap();
+    assert_eq!(body_json(response).await["counts"]["areas"], 6);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn data_writes_without_data_directory_return_conflict() {
+    let (app, _, store) = test_app_with_store().await;
+    let backup = store.export_data().await.unwrap();
+    for (path, body) in [
+        ("/data/reset", json!({})),
+        ("/data/import", json!({"backup":backup})),
+        ("/data/restore-backup", json!({"name":"auto-example.json"})),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(human_req("POST", path, body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+}
+
+#[tokio::test]
+async fn data_import_accepts_backups_larger_than_default_body_limit() {
+    let dir = std::env::temp_dir().join(format!("sin90-http-large-{}", crate::core::ulid()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = Sin90Store::open_memory_with_data_dir(dir.clone())
+        .await
+        .unwrap();
+    let title = "x".repeat(1_100_000);
+    store
+        .create_task(
+            &title,
+            None,
+            None,
+            crate::core::TaskKind::Other,
+            crate::core::Energy::Mid,
+            None,
+        )
+        .await
+        .unwrap();
+    let backup = store.export_data().await.unwrap();
+    let app = router(
+        Sin90State::new(
+            store.clone(),
+            Arc::new(RecordingSink::default()),
+            ActorKeys {
+                human: HUMAN.into(),
+                automation: AUTOMATION.into(),
+            },
+        ),
+        false,
+    );
+    let request = human_req("POST", "/data/import", json!({"backup":backup}));
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        store.today_view().await.unwrap().inbox[0].title.len(),
+        title.len()
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn capture_survives_startup_without_autoloading_template() {
+    let (app, _, store) = test_app_with_store().await;
+    let response = app
+        .oneshot(human_req(
+            "POST",
+            "/capture",
+            json!({"text":"keep this capture"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let capture = body_json(response).await;
+    store.initialize_data().await.unwrap();
+    let inbox = store.today_view().await.unwrap().inbox;
+    assert_eq!(inbox.len(), 1);
+    assert_eq!(inbox[0].id, capture["id"].as_str().unwrap());
+    assert_eq!(inbox[0].title, "keep this capture");
+    assert!(store.data_status().await.unwrap()["template"].is_null());
+    let backup = store.export_data().await.unwrap();
+    assert!(backup.tables["sin90_settings"]
+        .iter()
+        .any(|r| r["key"] == "template.autoload_done" && r["value"] == "true"));
+}
+
+#[tokio::test]
+async fn data_import_rejects_bodies_over_64_mib_before_changing_data() {
+    let (app, _, store) = test_app_with_store().await;
+    let before = store.export_data().await.unwrap().tables;
+    let request = Request::builder()
+        .method("POST")
+        .uri("/data/import")
+        .header("x-sin90-actor-key", HUMAN)
+        .body(Body::from(vec![b' '; 64 * 1024 * 1024 + 1]))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(store.export_data().await.unwrap().tables, before);
 }
