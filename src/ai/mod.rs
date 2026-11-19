@@ -112,6 +112,7 @@
 #![forbid(unsafe_code)]
 
 pub mod classify;
+pub mod decompose;
 pub mod ladder;
 pub mod ports;
 pub mod propose;

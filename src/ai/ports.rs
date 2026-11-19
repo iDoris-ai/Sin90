@@ -23,6 +23,7 @@ pub enum Capability {
     Classify,
     Summarize,
     Propose,
+    Decompose,
 }
 impl Capability {
     /// Value of `sin90_ai_calls.task_kind`.
@@ -32,6 +33,7 @@ impl Capability {
             Self::Classify => "classify",
             Self::Summarize => "summarize",
             Self::Propose => "propose",
+            Self::Decompose => "decompose",
         }
     }
 }

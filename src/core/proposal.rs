@@ -54,6 +54,8 @@ pub enum Sin90Op {
         goal_3y: String,
         from_year: i32,
     },
+    /// Plans are ordered parents first. Within this batch, `parent_id` may
+    /// use `period:YYYY[-Hn|-Qn]` to refer to a parent in this direction.
     UpsertPeriodPlans {
         direction_id: DirectionId,
         plans: Vec<NewPeriodPlan>,
@@ -518,14 +520,18 @@ fn validate_op(
                     continue;
                 }
                 validate_plan(plan).map_err(ProposalError::InvalidPeriodPlan)?;
-                let parent = plan
-                    .parent_id
-                    .as_ref()
-                    .and_then(|id| current.iter().find(|p| &p.id == id));
+                let parent = plan.parent_id.as_ref().and_then(|id| {
+                    current.iter().find(|p| {
+                        &p.id == id || id.strip_prefix("period:") == Some(p.plan.period.as_str())
+                    })
+                });
                 validate_parent(direction_id, plan, parent)
                     .map_err(ProposalError::InvalidPeriodPlan)?;
                 let updated = PeriodPlan {
-                    id: index.map_or_else(String::new, |i| current[i].id.clone()),
+                    id: index.map_or_else(
+                        || format!("period:{}", plan.period),
+                        |i| current[i].id.clone(),
+                    ),
                     direction_id: direction_id.clone(),
                     plan: plan.clone(),
                     source: PlanSource::Ai,

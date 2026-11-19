@@ -653,3 +653,146 @@ async fn s1_real_startup_selects_each_language_and_restart_keeps_data_or_blank_r
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
+
+#[tokio::test]
+async fn decompose_real_http_requires_actor_and_only_applies_after_human_acceptance() {
+    use serde_json::{json, Value};
+    let dir = std::env::temp_dir().join(format!("sin90-decompose-blackbox-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let server = Server::spawn(&dir).await;
+    let client = reqwest::Client::new();
+    let base = server.base();
+    let human = "blackbox-human-key-0123456789abcdef";
+    let automation = "blackbox-automation-key-0123456789abcdef";
+    let direction: Value = client
+        .post(format!("{base}/directions"))
+        .header("x-sin90-actor-key", human)
+        .json(&json!({"title":"拆分测试","target_window":"2026"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = direction["id"].as_str().unwrap();
+    client
+        .patch(format!("{base}/directions/{id}"))
+        .header("x-sin90-actor-key", human)
+        .json(&json!({"goal_3y":"完成36件作品","goal_from_year":2026}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let body = json!({"direction_id":id,"down_to":"month"});
+    assert_eq!(
+        client
+            .post(format!("{base}/ai/decompose"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    // A human annual plan supplies the quantitative target and stays untouched.
+    let year = jiff::Zoned::now().year();
+    let annual:Value=client.post(format!("{base}/period-plans")).header("x-sin90-actor-key",human).json(&json!({"direction_id":id,"kind":"year","period":format!("{year:04}"),"target":"我的年度目标","metric":"count","metric_target":12})).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    let response = client
+        .post(format!("{base}/ai/decompose"))
+        .header("x-sin90-actor-key", automation)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 202);
+    let trigger: Value = response.json().await.unwrap();
+    assert_eq!(trigger["capability"], "decompose");
+    let run_id = trigger["run_id"].as_str().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let run = loop {
+        let run: Value = client
+            .get(format!("{base}/ai/runs/{run_id}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if run["state"] != "running" {
+            break run;
+        }
+        assert!(std::time::Instant::now() < deadline, "{run}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(run["state"], "done");
+    assert_eq!(run["items"][0]["result"], "proposed");
+    let list: Value = client
+        .get(format!("{base}/period-plans?direction_id={id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list["period_plans"], json!([annual]));
+    let proposals: Value = client
+        .get(format!("{base}/proposals"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let proposal = proposals["proposals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"].as_str().unwrap().starts_with("ai-decompose-"))
+        .unwrap();
+    assert!(proposal["rationale"].as_str().unwrap().contains("规则兜底"));
+    assert_eq!(proposal["ops"][0]["op"], "upsert_period_plans");
+    assert_eq!(proposal["ops"][0]["plans"].as_array().unwrap().len(), 3);
+    let pid = proposal["id"].as_str().unwrap();
+    assert_eq!(
+        client
+            .post(format!("{base}/proposals/{pid}/accept"))
+            .header("x-sin90-actor-key", automation)
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    client
+        .post(format!("{base}/proposals/{pid}/accept"))
+        .header("x-sin90-actor-key", human)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let list: Value = client
+        .get(format!("{base}/period-plans?direction_id={id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let plans = list["period_plans"].as_array().unwrap();
+    assert_eq!(plans.len(), 4);
+    assert_eq!(plans.iter().find(|p| p["kind"] == "year").unwrap(), &annual);
+    let month = plans.iter().find(|p| p["kind"] == "month").unwrap();
+    assert_eq!(
+        month["period"],
+        jiff::Zoned::now().date().strftime("%Y-%m").to_string()
+    );
+    assert_eq!(month["source"], "ai");
+    drop(server);
+    std::fs::remove_dir_all(dir).unwrap();
+}

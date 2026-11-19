@@ -23,6 +23,7 @@
 
 pub mod actor;
 mod ai_classify;
+mod ai_decompose;
 mod ai_propose;
 pub mod ai_runs;
 mod ai_summarize;
@@ -211,6 +212,7 @@ pub fn router(state: Sin90State, mounted: bool) -> axum::Router {
         // — not under `/_a24/*`, registered in both standalone and mounted
         // mode.
         .route("/ai/propose", post(ai_propose::trigger_propose))
+        .route("/ai/decompose", post(ai_decompose::trigger))
         // New (T5.3.1, design §11.4.2): same posture as `/ai/classify`/
         // `/ai/propose` above.
         .route("/ai/summarize", post(ai_summarize::trigger_summarize))
