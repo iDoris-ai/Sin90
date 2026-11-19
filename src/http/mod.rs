@@ -155,7 +155,7 @@ pub fn router(state: Sin90State, mounted: bool) -> axum::Router {
         // Whole-store backups can exceed Axum's default 2 MiB body limit.
         .route(
             "/data/import",
-            post(data::import).layer(axum::extract::DefaultBodyLimit::disable()),
+            post(data::import).layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)),
         )
         .route("/data/reset", post(data::reset))
         .route("/data/restore-backup", post(data::restore))

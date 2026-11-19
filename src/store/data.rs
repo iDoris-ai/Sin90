@@ -146,6 +146,8 @@ impl Sin90Store {
             return Err(StoreError::Invalid("unknown backup table".into()));
         }
         if autoload && !empty_for_autoload(&mut tx).await? {
+            mark_autoload_done(&mut tx).await?;
+            tx.commit().await?;
             return Ok(());
         }
         let before = snapshot(&mut tx).await?;
@@ -163,6 +165,19 @@ impl Sin90Store {
             sqlx::query(&format!("DELETE FROM {}", ident(name)))
                 .execute(&mut *tx)
                 .await?;
+        }
+        for row in &before.tables["sin90_settings"] {
+            if row["key"]
+                .as_str()
+                .is_some_and(|key| key.starts_with("ai."))
+            {
+                sqlx::query("INSERT INTO sin90_settings(key,value,updated_at) VALUES(?,?,?)")
+                    .bind(row["key"].as_str())
+                    .bind(row["value"].as_str())
+                    .bind(row["updated_at"].as_str())
+                    .execute(&mut *tx)
+                    .await?;
+            }
         }
         for (table, rows) in &backup.tables {
             if table == "sin90_outbox" || table == "sin90_attention_watermark" {
@@ -243,7 +258,7 @@ impl Sin90Store {
             }
         }
         super::reviews::review_settings_in(&mut tx, None).await?;
-        sqlx::query("INSERT INTO sin90_settings(key,value,updated_at) VALUES('template.autoload_done','true',?) ON CONFLICT(key) DO UPDATE SET value='true'").bind(now_iso8601()).execute(&mut *tx).await?;
+        mark_autoload_done(&mut tx).await?;
         let plan_rows = sqlx::query("SELECT * FROM sin90_period_plans")
             .fetch_all(&mut *tx)
             .await?;
@@ -412,8 +427,41 @@ impl Sin90Store {
         Ok(json!({"template":template,"backups":backups,"counts":counts}))
     }
 }
+pub(super) async fn mark_autoload_done(tx: &mut Tx<'_>) -> Result<()> {
+    sqlx::query("INSERT INTO sin90_settings(key,value,updated_at) VALUES('template.autoload_done','true',?) ON CONFLICT(key) DO UPDATE SET value='true'")
+        .bind(now_iso8601()).execute(&mut **tx).await?;
+    Ok(())
+}
+
 pub(super) async fn empty_for_autoload(tx: &mut Tx<'_>) -> Result<bool> {
-    Ok(sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM sin90_areas) AND NOT EXISTS(SELECT 1 FROM sin90_directions WHERE id!='sin90-triage') AND NOT EXISTS(SELECT 1 FROM sin90_tasks) AND NOT EXISTS(SELECT 1 FROM sin90_settings WHERE key='template.autoload_done')").fetch_one(&mut **tx).await?)
+    // Include new user tables automatically; exempt only seeds and the events
+    // and scheduler projection created by the system review seed itself.
+    for table in tables(tx).await? {
+        let predicate = match table.as_str() {
+            "sin90_attention_watermark" => continue,
+            "sin90_directions" => "id != 'sin90-triage'".to_string(),
+            "sin90_routines" => format!("id != '{}'", super::reviews::SYSTEM_REVIEW_ID),
+            "sin90_settings" => "key != 'review' AND substr(key,1,3) != 'ai.'".to_string(),
+            "sin90_events" => format!(
+                "NOT ((entity='routine' AND entity_id='{}') OR (entity='settings.review' AND entity_id='review'))",
+                super::reviews::SYSTEM_REVIEW_ID
+            ),
+            "sin90_outbox" => format!(
+                "dedup_key != '{}'", routine_dedup_key(super::reviews::SYSTEM_REVIEW_ID)
+            ),
+            _ => "1".to_string(),
+        };
+        let exists: bool = sqlx::query_scalar(&format!(
+            "SELECT EXISTS(SELECT 1 FROM {} WHERE {predicate})",
+            ident(&table)
+        ))
+        .fetch_one(&mut **tx)
+        .await?;
+        if exists {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 #[cfg(test)]

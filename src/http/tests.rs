@@ -10979,3 +10979,43 @@ async fn data_import_accepts_backups_larger_than_default_body_limit() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+async fn capture_survives_startup_without_autoloading_template() {
+    let (app, _, store) = test_app_with_store().await;
+    let response = app
+        .oneshot(human_req(
+            "POST",
+            "/capture",
+            json!({"text":"keep this capture"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let capture = body_json(response).await;
+    store.initialize_data().await.unwrap();
+    let inbox = store.today_view().await.unwrap().inbox;
+    assert_eq!(inbox.len(), 1);
+    assert_eq!(inbox[0].id, capture["id"].as_str().unwrap());
+    assert_eq!(inbox[0].title, "keep this capture");
+    assert!(store.data_status().await.unwrap()["template"].is_null());
+    let backup = store.export_data().await.unwrap();
+    assert!(backup.tables["sin90_settings"]
+        .iter()
+        .any(|r| r["key"] == "template.autoload_done" && r["value"] == "true"));
+}
+
+#[tokio::test]
+async fn data_import_rejects_bodies_over_64_mib_before_changing_data() {
+    let (app, _, store) = test_app_with_store().await;
+    let before = store.export_data().await.unwrap().tables;
+    let request = Request::builder()
+        .method("POST")
+        .uri("/data/import")
+        .header("x-sin90-actor-key", HUMAN)
+        .body(Body::from(vec![b' '; 64 * 1024 * 1024 + 1]))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(store.export_data().await.unwrap().tables, before);
+}

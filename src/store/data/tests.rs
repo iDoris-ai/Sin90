@@ -154,7 +154,13 @@ async fn existing_user_data_prevents_autoload_in_each_case() {
         }
         let before = canonical(&store).await;
         store.initialize_data().await.unwrap();
-        assert_eq!(before, canonical(&store).await);
+        let mut after = canonical(&store).await;
+        let settings = after.get_mut("sin90_settings").unwrap();
+        assert!(settings
+            .iter()
+            .any(|r| r["key"] == "template.autoload_done" && r["value"] == "true"));
+        settings.retain(|r| r["key"] != "template.autoload_done");
+        assert_eq!(before, after);
         assert!(store.data_status().await.unwrap()["template"].is_null());
     }
 }
@@ -547,4 +553,103 @@ async fn import_reschedules_paused_and_removes_retired_routines() {
         .find(|r| r.dedup_key == routine_dedup_key(&routines[1].id))
         .unwrap();
     assert_eq!(retired.kind, "scheduler.delete");
+}
+
+#[tokio::test]
+async fn startup_preserves_isolated_legacy_rows_without_loading_template() {
+    // Raw inserts deliberately avoid companion events: each table must prevent
+    // autoload on its own, even when an old database has no event history.
+    for insert in [
+        "INSERT INTO sin90_schedule_blocks(id,status,planned_minutes,created_at,updated_at) VALUES('mine','planned',30,'old','old')",
+        "INSERT INTO sin90_routines(id,title,kind,cron,tz,status,created_at,updated_at) VALUES('mine','mine','other','0 9 * * *','UTC','active','old','old')",
+        "INSERT INTO sin90_reviews(id,kind,period,status,body,created_at,updated_at) VALUES('mine','daily','2026-11-18','draft','keep me','old','old')",
+        "INSERT INTO sin90_weeks(id,status,iso_week,created_at,updated_at) VALUES('mine','planning','2026-W47','old','old')",
+        "INSERT INTO sin90_period_plans(id,direction_id,kind,period,target,metric,source,status,created_at,updated_at) VALUES('mine','sin90-triage','year','2026','keep me','none','user','active','old','old')",
+        "INSERT INTO sin90_events(id,entity,entity_id,kind,payload,at) VALUES('mine','task','gone','created','{}','old')",
+        "INSERT INTO sin90_settings(key,value,updated_at) VALUES('progress.streak_weeks','3','old')",
+    ] {
+        let dir = TempDir::new();
+        let store = dir.store().await;
+        sqlx::query(insert).execute(store.pool()).await.unwrap();
+        let before = canonical(&store).await;
+        let reopened = dir.store().await;
+        reopened.initialize_data().await.unwrap();
+        let mut after = canonical(&reopened).await;
+        let settings = after.get_mut("sin90_settings").unwrap();
+        assert!(settings.iter().any(|r| r["key"] == "template.autoload_done" && r["value"] == "true"), "{insert}");
+        settings.retain(|r| r["key"] != "template.autoload_done");
+        assert_eq!(before, after, "{insert}");
+        assert!(reopened.data_status().await.unwrap()["template"].is_null());
+        reopened.initialize_data().await.unwrap();
+        assert!(reopened.list_areas().await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn import_and_reset_preserve_local_ai_settings_without_importing_them() {
+    let dir = TempDir::new();
+    let store = dir.store().await;
+    for (key, value) in [("ai.executive_enabled", "true"), ("ai.custom", "local")] {
+        sqlx::query("INSERT INTO sin90_settings(key,value,updated_at) VALUES(?,?,'original')")
+            .bind(key)
+            .bind(value)
+            .execute(store.pool())
+            .await
+            .unwrap();
+    }
+    let mut backup = store.export_data().await.unwrap();
+    let settings = backup.tables.get_mut("sin90_settings").unwrap();
+    for row in settings
+        .iter_mut()
+        .filter(|r| r["key"].as_str().unwrap().starts_with("ai."))
+    {
+        row.insert("value".into(), json!("untrusted"));
+    }
+    settings.push(BTreeMap::from([
+        ("key".into(), json!("ai.foreign")),
+        ("value".into(), json!("true")),
+        ("updated_at".into(), json!("foreign")),
+    ]));
+    for operation in 0..3 {
+        match operation {
+            0 => store.import_data(&backup).await.unwrap(),
+            1 => store.reset_data(None, None).await.unwrap(),
+            _ => store
+                .reset_data(Some("graduate"), Some("zh"))
+                .await
+                .unwrap(),
+        }
+        let rows: Vec<(String, String, String)> = sqlx::query_as("SELECT key,value,updated_at FROM sin90_settings WHERE substr(key,1,3)='ai.' ORDER BY key")
+            .fetch_all(store.pool()).await.unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("ai.custom".into(), "local".into(), "original".into()),
+                (
+                    "ai.executive_enabled".into(),
+                    "true".into(),
+                    "original".into()
+                ),
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn ai_settings_alone_allow_fresh_autoload_and_survive_it() {
+    let dir = TempDir::new();
+    let store = dir.store().await;
+    sqlx::query("INSERT INTO sin90_settings(key,value,updated_at) VALUES('ai.executive_enabled','true','original')")
+        .execute(store.pool()).await.unwrap();
+    store.initialize_data().await.unwrap();
+    assert_eq!(
+        store.data_status().await.unwrap()["template"]["id"],
+        "graduate"
+    );
+    let value: String =
+        sqlx::query_scalar("SELECT value FROM sin90_settings WHERE key='ai.executive_enabled'")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(value, "true");
 }

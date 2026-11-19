@@ -1,6 +1,8 @@
 use super::{
-    data::empty_for_autoload, period_plans::write_plan, reviews::system_tz_name, Result,
-    Sin90Store, StoreError,
+    data::{empty_for_autoload, mark_autoload_done},
+    period_plans::write_plan,
+    reviews::system_tz_name,
+    Result, Sin90Store, StoreError,
 };
 use crate::core::*;
 use jiff::{tz::TimeZone, Timestamp};
@@ -109,8 +111,11 @@ impl Sin90Store {
     /// Called once at service startup, before accepting requests or starting the pump.
     pub async fn initialize_data(&self) -> Result<()> {
         self.get_review_settings().await?;
-        let mut tx = self.pool().begin().await?;
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let empty = empty_for_autoload(&mut tx).await?;
+        if !empty {
+            mark_autoload_done(&mut tx).await?;
+        }
         tx.commit().await?;
         if empty {
             let locale = std::env::var("LC_ALL")
