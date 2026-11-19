@@ -747,6 +747,7 @@ fn allowed_ops(cap: Capability, ops: &[Sin90Op]) -> Result<(), SinkError> {
     }
     let ok = |op: &Sin90Op| -> bool {
         match cap {
+            Capability::Decompose => matches!(op, Sin90Op::UpsertPeriodPlans { .. }),
             Capability::Classify => matches!(op, Sin90Op::AssignTaskDirection { .. }),
             Capability::Summarize => matches!(
                 op,
@@ -1197,6 +1198,23 @@ mod tests {
 
     use super::*;
     use crate::core::{Energy, NewTask, TaskKind};
+
+    #[test]
+    fn decompose_allows_only_period_plan_upserts() {
+        let upsert = Sin90Op::UpsertPeriodPlans {
+            direction_id: "d".into(),
+            plans: vec![],
+        };
+        assert!(allowed_ops(Capability::Decompose, std::slice::from_ref(&upsert)).is_ok());
+        let forbidden = Sin90Op::SetDirectionGoal {
+            direction_id: "d".into(),
+            goal_3y: "goal".into(),
+            from_year: 2026,
+        };
+        assert!(allowed_ops(Capability::Decompose, std::slice::from_ref(&forbidden)).is_err());
+        assert!(allowed_ops(Capability::Decompose, &[upsert, forbidden]).is_err());
+        assert!(allowed_ops(Capability::Decompose, &[]).is_err());
+    }
 
     #[test]
     fn l2a_existing_capabilities_cannot_submit_goal_or_period_ops() {

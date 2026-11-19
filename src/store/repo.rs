@@ -4238,10 +4238,32 @@ pub(crate) async fn apply_op(
                 let row = sqlx::query("SELECT * FROM sin90_period_plans WHERE direction_id = ? AND kind = ? AND period = ?")
                     .bind(direction_id).bind(to_wire(&plan.kind)?).bind(&plan.period).fetch_optional(&mut **tx).await?;
                 let old = row.map(super::period_plans::row_to_plan).transpose()?;
+                // Batch proposals can reference a parent created earlier in this op.
+                let mut plan = plan.clone();
+                if let Some(period) = plan
+                    .parent_id
+                    .as_deref()
+                    .filter(|_| {
+                        !old.as_ref()
+                            .is_some_and(|p| p.source == crate::core::PlanSource::User)
+                    })
+                    .and_then(|id| id.strip_prefix("period:"))
+                {
+                    let parent: Option<String> = sqlx::query_scalar(
+                        "SELECT id FROM sin90_period_plans WHERE direction_id = ? AND period = ?",
+                    )
+                    .bind(direction_id)
+                    .bind(period)
+                    .fetch_optional(&mut **tx)
+                    .await?;
+                    plan.parent_id = Some(parent.ok_or_else(|| {
+                        StoreError::Invalid("batch parent does not exist".into())
+                    })?);
+                }
                 let updated = super::period_plans::write_plan(
                     tx,
                     direction_id,
-                    plan,
+                    &plan,
                     crate::core::PlanSource::Ai,
                     old.as_ref(),
                     event_ids,

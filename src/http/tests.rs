@@ -11019,3 +11019,89 @@ async fn data_import_rejects_bodies_over_64_mib_before_changing_data() {
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(store.export_data().await.unwrap().tables, before);
 }
+
+mod ai_decompose {
+    use super::*;
+    use crate::ai::Capability;
+
+    #[tokio::test]
+    async fn actor_and_input_validation() {
+        let (app, _, store) = test_app_with_store().await;
+        let direction = store.create_direction("学习", "2026", None).await.unwrap();
+        let request = json!({"direction_id":direction.id,"down_to":"month"});
+        let unauth = Request::builder()
+            .method("POST")
+            .uri("/ai/decompose")
+            .body(Body::from(request.to_string()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(unauth).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        for body in [
+            json!({"direction_id":direction.id,"down_to":"year"}),
+            json!({"direction_id":direction.id}),
+            json!({"direction_id":direction.id,"down_to":"month","extra":true}),
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(human_req("POST", "/ai/decompose", body))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+        assert_eq!(
+            app.clone()
+                .oneshot(automation_req(
+                    "POST",
+                    "/ai/decompose",
+                    json!({"direction_id":"missing","down_to":"month"})
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            app.oneshot(human_req("POST", "/ai/decompose", request))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::ACCEPTED
+        );
+    }
+    #[tokio::test]
+    async fn single_flight_is_per_capability() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let d = store.create_direction("工作", "2026", None).await.unwrap();
+        let state = Sin90State::new(
+            store,
+            Arc::new(RecordingSink::default()),
+            ActorKeys {
+                human: HUMAN.into(),
+                automation: AUTOMATION.into(),
+            },
+        );
+        state
+            .ai_runs
+            .lock()
+            .unwrap()
+            .start(Capability::Decompose, "decompose-busy");
+        let app = router(state, false);
+        let resp = app
+            .oneshot(automation_req(
+                "POST",
+                "/ai/decompose",
+                json!({"direction_id":d.id,"down_to":"month"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            body_json(resp).await,
+            json!({"code":"ai_busy","run_id":"decompose-busy"})
+        );
+    }
+}
