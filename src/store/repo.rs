@@ -1739,6 +1739,13 @@ impl Sin90Store {
             .bind(id)
             .execute(&mut *tx)
             .await?;
+        let quadrant: Option<String> = sqlx::query_scalar(
+            "SELECT COALESCE(override_quadrant, ai_quadrant) FROM sin90_task_priorities WHERE task_id=?",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
         append_event(
             &mut tx,
             "task",
@@ -1746,7 +1753,7 @@ impl Sin90Store {
             "transitioned",
             Some(&to_wire(&from)?),
             Some(&to_str),
-            &json!({"task_id": id}),
+            &json!({"task_id": id, "title": row.get::<String, _>("title"), "quadrant": quadrant}),
             &now,
         )
         .await?;
