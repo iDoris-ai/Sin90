@@ -115,6 +115,7 @@ pub mod classify;
 pub mod decompose;
 pub mod ladder;
 pub mod ports;
+pub mod priority;
 pub mod propose;
 pub mod summarize;
 

@@ -6,10 +6,13 @@ use axum::{
     Json,
 };
 use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
-use super::{map_err, state::Sin90State};
-use crate::ai::ports::{Complexity, ModelMessage, ModelPort, ModelRequest, Role};
+use super::ai_runs::with_hard_deadline;
+use super::map_err;
+use super::state::{HttpModelPort, Sin90State};
+use crate::ai::priority::{self, PriorityOutcome};
+use crate::ai::MODEL_ACCESS;
 
 const MAX_EVALUATION_ADVICE_CHARS: usize = 2_000;
 
@@ -141,49 +144,73 @@ pub(super) async fn evaluate_priority(
         })
         .collect::<Vec<_>>();
     let Some(model) = s.model.clone() else {
-        let unevaluated = selected
-            .iter()
-            .map(|t| json!({"task_id":t["task_id"],"reason":"model_unavailable"}))
-            .collect::<Vec<_>>();
-        return Json(json!({"evaluated":[],"unevaluated":unevaluated})).into_response();
+        return unevaluated_response(&selected, "model_unavailable");
     };
     if selected.is_empty() {
         return Json(json!({"evaluated":[],"unevaluated":[]})).into_response();
     }
-    let schema = json!({"type":"object","additionalProperties":false,"required":["items"],"properties":{"items":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["task_id","quadrant","importance","urgency","rationale","sufficient_evidence"],"properties":{"task_id":{"type":"string"},"quadrant":{"type":"string","enum":["do_first","schedule","delegate","eliminate"]},"importance":{"type":"string","enum":["high","low"]},"urgency":{"type":"string","enum":["high","low"]},"rationale":{"type":"string"},"sufficient_evidence":{"type":"boolean"}}}}}});
-    let prompt = priority_evaluation_prompt(context, &selected, req.advice);
-    let request=ModelRequest{messages:vec![ModelMessage{role:Role::System,content:"You provide cautious task priority advice. Never make changes or override human choices.".into()},ModelMessage{role:Role::User,content:prompt.to_string()}],schema_name:"sin90_task_priority",schema:schema.as_object().cloned().unwrap_or_else(Map::new),max_tokens:2000,complexity:Complexity::Simple};
-    let reply=match super::HttpModelPort(model).complete(request).await {Ok(v)=>v,Err(_)=>return Json(json!({"evaluated":[],"unevaluated":selected.iter().map(|t|json!({"task_id":t["task_id"],"reason":"model_error"})).collect::<Vec<_>>()})).into_response()};
-    let parsed: Value = match serde_json::from_str(&reply.text) {
-        Ok(v) => v,
-        Err(_) => return (StatusCode::BAD_GATEWAY, "invalid model response").into_response(),
+    let prompt = priority_evaluation_prompt(context, &selected, req.advice).to_string();
+    let reader = s.store.ai_reader();
+    let port = HttpModelPort(model);
+    let run_id = format!("run-{}", crate::core::ulid());
+    // Same wall-clock backstop as classify/summarize/propose. Dropping this
+    // future cancels the in-flight model call and releases its slot.
+    let outcome = match with_hard_deadline(
+        s.run_hard_deadline,
+        priority::run(
+            &run_id,
+            &prompt,
+            *MODEL_ACCESS,
+            Some(&port),
+            &s.store,
+            &reader,
+        ),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(_) => return unevaluated_response(&selected, "model_error"),
+    };
+    let items = match outcome {
+        PriorityOutcome::Accepted(items) => items,
+        PriorityOutcome::Failed { bad_output: true } => {
+            return (StatusCode::BAD_GATEWAY, "invalid model response").into_response();
+        }
+        PriorityOutcome::Failed { bad_output: false } => {
+            return unevaluated_response(&selected, "model_error");
+        }
     };
     let mut evaluated = Vec::<Value>::new();
     let mut unevaluated = Vec::<Value>::new();
-    for item in parsed["items"].as_array().into_iter().flatten() {
-        let Some(id) = item["task_id"].as_str() else {
-            continue;
-        };
-        if !selected.iter().any(|t| t["task_id"] == id) {
+    for item in items {
+        if !selected.iter().any(|t| t["task_id"] == item.task_id) {
             continue;
         }
-        if item["sufficient_evidence"] != true {
-            let _ = s.store.clear_task_priority_ai(id).await;
-            unevaluated.push(json!({"task_id":id,"reason":"insufficient_evidence"}));
+        if !item.sufficient_evidence {
+            if let Err(e) = s.store.clear_task_priority_ai(&item.task_id).await {
+                return map_err(e);
+            }
+            unevaluated.push(json!({"task_id": item.task_id, "reason": "insufficient_evidence"}));
             continue;
         }
         let (Some(q), Some(i), Some(u), Some(reason)) = (
-            item["quadrant"].as_str(),
-            item["importance"].as_str(),
-            item["urgency"].as_str(),
-            item["rationale"].as_str(),
+            item.quadrant.as_deref(),
+            item.importance.as_deref(),
+            item.urgency.as_deref(),
+            item.rationale.as_deref(),
         ) else {
-            unevaluated.push(json!({"task_id":id,"reason":"invalid_model_item"}));
+            unevaluated.push(json!({"task_id": item.task_id, "reason": "invalid_model_item"}));
             continue;
         };
-        match s.store.set_task_priority_ai(id, q, i, u, reason).await {
+        match s
+            .store
+            .set_task_priority_ai(&item.task_id, q, i, u, reason)
+            .await
+        {
             Ok(p) => evaluated.push(json!(p)),
-            Err(_) => unevaluated.push(json!({"task_id":id,"reason":"persistence_error"})),
+            Err(_) => {
+                unevaluated.push(json!({"task_id": item.task_id, "reason": "persistence_error"}))
+            }
         }
     }
     for task in &selected {
@@ -197,7 +224,22 @@ pub(super) async fn evaluate_priority(
     Json(json!({"evaluated":evaluated,"unevaluated":unevaluated})).into_response()
 }
 
-fn priority_evaluation_prompt(context: Value, tasks: &[Value], advice: Option<String>) -> Value {
+fn unevaluated_response(selected: &[Value], reason: &str) -> Response {
+    let unevaluated = selected
+        .iter()
+        .map(|t| json!({"task_id": t["task_id"], "reason": reason}))
+        .collect::<Vec<_>>();
+    Json(json!({"evaluated": [], "unevaluated": unevaluated})).into_response()
+}
+
+fn priority_evaluation_prompt(
+    mut context: Value,
+    tasks: &[Value],
+    advice: Option<String>,
+) -> Value {
+    if let Some(obj) = context.as_object_mut() {
+        obj.remove("tasks");
+    }
     json!({
         "context": context,
         "tasks": tasks,
@@ -229,6 +271,29 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("not a task priority override"));
+    }
+
+    #[test]
+    fn prompt_carries_selected_tasks_only() {
+        let prompt = priority_evaluation_prompt(
+            json!({
+                "directions": [{"id": "d1", "title": "Launch"}],
+                "tasks": [
+                    {"task_id": "keep", "title": "Selected task"},
+                    {"task_id": "drop", "title": "Unselected task"}
+                ]
+            }),
+            &[json!({"task_id": "keep", "title": "Selected task"})],
+            None,
+        );
+        assert!(prompt["context"].get("tasks").is_none());
+        assert_eq!(prompt["context"]["directions"][0]["title"], "Launch");
+        assert_eq!(
+            prompt["tasks"],
+            json!([{"task_id": "keep", "title": "Selected task"}])
+        );
+        assert!(!prompt.to_string().contains("drop"));
+        assert!(!prompt.to_string().contains("Unselected"));
     }
 
     #[test]

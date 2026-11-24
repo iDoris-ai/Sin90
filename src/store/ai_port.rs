@@ -769,6 +769,8 @@ fn allowed_ops(cap: Capability, ops: &[Sin90Op]) -> Result<(), SinkError> {
                     | Sin90Op::ReorderTasks { .. }
                     | Sin90Op::CreateTasks { .. }
             ),
+            // Priority advice is stored on the task, not as a proposal.
+            Capability::Priority => false,
         }
     };
     if ops.iter().all(ok) {

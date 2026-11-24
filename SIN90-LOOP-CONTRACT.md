@@ -24,7 +24,7 @@ When evaluated, the AI assessment is `{ "quadrant": "do_first | schedule | deleg
 
 ## Completion evidence
 
-The existing `PATCH /tasks/{task_id}` with `{ "to": "done" }` remains the only completion operation and does not require a note or assessment. The completion event captures the task identity/title and effective quadrant as it stood at completion when available.
+`PATCH /tasks/{task_id}` with `{ "to": "done" }` and `POST /proposals/{proposal_id}/accept` of a `TransitionTask` to `done` are both completion operations. Neither requires a note or assessment. Each writes the completion event in the same transaction as the status change and captures the task identity/title and effective quadrant as they stood at completion when available.
 
 `PUT /tasks/{task_id}/completion-note` accepts `{ "note": "…" }` and adds or replaces the human's retrospective note for the single completion event. It may be used after completion; it never creates/copies a task or another completion. Requires a human actor key. `GET /tasks/{task_id}/completion-evidence` returns `{ "task_id":"…", "completed_at":"…", "quadrant": null, "note": null }` (null is truthful missing evidence).
 

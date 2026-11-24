@@ -24,6 +24,8 @@ pub enum Capability {
     Summarize,
     Propose,
     Decompose,
+    /// Priority advice. Call rows use this capability; it never submits a proposal.
+    Priority,
 }
 impl Capability {
     /// Value of `sin90_ai_calls.task_kind`.
@@ -34,6 +36,7 @@ impl Capability {
             Self::Summarize => "summarize",
             Self::Propose => "propose",
             Self::Decompose => "decompose",
+            Self::Priority => "priority",
         }
     }
 }
