@@ -24,6 +24,8 @@ pub enum Capability {
     Summarize,
     Propose,
     Decompose,
+    /// Priority advice. Call rows use this capability; it never submits a proposal.
+    Priority,
 }
 impl Capability {
     /// Value of `sin90_ai_calls.task_kind`.
@@ -34,6 +36,7 @@ impl Capability {
             Self::Summarize => "summarize",
             Self::Propose => "propose",
             Self::Decompose => "decompose",
+            Self::Priority => "priority",
         }
     }
 }
@@ -482,6 +485,16 @@ pub struct SummarizeRoutineRow {
     pub completed: i64,
 }
 
+/// One task completion inside a weekly draft. `title` and `quadrant` are the
+/// values captured on the completion event. `note` is the retrospective note
+/// when the human has written one. `None` means that evidence is absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummarizeCompletion {
+    pub title: String,
+    pub quadrant: Option<String>,
+    pub note: Option<String>,
+}
+
 /// `summarize`'s own shape of T4.3.1's weekly draft (design §11.4.2, §11.1
 /// 第 13 条) — NOT `store::weekly_draft::WeeklyDraft` itself: same numbers,
 /// but `by_area`/`by_direction`/`routines` carry an already-resolved display
@@ -506,6 +519,9 @@ pub struct SummarizeDraft {
     pub by_direction: Vec<SummarizeBucket>,
     pub tasks_done: i64,
     pub routines: Vec<SummarizeRoutineRow>,
+    /// Weekly completion evidence, in completion order. Empty for non-weekly
+    /// drafts and for a week with no task completions.
+    pub completions: Vec<SummarizeCompletion>,
     pub auto_draft_md: String,
 }
 

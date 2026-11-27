@@ -32,12 +32,13 @@ mod period_plans;
 mod progress;
 mod review_settings;
 pub mod state;
+mod task_loop;
 
 use axum::body::Bytes;
 use axum::extract::{Path as AxPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post};
+use axum::routing::{get, patch, post, put};
 use axum::Json;
 use serde::Deserialize;
 
@@ -176,6 +177,19 @@ pub fn router(state: Sin90State, mounted: bool) -> axum::Router {
         )
         .route("/tasks", post(create_task).get(list_tasks))
         .route("/tasks/{id}", patch(transition_task))
+        .route("/tasks/{id}/priority", get(task_loop::get_priority))
+        .route(
+            "/tasks/{id}/priority/override",
+            put(task_loop::put_override).delete(task_loop::delete_override),
+        )
+        .route(
+            "/tasks/{id}/completion-note",
+            put(task_loop::put_completion_note),
+        )
+        .route(
+            "/tasks/{id}/completion-evidence",
+            get(task_loop::get_completion_evidence),
+        )
         .route("/schedule-blocks", post(create_block).get(list_blocks))
         .route("/schedule-blocks/{id}", patch(transition_block))
         .route("/weeks", post(create_week).get(list_weeks))
@@ -208,6 +222,7 @@ pub fn router(state: Sin90State, mounted: bool) -> axum::Router {
         // both standalone and mounted mode ("standalone 模式同样注册（port
         // 为 `None`，只有 reflex）").
         .route("/ai/classify", post(ai_classify::trigger_classify))
+        .route("/ai/priority/evaluate", post(task_loop::evaluate_priority))
         // New (T5.4.1, design §11.4.3): same posture as `/ai/classify` above
         // — not under `/_a24/*`, registered in both standalone and mounted
         // mode.

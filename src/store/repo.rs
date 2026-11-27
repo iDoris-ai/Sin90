@@ -1739,6 +1739,7 @@ impl Sin90Store {
             .bind(id)
             .execute(&mut *tx)
             .await?;
+        let payload = task_completion_payload(&mut tx, id).await?;
         append_event(
             &mut tx,
             "task",
@@ -1746,7 +1747,7 @@ impl Sin90Store {
             "transitioned",
             Some(&to_wire(&from)?),
             Some(&to_str),
-            &json!({"task_id": id}),
+            &payload,
             &now,
         )
         .await?;
@@ -4414,6 +4415,14 @@ pub(crate) async fn apply_op(
                 .bind(task_id)
                 .execute(&mut **tx)
                 .await?;
+            // Completion evidence reads this event, not the live task or
+            // priority row. Only `done` is a completion; other targets keep
+            // the historical `{"task_id"}` payload.
+            let payload = if *to == TaskStatus::Done {
+                task_completion_payload(tx, task_id).await?
+            } else {
+                json!({"task_id": task_id})
+            };
             let ev = append_event(
                 tx,
                 "task",
@@ -4421,7 +4430,7 @@ pub(crate) async fn apply_op(
                 "transitioned",
                 Some(&to_wire(&from)?),
                 Some(&to_str),
-                &json!({"task_id": task_id}),
+                &payload,
                 &now,
             )
             .await?;
@@ -4819,6 +4828,19 @@ pub(crate) async fn apply_op(
         }
     }
     Ok(())
+}
+
+/// Snapshot the task before the transition transaction releases its write lock.
+async fn task_completion_payload(tx: &mut Tx<'_>, task_id: &str) -> Result<serde_json::Value> {
+    let (title, quadrant): (String, Option<String>) = sqlx::query_as(
+        "SELECT t.title, COALESCE(p.override_quadrant, p.ai_quadrant)
+         FROM sin90_tasks t LEFT JOIN sin90_task_priorities p ON p.task_id = t.id
+         WHERE t.id = ?",
+    )
+    .bind(task_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(json!({"task_id": task_id, "title": title, "quadrant": quadrant}))
 }
 
 async fn read_task_status(tx: &mut Tx<'_>, id: &str) -> Result<TaskStatus> {
@@ -8353,5 +8375,73 @@ mod proposal_reject_tests {
             .await
             .unwrap();
         assert_eq!(rows.len(), 1, "{rows:?}");
+    }
+
+    /// Accepting `TransitionTask` to `done` must snapshot title and effective
+    /// quadrant in that apply transaction. A later rename or override edit
+    /// must not change the completion event. Effective quadrant is the human
+    /// override (`schedule`) over the AI quadrant (`do_first`).
+    #[tokio::test]
+    async fn accepted_proposal_done_captures_title_and_effective_quadrant() {
+        let store = new_store().await;
+        let task = store
+            .create_task(
+                "Ship the note",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .set_task_priority_ai(&task.id, "do_first", "high", "high", "model advice")
+            .await
+            .unwrap();
+        store
+            .set_task_priority_override(&task.id, "schedule", "at completion")
+            .await
+            .unwrap();
+
+        let proposal = Sin90Proposal {
+            id: "p-store-done-capture".to_string(),
+            status: ProposalStatus::Pending,
+            source: ProposalSource::LocalBrain,
+            ops: vec![
+                Sin90Op::TransitionTask {
+                    task_id: task.id.clone(),
+                    to: TaskStatus::Planned,
+                },
+                Sin90Op::TransitionTask {
+                    task_id: task.id.clone(),
+                    to: TaskStatus::InProgress,
+                },
+                Sin90Op::TransitionTask {
+                    task_id: task.id.clone(),
+                    to: TaskStatus::Done,
+                },
+            ],
+            rationale: None,
+        };
+        store.submit_proposal(&proposal).await.unwrap();
+        let outcome = store.apply_proposal(&proposal.id).await.unwrap();
+        assert!(outcome.applied_now);
+
+        sqlx::query("UPDATE sin90_tasks SET title = ? WHERE id = ?")
+            .bind("Renamed after accept")
+            .bind(&task.id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        store
+            .set_task_priority_override(&task.id, "eliminate", "after the fact")
+            .await
+            .unwrap();
+
+        let evidence = store.completion_evidence(&task.id).await.unwrap();
+        assert_eq!(evidence.title, "Ship the note");
+        assert_eq!(evidence.quadrant.as_deref(), Some("schedule"));
+        assert_eq!(evidence.note, None);
     }
 }

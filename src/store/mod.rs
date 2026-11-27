@@ -20,6 +20,7 @@ pub(crate) mod period_plans;
 pub mod progress;
 pub mod repo;
 pub mod reviews;
+pub mod task_loop;
 mod templates;
 pub mod weekly_draft;
 
