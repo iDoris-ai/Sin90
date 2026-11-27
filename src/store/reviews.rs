@@ -342,6 +342,7 @@ pub(crate) async fn calendar_draft(
                 completed,
             })
             .collect(),
+        completions: Vec::new(),
         auto_draft_md: String::new(),
     };
     draft.auto_draft_md =

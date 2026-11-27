@@ -1,15 +1,20 @@
 //! `GET /review/weekly/draft?week=YYYY-Www` (T4.3.1, spec.md M4, design §M4
 //! acceptance: "周复盘草稿里的小时数只来自事件回放，偷偷改表不影响它").
 //!
-//! Every number here comes from replaying `sin90_events` for the ISO week's
-//! `[start, end)` window ([`crate::core::iso_week_bounds`]) — never from
-//! `sin90_schedule_blocks` / `sin90_tasks` / `sin90_routines`, which are
-//! mutable and can drift from what actually happened. Two exceptions, both
-//! still pure event reads (never a mutable-table join):
+//! Counts and minute totals come from replaying `sin90_events` for the ISO
+//! week's `[start, end)` window ([`crate::core::iso_week_bounds`]). They do
+//! not read `sin90_schedule_blocks`, `sin90_routines`, or a task row's
+//! mutable status. Direction-to-area mappings use the latest created/updated
+//! snapshot in event insertion order. Routine completions count linked block
+//! completion events inside the requested week, including routines fired in
+//! other weeks.
 //!
-//! Direction-to-area mappings use the latest created/updated snapshot in
-//! event insertion order. Routine completions count linked block completion
-//! events inside the requested week, including routines fired in other weeks.
+//! Completion evidence is one row per done transition in that window, ordered
+//! by `at`, then `seq`. The title prefers the captured `payload.title`.
+//! Events written before that field existed have none; `done_titles` used to
+//! read `sin90_tasks.title`, so this draft left-joins that column only as the
+//! fallback. Quadrant stays on the event. The note is the task's
+//! `sin90_completion_notes` row.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -53,6 +58,8 @@ pub struct WeeklyDraft {
     pub by_area: Vec<AreaMinutes>,
     pub by_direction: Vec<DirectionMinutes>,
     pub tasks_done: i64,
+    #[serde(default)]
+    pub completed_tasks: Vec<super::task_loop::CompletionEvidence>,
     pub routines: Vec<RoutineDraftRow>,
 }
 
@@ -97,6 +104,20 @@ pub fn render_weekly_draft_markdown(draft: &WeeklyDraft) -> String {
     }
 
     out.push_str(&format!("## Tasks done: {}\n\n", draft.tasks_done));
+    out.push_str("## Completion evidence\n\n");
+    if draft.completed_tasks.is_empty() {
+        out.push_str("_no completion evidence recorded this week_\n\n");
+    } else {
+        for task in &draft.completed_tasks {
+            let quadrant = task.quadrant.as_deref().unwrap_or("unevaluated");
+            out.push_str(&format!("- {} [{}]", task.title, quadrant));
+            if let Some(note) = &task.note {
+                out.push_str(&format!(" — {note}"));
+            }
+            out.push('\n');
+        }
+        out.push('\n');
+    }
 
     out.push_str("## Routines fired\n\n");
     if draft.routines.is_empty() {
@@ -257,11 +278,43 @@ pub(crate) async fn weekly_draft_on(
         })
         .collect();
 
+    // One row per done event, in the same `at`, `seq` order the previous
+    // outer scan used. `payload.title` wins. A missing key (legacy events)
+    // falls back to the task row, which is what `done_titles` joined.
+    // Quadrant is never taken from the live priority row.
+    let completed_rows = sqlx::query(
+        "SELECT e.entity_id AS task_id,
+                COALESCE(json_extract(e.payload, '$.title'), t.title, '') AS title,
+                e.at AS completed_at,
+                json_extract(e.payload, '$.quadrant') AS quadrant,
+                n.note AS note
+         FROM sin90_events e
+         LEFT JOIN sin90_tasks t ON t.id = e.entity_id
+         LEFT JOIN sin90_completion_notes n ON n.task_id = e.entity_id
+         WHERE e.entity = 'task' AND e.kind = 'transitioned' AND e.to_state = 'done'
+           AND e.at >= ? AND e.at < ?
+         ORDER BY e.at, e.seq",
+    )
+    .bind(&start)
+    .bind(&end)
+    .fetch_all(&mut *conn)
+    .await?;
+    let completed_tasks = completed_rows
+        .into_iter()
+        .map(|row| super::task_loop::CompletionEvidence {
+            task_id: row.get("task_id"),
+            title: row.get("title"),
+            completed_at: row.get("completed_at"),
+            quadrant: row.get("quadrant"),
+            note: row.get("note"),
+        })
+        .collect();
     Ok(WeeklyDraft {
         week,
         by_area,
         by_direction,
         tasks_done,
+        completed_tasks,
         routines,
     })
 }
@@ -565,9 +618,10 @@ mod weekly_draft_tests {
     // ----- negative control: editing the mutable tables must not move the numbers --
 
     /// The acceptance-critical test: bypass every event-producing route and
-    /// mutate `sin90_schedule_blocks`/`sin90_tasks` directly via raw SQL
-    /// (`test_hooks`) — the draft's numbers must not move at all, because
-    /// they never read those tables.
+    /// mutate `sin90_schedule_blocks.planned_minutes` and `sin90_tasks.status`
+    /// directly via raw SQL (`test_hooks`). Minute totals and `tasks_done`
+    /// replay events only. This fixture's done event already captured its
+    /// title, so the legacy title join does not observe the status rewrite.
     #[tokio::test]
     async fn weekly_draft_ignores_direct_table_mutation_negative_control() {
         let store = new_store().await;
@@ -598,7 +652,126 @@ mod weekly_draft_tests {
         let after = store.weekly_draft("2026-W39").await.unwrap();
         assert_eq!(
             after, before,
-            "editing sin90_schedule_blocks/sin90_tasks directly must not change the draft at all"
+            "editing planned minutes or task status directly must not change the draft"
+        );
+    }
+
+    /// Captured `payload.title` wins over a later rename. An event with no
+    /// title — the shape `done_titles` used to cover by joining
+    /// `sin90_tasks` — falls back to that row. Quadrant and the note stay
+    /// on the event and `sin90_completion_notes`; a later priority edit is
+    /// ignored. Order is `at`, then `seq`.
+    #[tokio::test]
+    async fn weekly_draft_prefers_captured_title_and_falls_back_for_legacy_events() {
+        use crate::store::task_loop::CompletionEvidence;
+
+        let store = new_store().await;
+        let captured = store
+            .create_task(
+                "Captured title",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .set_task_priority_override(&captured.id, "schedule", "at completion")
+            .await
+            .unwrap();
+        for to in [
+            TaskStatus::Planned,
+            TaskStatus::InProgress,
+            TaskStatus::Done,
+        ] {
+            store.transition_task(&captured.id, to).await.unwrap();
+        }
+        test_hooks::set_last_event_at(&store, "task", &captured.id, "2026-09-24T10:00:00Z")
+            .await
+            .unwrap();
+        store
+            .put_completion_note(&captured.id, "Kept the retrospective")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE sin90_tasks SET title = ? WHERE id = ?")
+            .bind("Renamed later")
+            .bind(&captured.id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        store
+            .set_task_priority_override(&captured.id, "eliminate", "after the fact")
+            .await
+            .unwrap();
+
+        let legacy = store
+            .create_task(
+                "Legacy title",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .set_task_priority_override(&legacy.id, "do_first", "before")
+            .await
+            .unwrap();
+        for to in [
+            TaskStatus::Planned,
+            TaskStatus::InProgress,
+            TaskStatus::Done,
+        ] {
+            store.transition_task(&legacy.id, to).await.unwrap();
+        }
+        test_hooks::set_last_event_at(&store, "task", &legacy.id, "2026-09-24T11:00:00Z")
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE sin90_events
+             SET payload = json_remove(payload, '$.title', '$.quadrant')
+             WHERE entity = 'task' AND entity_id = ? AND kind = 'transitioned'
+               AND to_state = 'done'",
+        )
+        .bind(&legacy.id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query("UPDATE sin90_tasks SET title = ? WHERE id = ?")
+            .bind("Legacy from task row")
+            .bind(&legacy.id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        store
+            .set_task_priority_override(&legacy.id, "delegate", "live only")
+            .await
+            .unwrap();
+
+        let draft = store.weekly_draft("2026-W39").await.unwrap();
+        assert_eq!(draft.tasks_done, 2);
+        assert_eq!(
+            draft.completed_tasks,
+            vec![
+                CompletionEvidence {
+                    task_id: captured.id,
+                    title: "Captured title".to_string(),
+                    completed_at: "2026-09-24T10:00:00Z".to_string(),
+                    quadrant: Some("schedule".to_string()),
+                    note: Some("Kept the retrospective".to_string()),
+                },
+                CompletionEvidence {
+                    task_id: legacy.id,
+                    title: "Legacy from task row".to_string(),
+                    completed_at: "2026-09-24T11:00:00Z".to_string(),
+                    quadrant: None,
+                    note: None,
+                },
+            ]
         );
     }
 
@@ -668,6 +841,7 @@ mod weekly_draft_tests {
                 minutes: 60,
             }],
             tasks_done: 3,
+            completed_tasks: vec![],
             routines: vec![RoutineDraftRow {
                 routine_id: "routine-1".to_string(),
                 fired: 2,

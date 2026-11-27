@@ -367,7 +367,7 @@ async fn ts10_out_model_complete_summarize() {
         value: "5".to_string(),
     }];
     let titles = vec!["Write the Q3 rollup memo".to_string()];
-    let req = build_summarize_request(&facts, &titles, Engine::Local);
+    let req = build_summarize_request(&facts, &titles, &[], Engine::Local);
     let call = tokio::spawn(async move { model.complete(&req).await });
 
     let wire_req = read_request(&mut peer).await;

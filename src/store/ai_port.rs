@@ -22,8 +22,8 @@ use sqlx::{Acquire, Row, SqlitePool};
 
 use crate::ai::ports::{
     AiCallRecord, AiReadModel, AiSettings, AiSink, Capability, DirectionCandidate, Engine,
-    ProposalDraft, ReadError, SettingsRead, SinkError, SummarizeBucket, SummarizeDraft,
-    SummarizeRoutineRow,
+    ProposalDraft, ReadError, SettingsRead, SinkError, SummarizeBucket, SummarizeCompletion,
+    SummarizeDraft, SummarizeRoutineRow,
 };
 use crate::ai::source_for;
 use crate::core::{
@@ -610,6 +610,15 @@ impl AiReadModel for AiReader {
                 minutes: a.minutes,
             });
         }
+        let completions = draft
+            .completed_tasks
+            .iter()
+            .map(|task| SummarizeCompletion {
+                title: task.title.clone(),
+                quadrant: task.quadrant.clone(),
+                note: task.note.clone(),
+            })
+            .collect();
         let mut routines = Vec::with_capacity(draft.routines.len());
         for r in &draft.routines {
             // A Routine's own id is never empty, so `resolve_label`'s
@@ -637,6 +646,7 @@ impl AiReadModel for AiReader {
             by_direction,
             tasks_done: draft.tasks_done,
             routines,
+            completions,
             auto_draft_md,
         })
     }
@@ -759,6 +769,8 @@ fn allowed_ops(cap: Capability, ops: &[Sin90Op]) -> Result<(), SinkError> {
                     | Sin90Op::ReorderTasks { .. }
                     | Sin90Op::CreateTasks { .. }
             ),
+            // Priority advice is stored on the task, not as a proposal.
+            Capability::Priority => false,
         }
     };
     if ops.iter().all(ok) {

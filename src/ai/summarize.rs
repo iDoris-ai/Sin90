@@ -34,7 +34,7 @@ use crate::core::{body_sha256, Review, ReviewKind, ReviewStatus, Sin90Op};
 use super::ladder::{plan, run_item, Outcome, RunState};
 use super::ports::{
     AiReadModel, AiSink, Capability, Complexity, Engine, ModelAccess, ModelMessage, ModelPort,
-    ModelReply, ModelRequest, ProposalDraft, Role, SinkError, SummarizeDraft,
+    ModelReply, ModelRequest, ProposalDraft, Role, SinkError, SummarizeCompletion, SummarizeDraft,
 };
 
 // ==================================================================== facts
@@ -110,6 +110,36 @@ pub fn render_facts(week: &str, fs: &[Fact]) -> String {
     let mut s = format!("## {week} {FACTS_HEADING_WORD}\n\n");
     for f in fs {
         s.push_str(&format!("- {}：{}\n", f.label, f.value));
+    }
+    s
+}
+
+/// Program-rendered completion evidence. Empty when there is nothing to
+/// record, so a facts block without completions stays byte-identical.
+/// Missing quadrant or note is omitted. Nothing here is invented.
+#[must_use]
+pub fn render_completion_evidence(items: &[SummarizeCompletion]) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("\n## 完成记录\n\n");
+    for item in items {
+        let title = sanitize_inline(&item.title);
+        s.push_str(&format!("- 「{title}」"));
+        if let Some(quadrant) = item.quadrant.as_deref().filter(|q| !q.is_empty()) {
+            let quadrant = sanitize_inline(quadrant);
+            s.push_str(&format!("〔象限：{quadrant}〕"));
+        }
+        if let Some(note) = item
+            .note
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+        {
+            let note = sanitize_inline(note);
+            s.push_str(&format!(" — {note}"));
+        }
+        s.push('\n');
     }
     s
 }
@@ -376,15 +406,12 @@ pub fn compose_body(facts_md: &str, narrative: Option<&str>) -> String {
 /// current body, after trimming TRAILING whitespace, is either empty or
 /// EXACTLY equal (candidates trimmed the same way) to ONE of `candidates` —
 /// no fuzzy matching, one extra/missing/changed character on EITHER
-/// candidate counts as human text. `candidates` is always `[render_facts(当前
-/// 草稿), SummarizeDraft::auto_draft_md]` at the call site (Layer C,
-/// `run_summarize`) — ① `ai::summarize`'s own facts block, ② T4.3.2's
-/// `render_weekly_draft_markdown` rendering of the SAME draft (the review's
-/// own C1 finding: a review auto-created by a Routine firing starts out
-/// equal to ②, never ①, so recognizing only ① meant summarize could NEVER
-/// touch an auto-created draft). Taking a slice rather than exactly two
-/// `&str` params keeps this function honest about not caring how many
-/// program rendering candidates exist, or in what order.
+/// candidate counts as human text. `run_summarize` passes the ordinary facts
+/// block, that block with completion evidence appended, and
+/// [`SummarizeDraft::auto_draft_md`] (a Routine-created draft matches the
+/// last of these, not the first). Taking a slice keeps this function honest
+/// about not caring how many program rendering candidates exist, or in what
+/// order.
 #[must_use]
 pub fn is_program_only(body: &str, candidates: &[&str]) -> bool {
     let trimmed = body.trim_end();
@@ -440,7 +467,12 @@ pub fn summarize_schema() -> Map<String, Value> {
 }
 
 #[must_use]
-pub fn build_summarize_request(fs: &[Fact], titles: &[String], engine: Engine) -> ModelRequest {
+pub fn build_summarize_request(
+    fs: &[Fact],
+    titles: &[String],
+    completions: &[SummarizeCompletion],
+    engine: Engine,
+) -> ModelRequest {
     let schema = summarize_schema();
     let facts_json: Vec<Value> = fs
         .iter()
@@ -451,7 +483,23 @@ pub fn build_summarize_request(fs: &[Fact], titles: &[String], engine: Engine) -
         .enumerate()
         .map(|(i, t)| json!({"key": format!("t{}", i + 1), "title": t}))
         .collect();
-    let user = json!({"facts": facts_json, "tasks": titles_json}).to_string();
+    let mut user = json!({"facts": facts_json, "tasks": titles_json});
+    if !completions.is_empty() {
+        let rows: Vec<Value> = completions
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                json!({
+                    "key": format!("t{}", i + 1),
+                    "title": item.title,
+                    "quadrant": item.quadrant,
+                    "note": item.note,
+                })
+            })
+            .collect();
+        user["completions"] = Value::Array(rows);
+    }
+    let user = user.to_string();
     ModelRequest {
         messages: vec![
             ModelMessage {
@@ -635,8 +683,9 @@ pub enum SummarizeItemResult {
     /// The run aborted (§11.3.4) before or during this item.
     Aborted,
     /// Q7/J19 (§11.4.2's "可改写条件"): the current body is not empty and
-    /// does not exactly match ANY of the program's own renderings (①
-    /// `render_facts`, ② `SummarizeDraft::auto_draft_md`) — this run never
+    /// does not exactly match ANY of the program's own renderings (ordinary
+    /// `render_facts`, that block with completion evidence, or
+    /// `SummarizeDraft::auto_draft_md`) — this run never
     /// even called the ladder, let alone the model.
     Skipped,
     /// 2026-09-26 review (Low): `AiReadModel::weekly_draft` itself failed —
@@ -683,29 +732,38 @@ where
         Vec::new()
     };
     let fs = facts(&draft);
-    let facts_md = render_facts(&draft.week, &fs);
+    let mut facts_md = render_facts(&draft.week, &fs);
+    // Keep the ordinary facts block before evidence is appended. A legacy
+    // weekly body that is still exactly that block (current numbers, no
+    // completion section) must stay rewriteable.
+    let ordinary_md = facts_md.clone();
+    if review.kind == ReviewKind::Weekly {
+        facts_md.push_str(&render_completion_evidence(&draft.completions));
+    }
 
-    // Q7/§11.4.2's "可改写条件" (J19, REVISED 2026-09-26 review C1): checked
-    // BEFORE the ladder ever runs — human text under (or instead of) EITHER
-    // program rendering means this run attempts nothing at all, not even a
-    // reflex-only rewrite. `candidates` is BOTH program renderings of this
-    // SAME draft: `ai::summarize`'s own facts block, and T4.3.2's
-    // `render_weekly_draft_markdown` output (`auto_draft_md`) — a review
-    // auto-created by a Routine firing starts out equal to the SECOND one,
-    // never the first, so checking only `facts_md` (the pre-review shape)
-    // meant summarize could never touch an auto-created draft at all.
-    if !is_program_only(&review.body, &[&facts_md, &draft.auto_draft_md]) {
+    // Exact match only: ordinary facts, enriched facts, or auto_draft_md.
+    // Anything else, including a human line under one of those, is skipped.
+    if !is_program_only(
+        &review.body,
+        &[&ordinary_md, &facts_md, &draft.auto_draft_md],
+    ) {
         return SummarizeItemResult::Skipped;
     }
 
-    let titles = if review.kind == ReviewKind::Weekly {
-        read.done_titles(&review.period).await.unwrap_or_else(|e| {
-        tracing::warn!(error = %e, review_id = %review.id, "summarize: done_titles read failed, treating as empty");
-        Vec::new()
-    })
+    // Titles and evidence come from the same completion rows. A later rename
+    // or quadrant edit on the live task must not replace the captured values.
+    // The prompt keeps the previous priority: most recent 50, latest first.
+    // The rendered body keeps every row in chronological order.
+    let prompt_completions: Vec<SummarizeCompletion> = if review.kind == ReviewKind::Weekly {
+        let start = draft.completions.len().saturating_sub(50);
+        draft.completions[start..].iter().rev().cloned().collect()
     } else {
         Vec::new()
     };
+    let titles: Vec<String> = prompt_completions
+        .iter()
+        .map(|item| item.title.clone())
+        .collect();
     let base_body_sha256 = body_sha256(&review.body);
 
     let settings = read.settings().await.unwrap_or_else(|e| {
@@ -717,6 +775,7 @@ where
 
     let fs_for_build = fs.clone();
     let titles_for_build = titles.clone();
+    let completions_for_build = prompt_completions.clone();
     let fs_for_parse = fs.clone();
     let titles_for_parse = titles.clone();
     let annual = review.kind == ReviewKind::Yearly;
@@ -735,7 +794,12 @@ where
         sink,
         read,
         move |engine| {
-            let mut request = build_summarize_request(&fs_for_build, &titles_for_build, engine);
+            let mut request = build_summarize_request(
+                &fs_for_build,
+                &titles_for_build,
+                &completions_for_build,
+                engine,
+            );
             request.messages.push(ModelMessage {role: Role::User, content: review_context.clone()});
             if annual {
                 request.messages.push(ModelMessage { role: Role::User, content: format!(
@@ -859,6 +923,7 @@ mod tests {
                 fired: 3,
                 completed: 2,
             }],
+            completions: Vec::new(),
             auto_draft_md: String::new(),
         }
     }
@@ -918,6 +983,7 @@ mod tests {
             by_direction: vec![],
             tasks_done: 0,
             routines: vec![],
+            completions: Vec::new(),
             auto_draft_md: String::new(),
         };
         let f = facts(&d);
@@ -938,6 +1004,7 @@ mod tests {
             by_direction: vec![],
             tasks_done: 0,
             routines: vec![],
+            completions: Vec::new(),
             auto_draft_md: String::new(),
         };
         let f = facts(&d);
@@ -1207,6 +1274,7 @@ mod tests {
                 by_direction: Vec::new(),
                 tasks_done: 0,
                 routines: Vec::new(),
+                completions: Vec::new(),
                 auto_draft_md: String::new(),
             })
         }
@@ -1685,6 +1753,244 @@ mod tests {
         )
         .await;
         assert_eq!(result, SummarizeItemResult::Skipped);
+    }
+
+    /// Weekly summarize keeps the completion event's title and quadrant, plus
+    /// the retrospective note, in the facts-only proposal, the model proposal,
+    /// and the accepted body. The model prompt gets that same evidence. Later
+    /// edits of the live task do not rewrite it. Human text stays put, and a
+    /// non-weekly review does not gain this section.
+    #[tokio::test]
+    async fn weekly_summary_keeps_completion_evidence_in_body_and_prompt() {
+        let store = Sin90Store::open_memory().await.unwrap();
+        let captured = store
+            .create_task(
+                "Captured title",
+                None,
+                None,
+                TaskKind::Other,
+                Energy::Mid,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .set_task_priority_override(&captured.id, "schedule", "at completion")
+            .await
+            .unwrap();
+        for to in [
+            crate::core::TaskStatus::Planned,
+            crate::core::TaskStatus::InProgress,
+            crate::core::TaskStatus::Done,
+        ] {
+            store.transition_task(&captured.id, to).await.unwrap();
+        }
+        crate::store::test_hooks::set_last_event_at(
+            &store,
+            "task",
+            &captured.id,
+            "2026-09-24T10:00:00Z",
+        )
+        .await
+        .unwrap();
+        store
+            .put_completion_note(&captured.id, "Kept the retrospective")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE sin90_tasks SET title = ? WHERE id = ?")
+            .bind("Renamed later")
+            .bind(&captured.id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        store
+            .set_task_priority_override(&captured.id, "eliminate", "after the fact")
+            .await
+            .unwrap();
+
+        let bare = store
+            .create_task("Bare title", None, None, TaskKind::Other, Energy::Mid, None)
+            .await
+            .unwrap();
+        for to in [
+            crate::core::TaskStatus::Planned,
+            crate::core::TaskStatus::InProgress,
+            crate::core::TaskStatus::Done,
+        ] {
+            store.transition_task(&bare.id, to).await.unwrap();
+        }
+        crate::store::test_hooks::set_last_event_at(
+            &store,
+            "task",
+            &bare.id,
+            "2026-09-24T11:00:00Z",
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE sin90_tasks SET title = ? WHERE id = ?")
+            .bind("Bare renamed")
+            .bind(&bare.id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let review = store
+            .create_review(&NewReview {
+                kind: ReviewKind::Weekly,
+                period: "2026-W39".into(),
+            })
+            .await
+            .unwrap();
+        store
+            .update_review_body(&review.id, "人手写的一句")
+            .await
+            .unwrap();
+        let reader = store.ai_reader();
+        let human = store.get_review(&review.id).await.unwrap();
+        let skipped = run_summarize(
+            "run-human",
+            &human,
+            ModelAccess::LocalOnly,
+            None::<&NoModelPort>,
+            &store,
+            &reader,
+        )
+        .await;
+        assert_eq!(skipped, SummarizeItemResult::Skipped);
+        assert_eq!(
+            store.get_review(&review.id).await.unwrap().body,
+            "人手写的一句"
+        );
+
+        store.update_review_body(&review.id, "").await.unwrap();
+        let open = store.get_review(&review.id).await.unwrap();
+        let seen = std::sync::Mutex::new(Vec::new());
+        let model = RecordingModel { seen: &seen };
+        let modeled = run_summarize(
+            "run-model",
+            &open,
+            ModelAccess::LocalOnly,
+            Some(&model),
+            &store,
+            &reader,
+        )
+        .await;
+        let SummarizeItemResult::Proposed(model_id) = modeled else {
+            panic!("expected a model proposal, got {modeled:?}");
+        };
+        let prompt = seen.lock().unwrap().clone();
+        let user = prompt
+            .iter()
+            .flat_map(|req| req.messages.iter())
+            .find(|message| message.content.starts_with('{'))
+            .unwrap_or_else(|| panic!("model prompt has no JSON user message: {prompt:?}"));
+        let payload: Value = serde_json::from_str(&user.content).unwrap();
+        let completions = payload
+            .get("completions")
+            .unwrap_or_else(|| panic!("model prompt dropped completion evidence: {payload}"));
+        // Prompt priority is latest first. Body order stays chronological.
+        assert_eq!(completions[0]["title"], "Bare title");
+        assert!(completions[0]["quadrant"].is_null(), "{completions}");
+        assert!(completions[0]["note"].is_null(), "{completions}");
+        assert_eq!(completions[1]["title"], "Captured title");
+        assert_eq!(completions[1]["quadrant"], "schedule");
+        assert_eq!(completions[1]["note"], "Kept the retrospective");
+        assert_eq!(payload["tasks"][0]["title"], "Bare title");
+        assert_eq!(payload["tasks"][1]["title"], "Captured title");
+        assert!(!user.content.contains("Renamed later"), "{}", user.content);
+        assert!(!user.content.contains("Bare renamed"), "{}", user.content);
+        assert!(!user.content.contains("eliminate"), "{}", user.content);
+
+        let model_body = draft_body(&store.get_proposal(&model_id).await.unwrap().ops);
+        assert!(model_body.contains("本周推进顺利"), "{model_body}");
+        assert_evidence(&model_body);
+
+        let facts_only = run_summarize(
+            "run-facts",
+            &open,
+            ModelAccess::LocalOnly,
+            None::<&NoModelPort>,
+            &store,
+            &reader,
+        )
+        .await;
+        let SummarizeItemResult::Proposed(facts_id) = facts_only else {
+            panic!("expected a facts-only proposal, got {facts_only:?}");
+        };
+        let facts_body = draft_body(&store.get_proposal(&facts_id).await.unwrap().ops);
+        assert!(!facts_body.contains("本周推进顺利"), "{facts_body}");
+        assert_evidence(&facts_body);
+        store.apply_proposal(&facts_id).await.unwrap();
+        let accepted = store.get_review(&review.id).await.unwrap();
+        assert_eq!(accepted.body, facts_body);
+        assert_evidence(&accepted.body);
+
+        let month = store
+            .create_review(&NewReview {
+                kind: ReviewKind::Monthly,
+                period: "2026-09".into(),
+            })
+            .await
+            .unwrap();
+        let monthly = run_summarize(
+            "run-month",
+            &month,
+            ModelAccess::LocalOnly,
+            None::<&NoModelPort>,
+            &store,
+            &reader,
+        )
+        .await;
+        let SummarizeItemResult::Proposed(month_id) = monthly else {
+            panic!("expected a monthly proposal, got {monthly:?}");
+        };
+        let month_body = draft_body(&store.get_proposal(&month_id).await.unwrap().ops);
+        assert!(month_body.contains("2026-09"), "{month_body}");
+        assert!(!month_body.contains("Captured title"), "{month_body}");
+        assert!(
+            !month_body.contains("Kept the retrospective"),
+            "{month_body}"
+        );
+        assert!(!month_body.contains("完成记录"), "{month_body}");
+    }
+
+    fn assert_evidence(body: &str) {
+        assert!(
+            body.contains("- 「Captured title」〔象限：schedule〕 — Kept the retrospective\n"),
+            "{body}"
+        );
+        assert!(body.contains("- 「Bare title」\n"), "{body}");
+        assert!(!body.contains("Bare title」〔"), "{body}");
+        assert!(!body.contains("Renamed later"), "{body}");
+        assert!(!body.contains("Bare renamed"), "{body}");
+        assert!(!body.contains("eliminate"), "{body}");
+        assert!(!body.contains("unevaluated"), "{body}");
+        let captured_at = body.find("Captured title").unwrap();
+        let bare_at = body.find("Bare title").unwrap();
+        assert!(captured_at < bare_at, "{body}");
+    }
+
+    fn draft_body(ops: &[Sin90Op]) -> String {
+        ops.iter()
+            .find_map(|op| match op {
+                Sin90Op::DraftReviewBody { body, .. } => Some(body.clone()),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    struct RecordingModel<'a> {
+        seen: &'a std::sync::Mutex<Vec<ModelRequest>>,
+    }
+    impl ModelPort for RecordingModel<'_> {
+        fn complete(
+            &self,
+            req: ModelRequest,
+        ) -> impl Future<Output = Result<ModelReply, ModelFailure>> + Send {
+            self.seen.lock().unwrap().push(req);
+            let reply = ok_reply(&json!({"narrative": "本周推进顺利，保持了节奏。"}).to_string());
+            async move { Ok(reply) }
+        }
     }
 
     // ---- §11.4.2's "比较并交换" ------------------------------------------

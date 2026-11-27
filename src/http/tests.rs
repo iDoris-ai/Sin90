@@ -11105,3 +11105,5 @@ mod ai_decompose {
         );
     }
 }
+
+mod task_priority;
